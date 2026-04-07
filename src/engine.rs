@@ -72,18 +72,30 @@ impl Engine {
     fn extract_image_centroids(
         &mut self,
     ) -> Option<(usize, Duration, Duration, Duration, Array2<f64>)> {
-        let img = self
+        let img_arc = self
             .camera
             .wait_for_next_capture(self.last_processed_timestamp);
-        self.last_processed_timestamp = Some(img.timestamp);
+        self.last_processed_timestamp = Some(img_arc.timestamp);
+
+        // Extract metadata before we consume the Arc
+        let exposure_us = img_arc.exposure_time_us;
+        let post_process_time = img_arc.post_process_time;
+
+        // Try to take ownership of the Vec to avoid a 2MB memory allocation and copy.
+        // If the camera thread has already captured the next frame, it has dropped its reference
+        // to this Arc, leaving the engine as the sole owner.
+        let img_data = match Arc::try_unwrap(img_arc) {
+            Ok(img) => img.data,          // Zero-copy! We stole the memory directly.
+            Err(arc) => arc.data.clone(), // Fallback to copy if camera thread still holds it
+        };
 
         let config = self.camera.get_config().expect("Camera config missing");
 
         let width = config.width as usize;
         let height = config.height as usize;
 
-        // Build ndarray from data
-        let array_img = match Array2::from_shape_vec((height, width), img.data.clone()) {
+        // Build ndarray directly from the stolen memory
+        let array_img = match Array2::from_shape_vec((height, width), img_data) {
             Ok(arr) => arr,
             Err(e) => {
                 error!("Failed to create Array2 from image data: {}", e);
@@ -96,7 +108,7 @@ impl Engine {
         //options.downsample = Some(2);
 
         let extract_start = Instant::now();
-        let result = self.extractor.extract_u8_fast(&array_img, options);
+        let result = self.extractor.extract_u8(&array_img, options);
         let extract_time = extract_start.elapsed();
 
         let num_centroids = result.centroids.len();
@@ -109,8 +121,8 @@ impl Engine {
 
         Some((
             num_centroids,
-            Duration::from_micros(img.exposure_time_us as u64),
-            img.post_process_time,
+            Duration::from_micros(exposure_us as u64),
+            post_process_time,
             extract_time,
             centroids_arr,
         ))
