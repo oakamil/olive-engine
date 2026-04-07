@@ -1,7 +1,6 @@
 // Required Notice: Copyright (c) 2026 Omair Kamil
 // See LICENSE file in root directory for license terms.
 
-use i2c_linux::{I2c, ReadWrite};
 use libcamera::{
     camera::ActiveCamera,
     camera_manager::CameraManager,
@@ -14,11 +13,11 @@ use libcamera::{
     stream::StreamRole,
 };
 use log::info;
+use rppal::i2c::I2c;
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 #[cfg(target_arch = "aarch64")]
 use std::arch::asm;
-use std::io::Write;
 use std::sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicI32, AtomicU32, Ordering},
@@ -39,6 +38,8 @@ const I2C_BUSES_TO_SCAN: &[u8] = &[0, 1, 4, 6, 10, 11, 12, 13, 14, 15];
 pub struct Image {
     pub data: Vec<u8>,
     pub timestamp: SystemTime,
+    pub exposure_time_us: i32,
+    pub post_process_time: Duration,
 }
 
 /// Thread-safe atomic store for the latest capture.
@@ -73,6 +74,9 @@ fn parse_bit_depth(s: &str) -> u8 {
     for c in s.chars() {
         if c.is_ascii_digit() {
             depth.push(c);
+        } else if !depth.is_empty() {
+            // Stop at the first non-digit after we've started collecting digits
+            break;
         }
     }
     depth.parse().unwrap_or(8)
@@ -197,43 +201,86 @@ impl Camera {
         lock.clone()
     }
 
-    /// Blocks until an image is available, then returns it.
+    /// Blocks until an image newer than `last_timestamp` is available, then returns it.
     /// Optimization: Returns an Arc to avoid copying the heap buffer.
-    pub fn get_last_capture_sync(&self) -> Arc<Image> {
+    pub fn wait_for_next_capture(&self, last_timestamp: Option<SystemTime>) -> Arc<Image> {
         let mut lock = self.store.image.lock().unwrap();
         loop {
             if let Some(img) = &*lock {
-                return img.clone();
+                if last_timestamp.is_none() || Some(img.timestamp) != last_timestamp {
+                    return img.clone();
+                }
             }
             // Wait to be notified by the capture thread that a new image is ready
             lock = self.store.cvar.wait(lock).unwrap();
         }
     }
 
-    fn store_as_8bit(store: &Arc<CaptureStore>, config: &CameraConfiguration, buf_data: &[u8]) {
+    fn store_as_8bit(
+        store: &Arc<CaptureStore>,
+        config: &CameraConfiguration,
+        buf_data: &[u8],
+        exposure_time_us: i32,
+        timestamp: SystemTime,
+        receive_time: std::time::Instant,
+    ) {
         let width = config.width as usize;
         let height = config.height as usize;
         let stride = config.stride as usize;
-        let mut image_data = vec![0u8; width * height];
+
+        // Optimization: Use with_capacity and set_len to avoid zero-initializing 2MB+ of memory.
+        // This is safe because we guaranteed to overwrite every byte in the loops below.
+        let mut image_data: Vec<u8> = Vec::with_capacity(width * height);
+        unsafe { image_data.set_len(width * height) };
 
         let is_10_bit = config.bit_depth == 10;
         let is_12_bit = config.bit_depth == 12;
         let is_16_bit = config.bit_depth == 16;
 
         if is_16_bit {
-            for row in 0..height {
-                let buf_row_start = row * stride;
-                let buf_row_end = buf_row_start + width * 2;
-                let pix_row_start = row * width;
-                let pix_row_end = pix_row_start + width;
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                for row in 0..height {
+                    let buf_row_start = row * stride;
+                    let buf_ptr = buf_data.as_ptr().add(buf_row_start);
+                    let pix_row_start = row * width;
+                    let pix_ptr = image_data.as_mut_ptr().add(pix_row_start);
 
-                for (src_chunk, dst) in buf_data[buf_row_start..buf_row_end]
-                    .chunks_exact(2)
-                    .zip(image_data[pix_row_start..pix_row_end].iter_mut())
-                {
-                    // Because the Pi 5 MSB-justifies, and ARM is little-endian,
-                    // src_chunk[1] contains exactly the top 8 bits we need!
-                    *dst = src_chunk[1];
+                    let mut i = 0;
+                    let mut j = 0;
+
+                    // Process 32 bytes (16 pixels) at a time
+                    while i + 32 <= width * 2 {
+                        // vld2q_u8 deinterleaves: v.0 gets even bytes, v.1 gets odd bytes
+                        // Since ARM is little-endian and data is MSB-justified in 16-bit words,
+                        // the high byte (MSB) is the second byte of each pair (odd index).
+                        let v = vld2q_u8(buf_ptr.add(i));
+                        vst1q_u8(pix_ptr.add(j), v.1);
+                        i += 32;
+                        j += 16;
+                    }
+
+                    // Fallback for remaining pixels in the row
+                    for k in 0..(width - j) {
+                        *pix_ptr.add(j + k) = *buf_ptr.add((j + k) * 2 + 1);
+                    }
+                }
+            }
+
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                for row in 0..height {
+                    let buf_row_start = row * stride;
+                    let buf_row_end = buf_row_start + width * 2;
+                    let pix_row_start = row * width;
+                    let pix_row_end = pix_row_start + width;
+
+                    for (src_chunk, dst) in buf_data[buf_row_start..buf_row_end]
+                        .chunks_exact(2)
+                        .zip(image_data[pix_row_start..pix_row_end].iter_mut())
+                    {
+                        *dst = src_chunk[1];
+                    }
                 }
             }
         } else if !is_10_bit && !is_12_bit {
@@ -384,10 +431,13 @@ impl Camera {
             }
         }
 
+        let post_process_time = receive_time.elapsed();
         let mut lock = store.image.lock().unwrap();
         *lock = Some(Arc::new(Image {
             data: image_data,
-            timestamp: SystemTime::now(),
+            timestamp,
+            exposure_time_us,
+            post_process_time,
         }));
         store.cvar.notify_all();
     }
@@ -405,44 +455,62 @@ impl Camera {
         (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
     }
 
-    /// Scans the defined I2C buses to find the camera at address 0x1A.
+    /// Scans the defined I2C buses to find the camera at address 0x1A using rppal.
     fn detect_i2c_bus() -> Option<u8> {
         for &bus in I2C_BUSES_TO_SCAN {
-            let path = format!("/dev/i2c-{}", bus);
-            if let Ok(mut i2c) = I2c::from_path(&path) {
-                // Force mode bypasses driver reservation conflicts (true = I2C_SLAVE_FORCE)
-                if i2c.smbus_set_slave_address(I2C_ADDR, true).is_ok() {
-                    // Try a quick write to ping the device; if it ACKs, it's our bus.
-                    if i2c.smbus_write_quick(ReadWrite::Write).is_ok() {
+            if let Ok(mut i2c) = I2c::with_bus(bus) {
+                // Without I2C_SLAVE_FORCE, set_slave_address will fail with OS Error 16 (EBUSY)
+                // if the V4L2 kernel driver has already claimed the camera sensor.
+                match i2c.set_slave_address(I2C_ADDR) {
+                    Ok(_) => {
+                        // The address is free. Try a simple read to ping the device.
+                        if i2c.smbus_receive_byte().is_ok() {
+                            return Some(bus);
+                        }
+                    }
+                    Err(rppal::i2c::Error::Io(e)) if e.raw_os_error() == Some(16) => {
+                        // EBUSY (16) explicitly means a driver is using this address on this bus.
+                        // Since we are looking for the active camera, this is exactly what we want!
                         return Some(bus);
                     }
+                    Err(_) => {} // Other I/O errors, move on to the next bus
                 }
             }
         }
         None
     }
 
-    /// Writes raw bytes to the detected I2C bus to enable/disable HCG.
+    /// Writes raw bytes to the detected I2C bus to enable/disable HCG using `i2cset`.
+    /// Bypasses kernel driver locks by enforcing the proper I2C_RDWR ioctl block via i2c-tools.
     fn write_i2c_hcg(enable: bool) -> std::io::Result<()> {
         let bus = Self::detect_i2c_bus().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "Camera I2C bus not found")
         })?;
 
-        let path = format!("/dev/i2c-{}", bus);
-        let mut i2c = I2c::from_path(&path)?;
+        // The target value for register 0x3009
+        let val = if enable { "0x11" } else { "0x01" };
 
-        i2c.smbus_set_slave_address(I2C_ADDR, true)?;
+        log::debug!("Executing: i2cset -y -f {} 0x1a 0x30 0x09 {} i", bus, val);
 
-        // Specific payloads required for 0x1A HCG toggle
-        let payload: [u8; 3] = if enable {
-            [0x30, 0x09, 0x11]
-        } else {
-            [0x30, 0x09, 0x01]
-        };
+        // i2cset -y (yes) -f (force) <bus> <chip-addr> <reg-high> <reg-low> <val> i (block data)
+        let output = std::process::Command::new("i2cset")
+            .arg("-y")
+            .arg("-f")
+            .arg(bus.to_string())
+            .arg("0x1a") // I2C Address
+            .arg("0x30") // Register High Byte
+            .arg("0x09") // Register Low Byte
+            .arg(val) // Data Byte
+            .arg("i") // I2C Block Write Mode
+            .output()?;
 
-        // Extract the underlying File to write the raw bytes directly to the register
-        let mut file = i2c.into_inner();
-        file.write_all(&payload)?;
+        if !output.status.success() {
+            let err_msg = String::from_utf8_lossy(&output.stderr);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("i2cset failed: {}", err_msg.trim()),
+            ));
+        }
 
         Ok(())
     }
@@ -459,7 +527,7 @@ impl Camera {
                 .ok_or_else(|| "Failed to generate configuration".to_string())?;
 
             let stream_cfg = cfgs
-                .get(0)
+                .get_mut(0)
                 .ok_or_else(|| "Failed to get stream configuration".to_string())?;
             let formats = stream_cfg.formats().pixel_formats();
             let mut format_r8 = None;
@@ -638,6 +706,7 @@ impl Camera {
         let mut stream_config = config
             .get_mut(0)
             .ok_or_else(|| "Failed to get stream configuration".to_string())?;
+
         let selected_format = if status.is_invalid() {
             stream_config.set_pixel_format(original_format);
             original_format
@@ -792,12 +861,15 @@ impl Camera {
             initial_requests.push(request);
         }
 
+        // Local state for actively driven exposure and gain
+        let mut target_gain = INITIAL_GAIN;
+        let mut target_exposure = INITIAL_EXPOSURE_US;
+
         // --- 3. Initial Controls Application ---
         let mut control_list = ControlList::new();
-        // Controls are now strongly typed tuple structs
         let _ = control_list.set(AeEnable(false));
-        let _ = control_list.set(AnalogueGain(INITIAL_GAIN));
-        let _ = control_list.set(ExposureTime(INITIAL_EXPOSURE_US));
+        let _ = control_list.set(AnalogueGain(target_gain));
+        let _ = control_list.set(ExposureTime(target_exposure));
         let _ = control_list.set(FrameDurationLimits([16667, 1000000]));
 
         active_camera
@@ -813,63 +885,173 @@ impl Camera {
         }
 
         // --- 4. Main Event/Capture Loop ---
-        loop {
+        'capture: loop {
             // Check for software configuration changes
-            if let Ok(cmd) = rx.try_recv() {
+            while let Ok(cmd) = rx.try_recv() {
                 match cmd {
-                    CaptureCommand::StopCaptureThread => break,
+                    CaptureCommand::StopCaptureThread => break 'capture,
                     CaptureCommand::SetHcg(enable) => {
-                        let _ = Self::write_i2c_hcg(enable);
+                        log::info!("Initiating HCG toggle sequence (Target: {})", enable);
+
+                        // 1. Drain any pending/completed requests into a holding vector
+                        let mut held_requests = Vec::new();
+                        while let Ok(req) = req_rx.try_recv() {
+                            held_requests.push(req);
+                        }
+
+                        // 2. Stop the pipeline to halt hardware processing.
+                        // Any frames actively exposed or moving through the pipeline will be cancelled
+                        // and immediately pushed into `req_rx`
+                        log::debug!(
+                            "Stopping camera pipeline... (held {} completed requests)",
+                            held_requests.len()
+                        );
+                        if let Err(e) = active_camera.stop() {
+                            log::error!("Failed to stop camera for HCG toggle: {}", e);
+                        }
+
+                        // 3. Restart the pipeline
+                        log::debug!("Restarting camera pipeline...");
+                        if let Err(e) = active_camera.start(None) {
+                            log::error!("Failed to restart camera for HCG toggle: {}", e);
+                        }
+
+                        // 4. Attempt to write I2C while the pipeline clock is running
+                        log::debug!("Writing HCG via I2C (started state)...");
+                        if let Err(e) = Self::write_i2c_hcg(enable) {
+                            log::warn!("HCG write failed: {}", e);
+                        } else {
+                            log::info!("HCG write succeeded.");
+                        }
+
+                        // 5. Rest before we flood the queue with buffers again
+                        std::thread::sleep(Duration::from_millis(100));
+
+                        // 6. Grab any cancelled requests that were dumped during the `stop()` call
+                        while let Ok(req) = req_rx.try_recv() {
+                            held_requests.push(req);
+                        }
+
+                        // 7. Re-queue everything with our latest controls
+                        log::debug!(
+                            "Re-queuing {} requests after HCG toggle...",
+                            held_requests.len()
+                        );
+                        for mut req in held_requests {
+                            req.reuse(ReuseFlag::REUSE_BUFFERS);
+                            {
+                                let req_ctrls = req.controls_mut();
+                                let _ = req_ctrls.set(AnalogueGain(target_gain));
+                                let _ = req_ctrls.set(ExposureTime(target_exposure));
+                            }
+                            let _ = active_camera.queue_request(req);
+                        }
+                        log::info!("HCG toggle sequence complete.");
                     }
                     CaptureCommand::SetGain(gain) => {
-                        active_camera.stop().unwrap();
-                        let mut new_ctrls = ControlList::new();
-                        let _ = new_ctrls.set(AnalogueGain(gain));
-                        active_camera.start(Some(&new_ctrls)).unwrap();
-
-                        // When stopped, pending requests are returned to the channel as cancelled.
-                        // Drain them, refresh them, and pass them back to the active camera.
-                        while let Ok(mut req) = req_rx.try_recv() {
-                            req.reuse(ReuseFlag::REUSE_BUFFERS);
-                            active_camera.queue_request(req).unwrap();
-                        }
+                        target_gain = gain;
                     }
                     CaptureCommand::SetExposure(exp) => {
-                        active_camera.stop().unwrap();
-                        let mut new_ctrls = ControlList::new();
-                        let _ = new_ctrls.set(ExposureTime(exp));
-                        active_camera.start(Some(&new_ctrls)).unwrap();
-
-                        while let Ok(mut req) = req_rx.try_recv() {
-                            req.reuse(ReuseFlag::REUSE_BUFFERS);
-                            active_camera.queue_request(req).unwrap();
-                        }
+                        target_exposure = exp;
                     }
                 }
             }
 
             // Wait for at least one completed frame from libcamera
             if let Ok(completed_request) = req_rx.recv_timeout(Duration::from_millis(50)) {
+                let receive_time = std::time::Instant::now();
                 let mut latest_req = completed_request;
 
                 // Drain the channel to ensure we drop older backlog frames.
-                // We must re-queue them immediately without processing to prevent libcamera from starving.
+                // Re-queue older frames with the absolute latest controls applied.
                 while let Ok(newer_req) = req_rx.try_recv() {
                     latest_req.reuse(ReuseFlag::REUSE_BUFFERS);
+                    {
+                        let req_ctrls = latest_req.controls_mut();
+                        let _ = req_ctrls.set(AnalogueGain(target_gain));
+                        let _ = req_ctrls.set(ExposureTime(target_exposure));
+                    }
                     let _ = active_camera.queue_request(latest_req);
                     latest_req = newer_req;
                 }
 
+                // GUARD: Skip processing entirely if the hardware aborted this request.
+                // Since we now handle cancelled frames explicitly during the HCG toggle,
+                // this mostly catches unexpected hardware stutters.
+                if latest_req.status() == libcamera::request::RequestStatus::Cancelled {
+                    latest_req.reuse(ReuseFlag::REUSE_BUFFERS);
+                    {
+                        let req_ctrls = latest_req.controls_mut();
+                        let _ = req_ctrls.set(AnalogueGain(target_gain));
+                        let _ = req_ctrls.set(ExposureTime(target_exposure));
+                    }
+                    let _ = active_camera.queue_request(latest_req);
+                    continue;
+                }
+
                 // --- Process ONLY the newest request ---
+                let meta = latest_req.metadata();
+
+                // Extract exposure time (in microseconds), fallback to a sensible default if unavailable
+                let exposure_time_us = meta
+                    .get::<libcamera::controls::ExposureTime>()
+                    .map(|e| e.0)
+                    .unwrap_or(16667);
+
+                // Extract hardware sensor timestamp (in nanoseconds since boot)
+                let sensor_timestamp_ns = meta
+                    .get::<libcamera::controls::SensorTimestamp>()
+                    .map(|t| t.0)
+                    .unwrap_or(0);
+
+                let capture_sys_time = if sensor_timestamp_ns > 0 {
+                    // Calculate pipeline delay using CLOCK_MONOTONIC
+                    let mut ts = libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 0,
+                    };
+                    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+                    let current_mono_ns = ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64;
+
+                    let pipeline_delay_ns = (current_mono_ns - sensor_timestamp_ns).max(0) as u64;
+
+                    // SensorTimestamp is typically Start of Frame. Add half exposure to get to the middle.
+                    let halfway_offset_ns = (exposure_time_us as u64) * 1000 / 2;
+
+                    // SystemTime now minus the pipeline delivery delay, plus the offset to the middle of exposure
+                    SystemTime::now()
+                        .checked_sub(Duration::from_nanos(pipeline_delay_ns))
+                        .unwrap_or_else(SystemTime::now)
+                        + Duration::from_nanos(halfway_offset_ns)
+                } else {
+                    // Fallback if hardware timestamp is missing
+                    let halfway_duration = Duration::from_micros((exposure_time_us as u64) / 2);
+                    SystemTime::now()
+                        .checked_sub(halfway_duration)
+                        .unwrap_or_else(SystemTime::now)
+                };
+
                 if let Some(mapped_buffer) =
                     latest_req.buffer::<MemoryMappedFrameBuffer<FrameBuffer>>(&stream)
                 {
-                    // Extract the bytes from the first plane and store as 8-bit.
-                    Self::store_as_8bit(&store, &cam_config, &mapped_buffer.data()[0]);
+                    Self::store_as_8bit(
+                        &store,
+                        &cam_config,
+                        &mapped_buffer.data()[0],
+                        exposure_time_us,
+                        capture_sys_time,
+                        receive_time,
+                    );
                 }
 
-                // Re-queue the newest request (passing ownership) to keep the hardware pipeline flowing
+                // Re-queue the newest request, forcing the active target controls onto it.
                 latest_req.reuse(ReuseFlag::REUSE_BUFFERS);
+                {
+                    let req_ctrls = latest_req.controls_mut();
+                    let _ = req_ctrls.set(AnalogueGain(target_gain));
+                    let _ = req_ctrls.set(ExposureTime(target_exposure));
+                }
+
                 let _ = active_camera.queue_request(latest_req);
             }
         }

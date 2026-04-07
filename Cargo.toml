@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-i2c-linux = "0.1.2"
 libcamera = "0.7.0"
 log = "0.4"
+libc = "0.2"
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
@@ -16,3 +16,12 @@ base64 = "0.22"
 clap = { version = "4.4", features = ["derive"] }
 image = "0.25"
 env_logger = "0.11"
+tetra3 = { git = "https://github.com/oakamil/olive-solve" }
+ndarray = "0.17"
+rppal = "0.22.1"
+
+[profile.release]
+lto = "fat"            # Enables Link-Time Optimization across all dependency crates
+codegen-units = 1      # Compiles the whole program as a single unit for max optimization
+panic = "abort"        # Removes stack-unwinding overhead
+strip = true           # Strips debug symbols to reduce binary size and memory layout

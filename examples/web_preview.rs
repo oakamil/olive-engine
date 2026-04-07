@@ -56,13 +56,10 @@ async fn main() {
         let mut last_check = Instant::now();
         let mut last_timestamp = None;
         loop {
-            // Non-blocking check for new image
-            if let Some(img) = state_clone.camera.get_last_capture() {
-                if Some(img.timestamp) != last_timestamp {
-                    frame_count += 1;
-                    last_timestamp = Some(img.timestamp);
-                }
-            }
+            // Wait for a new image
+            let img = state_clone.camera.wait_for_next_capture(last_timestamp);
+            last_timestamp = Some(img.timestamp);
+            frame_count += 1;
 
             let now = Instant::now();
             if now.duration_since(last_check) >= Duration::from_secs(1) {
@@ -71,7 +68,6 @@ async fn main() {
                 frame_count = 0;
                 last_check = now;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     });
 
@@ -116,8 +112,10 @@ async fn index() -> Html<String> {
 }
 
 async fn mjpeg_handler(State(state): State<Arc<AppState>>) -> Response {
-    let stream = stream::unfold(state, |state| async move {
-        let img = state.camera.get_last_capture_sync();
+    let last_timestamp = None;
+    let stream = stream::unfold((state, last_timestamp), |(state, mut last_ts)| async move {
+        let img = state.camera.wait_for_next_capture(last_ts);
+        last_ts = Some(img.timestamp);
         let config = state
             .camera
             .get_config()
@@ -140,7 +138,10 @@ async fn mjpeg_handler(State(state): State<Arc<AppState>>) -> Response {
         full_chunk.extend_from_slice(&data);
         full_chunk.extend_from_slice(b"\r\n");
 
-        Some((Ok::<_, std::convert::Infallible>(full_chunk), state))
+        Some((
+            Ok::<_, std::convert::Infallible>(full_chunk),
+            (state, last_ts),
+        ))
     });
 
     Response::builder()
