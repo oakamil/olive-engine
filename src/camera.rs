@@ -13,6 +13,7 @@ use libcamera::{
     stream::StreamRole,
 };
 use log::info;
+use rayon::prelude::*;
 use rppal::i2c::I2c;
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
@@ -237,197 +238,232 @@ impl Camera {
         let is_12_bit = config.bit_depth == 12;
         let is_16_bit = config.bit_depth == 16;
 
+        let rows_per_core = height / 2;
+
         if is_16_bit {
-            #[cfg(target_arch = "aarch64")]
-            unsafe {
-                for row in 0..height {
-                    let buf_row_start = row * stride;
-                    let buf_ptr = buf_data.as_ptr().add(buf_row_start);
-                    let pix_row_start = row * width;
-                    let pix_ptr = image_data.as_mut_ptr().add(pix_row_start);
+            buf_data
+                .par_chunks_exact(stride)
+                .zip(image_data.par_chunks_exact_mut(width))
+                .with_min_len(rows_per_core)
+                .for_each(|(buf_row, pix_row)| {
+                    #[cfg(target_arch = "aarch64")]
+                    unsafe {
+                        let buf_ptr = buf_row.as_ptr();
+                        let pix_ptr = pix_row.as_mut_ptr();
 
-                    let mut i = 0;
-                    let mut j = 0;
+                        let mut i = 0;
+                        let mut j = 0;
 
-                    // Process 32 bytes (16 pixels) at a time
-                    while i + 32 <= width * 2 {
-                        // vld2q_u8 deinterleaves: v.0 gets even bytes, v.1 gets odd bytes
-                        // Since ARM is little-endian and data is MSB-justified in 16-bit words,
-                        // the high byte (MSB) is the second byte of each pair (odd index).
-                        let v = vld2q_u8(buf_ptr.add(i));
-                        vst1q_u8(pix_ptr.add(j), v.1);
-                        i += 32;
-                        j += 16;
+                        // Process 32 bytes (16 pixels) at a time
+                        while i + 32 <= width * 2 {
+                            // vld2q_u8 deinterleaves: v.0 gets even bytes, v.1 gets odd bytes
+                            // Since ARM is little-endian and data is MSB-justified in 16-bit words,
+                            // the high byte (MSB) is the second byte of each pair (odd index).
+                            let v = vld2q_u8(buf_ptr.add(i));
+                            vst1q_u8(pix_ptr.add(j), v.1);
+                            i += 32;
+                            j += 16;
+                        }
+
+                        // Fallback for remaining pixels in the row
+                        for k in 0..(width - j) {
+                            *pix_ptr.add(j + k) = *buf_ptr.add((j + k) * 2 + 1);
+                        }
                     }
 
-                    // Fallback for remaining pixels in the row
-                    for k in 0..(width - j) {
-                        *pix_ptr.add(j + k) = *buf_ptr.add((j + k) * 2 + 1);
-                    }
-                }
-            }
-
-            #[cfg(not(target_arch = "aarch64"))]
-            {
-                for row in 0..height {
-                    let buf_row_start = row * stride;
-                    let buf_row_end = buf_row_start + width * 2;
-                    let pix_row_start = row * width;
-                    let pix_row_end = pix_row_start + width;
-
-                    for (src_chunk, dst) in buf_data[buf_row_start..buf_row_end]
-                        .chunks_exact(2)
-                        .zip(image_data[pix_row_start..pix_row_end].iter_mut())
+                    #[cfg(not(target_arch = "aarch64"))]
                     {
-                        *dst = src_chunk[1];
+                        let buf_row_end = width * 2;
+                        for (src_chunk, dst) in buf_row[..buf_row_end]
+                            .chunks_exact(2)
+                            .zip(pix_row.iter_mut())
+                        {
+                            *dst = src_chunk[1];
+                        }
                     }
-                }
-            }
+                });
         } else if !is_10_bit && !is_12_bit {
             if stride == width {
+                // A single contiguous memory copy is extremely fast and doesn't need rayon overhead
                 image_data[..width * height].copy_from_slice(&buf_data[..width * height]);
             } else {
-                for row in 0..height {
-                    let src_start = row * stride;
-                    let dst_start = row * width;
-                    image_data[dst_start..dst_start + width]
-                        .copy_from_slice(&buf_data[src_start..src_start + width]);
-                }
+                buf_data
+                    .par_chunks_exact(stride)
+                    .zip(image_data.par_chunks_exact_mut(width))
+                    .with_min_len(rows_per_core)
+                    .for_each(|(buf_row, pix_row)| {
+                        pix_row.copy_from_slice(&buf_row[..width]);
+                    });
             }
         } else if config.is_packed {
+            // 10-bit path
             if is_10_bit {
                 let valid_buf_len = width * 5 / 4;
-                for row in 0..height {
-                    let buf_row_full = &buf_data[row * stride..(row + 1) * stride];
-                    let pix_row_full = &mut image_data[row * width..(row + 1) * width];
-                    let buf_slice = &buf_row_full[..valid_buf_len];
-                    let pix_slice = &mut pix_row_full[..width];
 
-                    #[cfg(target_arch = "aarch64")]
-                    unsafe {
-                        let mask0 = vld1q_u8(
-                            [0, 1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13, 15, 16, 17, 18].as_ptr(),
-                        );
-                        let mask1 = vld1q_u8(
-                            [4, 5, 6, 7, 9, 10, 11, 12, 14, 15, 16, 17, 19, 20, 21, 22].as_ptr(),
-                        );
-                        let mask2 = vld1q_u8(
-                            [8, 9, 10, 11, 13, 14, 15, 16, 18, 19, 20, 21, 23, 24, 25, 26].as_ptr(),
-                        );
-                        let mask3 = vld1q_u8(
-                            [
-                                12, 13, 14, 15, 17, 18, 19, 20, 22, 23, 24, 25, 27, 28, 29, 30,
-                            ]
-                            .as_ptr(),
-                        );
+                buf_data
+                    .par_chunks_exact(stride)
+                    .zip(image_data.par_chunks_exact_mut(width))
+                    .with_min_len(rows_per_core)
+                    .for_each(|(buf_row_full, pix_row_full)| {
+                        let buf_slice = &buf_row_full[..valid_buf_len];
+                        let pix_slice = &mut pix_row_full[..width];
 
-                        let mut i = 0;
-                        let mut j = 0;
+                        #[cfg(target_arch = "aarch64")]
+                        unsafe {
+                            let mask0 = vld1q_u8(
+                                [0, 1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13, 15, 16, 17, 18].as_ptr(),
+                            );
+                            let mask1 = vld1q_u8(
+                                [4, 5, 6, 7, 9, 10, 11, 12, 14, 15, 16, 17, 19, 20, 21, 22]
+                                    .as_ptr(),
+                            );
+                            let mask2 = vld1q_u8(
+                                [8, 9, 10, 11, 13, 14, 15, 16, 18, 19, 20, 21, 23, 24, 25, 26]
+                                    .as_ptr(),
+                            );
+                            let mask3 = vld1q_u8(
+                                [
+                                    12, 13, 14, 15, 17, 18, 19, 20, 22, 23, 24, 25, 27, 28, 29, 30,
+                                ]
+                                .as_ptr(),
+                            );
 
-                        while i + 80 <= buf_slice.len() && j + 64 <= pix_slice.len() {
-                            let in_ptr = buf_slice.as_ptr().add(i);
-                            let out_ptr = pix_slice.as_mut_ptr().add(j);
+                            let mut i = 0;
+                            let mut j = 0;
 
-                            asm!("prfm pldl1keep, [{0}, #256]", in(reg) in_ptr, options(readonly, preserves_flags, nostack));
+                            // 80 bytes in -> 64 pixels out
+                            while i + 80 <= buf_slice.len() && j + 64 <= pix_slice.len() {
+                                let in_ptr = buf_slice.as_ptr().add(i);
+                                let out_ptr = pix_slice.as_mut_ptr().add(j);
 
-                            let v0 = vld1q_u8(in_ptr);
-                            let v1 = vld1q_u8(in_ptr.add(16));
-                            let v2 = vld1q_u8(in_ptr.add(32));
-                            let out0 = vqtbl2q_u8(uint8x16x2_t(v0, v1), mask0);
-                            let v3 = vld1q_u8(in_ptr.add(48));
-                            let out1 = vqtbl2q_u8(uint8x16x2_t(v1, v2), mask1);
-                            let v4 = vld1q_u8(in_ptr.add(64));
-                            let out2 = vqtbl2q_u8(uint8x16x2_t(v2, v3), mask2);
-                            vst1q_u8(out_ptr, out0);
-                            let out3 = vqtbl2q_u8(uint8x16x2_t(v3, v4), mask3);
-                            vst1q_u8(out_ptr.add(16), out1);
-                            vst1q_u8(out_ptr.add(32), out2);
-                            vst1q_u8(out_ptr.add(48), out3);
+                                asm!(
+                                    "prfm pldl1keep, [{0}, #256]",
+                                    in(reg) in_ptr,
+                                    options(readonly, preserves_flags, nostack)
+                                );
 
-                            i += 80;
-                            j += 64;
+                                let v0 = vld1q_u8(in_ptr);
+                                let v1 = vld1q_u8(in_ptr.add(16));
+                                let v2 = vld1q_u8(in_ptr.add(32));
+
+                                let out0 = vqtbl2q_u8(uint8x16x2_t(v0, v1), mask0);
+                                let v3 = vld1q_u8(in_ptr.add(48));
+
+                                let out1 = vqtbl2q_u8(uint8x16x2_t(v1, v2), mask1);
+                                let v4 = vld1q_u8(in_ptr.add(64));
+
+                                let out2 = vqtbl2q_u8(uint8x16x2_t(v2, v3), mask2);
+                                vst1q_u8(out_ptr, out0);
+
+                                let out3 = vqtbl2q_u8(uint8x16x2_t(v3, v4), mask3);
+                                vst1q_u8(out_ptr.add(16), out1);
+                                vst1q_u8(out_ptr.add(32), out2);
+                                vst1q_u8(out_ptr.add(48), out3);
+
+                                i += 80;
+                                j += 64;
+                            }
+
+                            // Edge remainder
+                            for (buf_chunk, pix_chunk) in buf_slice[i..]
+                                .chunks_exact(5)
+                                .zip(pix_slice[j..].chunks_exact_mut(4))
+                            {
+                                pix_chunk[0] = buf_chunk[0];
+                                pix_chunk[1] = buf_chunk[1];
+                                pix_chunk[2] = buf_chunk[2];
+                                pix_chunk[3] = buf_chunk[3];
+                            }
                         }
 
-                        for (buf_chunk, pix_chunk) in buf_slice[i..]
-                            .chunks_exact(5)
-                            .zip(pix_slice[j..].chunks_exact_mut(4))
+                        // Scalar Fallback for x86 / non-aarch64 machines
+                        #[cfg(not(target_arch = "aarch64"))]
                         {
-                            pix_chunk[0] = buf_chunk[0];
-                            pix_chunk[1] = buf_chunk[1];
-                            pix_chunk[2] = buf_chunk[2];
-                            pix_chunk[3] = buf_chunk[3];
+                            for (buf_chunk, pix_chunk) in
+                                buf_slice.chunks_exact(5).zip(pix_slice.chunks_exact_mut(4))
+                            {
+                                pix_chunk[0] = buf_chunk[0];
+                                pix_chunk[1] = buf_chunk[1];
+                                pix_chunk[2] = buf_chunk[2];
+                                pix_chunk[3] = buf_chunk[3];
+                            }
                         }
-                    }
-
-                    #[cfg(not(target_arch = "aarch64"))]
-                    {
-                        for (buf_chunk, pix_chunk) in
-                            buf_slice.chunks_exact(5).zip(pix_slice.chunks_exact_mut(4))
-                        {
-                            pix_chunk[0] = buf_chunk[0];
-                            pix_chunk[1] = buf_chunk[1];
-                            pix_chunk[2] = buf_chunk[2];
-                            pix_chunk[3] = buf_chunk[3];
-                        }
-                    }
-                }
-            } else if is_12_bit {
+                    });
+            }
+            // 12-bit path
+            else if is_12_bit {
                 let valid_buf_len = width * 3 / 2;
-                for row in 0..height {
-                    let buf_row_full = &buf_data[row * stride..(row + 1) * stride];
-                    let pix_row_full = &mut image_data[row * width..(row + 1) * width];
-                    let buf_slice = &buf_row_full[..valid_buf_len];
-                    let pix_slice = &mut pix_row_full[..width];
 
-                    #[cfg(target_arch = "aarch64")]
-                    unsafe {
-                        let mask0 = vld1q_u8(
-                            [0, 1, 3, 4, 6, 7, 9, 10, 12, 13, 15, 16, 18, 19, 21, 22].as_ptr(),
-                        );
-                        let mask1 = vld1q_u8(
-                            [8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 23, 24, 26, 27, 29, 30].as_ptr(),
-                        );
+                buf_data
+                    .par_chunks_exact(stride)
+                    .zip(image_data.par_chunks_exact_mut(width))
+                    .with_min_len(rows_per_core)
+                    .for_each(|(buf_row_full, pix_row_full)| {
+                        let buf_slice = &buf_row_full[..valid_buf_len];
+                        let pix_slice = &mut pix_row_full[..width];
 
-                        let mut i = 0;
-                        let mut j = 0;
+                        #[cfg(target_arch = "aarch64")]
+                        unsafe {
+                            // For 12-bit, we drop every 3rd byte.
+                            // Lowest Common Multiple for 16-byte registers is 48 bytes (3 registers).
+                            // This outputs 32 bytes (2 registers).
+                            let mask0 = vld1q_u8(
+                                [0, 1, 3, 4, 6, 7, 9, 10, 12, 13, 15, 16, 18, 19, 21, 22].as_ptr(),
+                            );
+                            let mask1 = vld1q_u8(
+                                [8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 23, 24, 26, 27, 29, 30]
+                                    .as_ptr(),
+                            );
 
-                        while i + 48 <= buf_slice.len() && j + 32 <= pix_slice.len() {
-                            let in_ptr = buf_slice.as_ptr().add(i);
-                            let out_ptr = pix_slice.as_mut_ptr().add(j);
+                            let mut i = 0;
+                            let mut j = 0;
 
-                            asm!("prfm pldl1keep, [{0}, #256]", in(reg) in_ptr, options(readonly, preserves_flags, nostack));
+                            // 48 bytes in -> 32 pixels out
+                            while i + 48 <= buf_slice.len() && j + 32 <= pix_slice.len() {
+                                let in_ptr = buf_slice.as_ptr().add(i);
+                                let out_ptr = pix_slice.as_mut_ptr().add(j);
 
-                            let v0 = vld1q_u8(in_ptr);
-                            let v1 = vld1q_u8(in_ptr.add(16));
-                            let v2 = vld1q_u8(in_ptr.add(32));
-                            let out0 = vqtbl2q_u8(uint8x16x2_t(v0, v1), mask0);
-                            let out1 = vqtbl2q_u8(uint8x16x2_t(v1, v2), mask1);
-                            vst1q_u8(out_ptr, out0);
-                            vst1q_u8(out_ptr.add(16), out1);
+                                asm!(
+                                    "prfm pldl1keep, [{0}, #256]",
+                                    in(reg) in_ptr,
+                                    options(readonly, preserves_flags, nostack)
+                                );
 
-                            i += 48;
-                            j += 32;
+                                let v0 = vld1q_u8(in_ptr);
+                                let v1 = vld1q_u8(in_ptr.add(16));
+                                let v2 = vld1q_u8(in_ptr.add(32));
+
+                                let out0 = vqtbl2q_u8(uint8x16x2_t(v0, v1), mask0);
+                                let out1 = vqtbl2q_u8(uint8x16x2_t(v1, v2), mask1);
+
+                                vst1q_u8(out_ptr, out0);
+                                vst1q_u8(out_ptr.add(16), out1);
+
+                                i += 48;
+                                j += 32;
+                            }
+
+                            // Edge remainder
+                            for (buf_chunk, pix_pair) in buf_slice[i..]
+                                .chunks_exact(3)
+                                .zip(pix_slice[j..].chunks_exact_mut(2))
+                            {
+                                pix_pair[0] = buf_chunk[0];
+                                pix_pair[1] = buf_chunk[1];
+                            }
                         }
 
-                        for (buf_chunk, pix_pair) in buf_slice[i..]
-                            .chunks_exact(3)
-                            .zip(pix_slice[j..].chunks_exact_mut(2))
+                        // Scalar Fallback for x86 / non-aarch64 machines
+                        #[cfg(not(target_arch = "aarch64"))]
                         {
-                            pix_pair[0] = buf_chunk[0];
-                            pix_pair[1] = buf_chunk[1];
+                            for (buf_chunk, pix_pair) in
+                                buf_slice.chunks_exact(3).zip(pix_slice.chunks_exact_mut(2))
+                            {
+                                pix_pair[0] = buf_chunk[0];
+                                pix_pair[1] = buf_chunk[1];
+                            }
                         }
-                    }
-
-                    #[cfg(not(target_arch = "aarch64"))]
-                    {
-                        for (buf_chunk, pix_pair) in
-                            buf_slice.chunks_exact(3).zip(pix_slice.chunks_exact_mut(2))
-                        {
-                            pix_pair[0] = buf_chunk[0];
-                            pix_pair[1] = buf_chunk[1];
-                        }
-                    }
-                }
+                    });
             }
         }
 

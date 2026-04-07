@@ -1687,6 +1687,7 @@ dependencies = [
  "libcamera",
  "log",
  "ndarray",
+ "rayon",
  "rppal",
  "tetra3",
  "tokio",

@@ -19,6 +19,7 @@ env_logger = "0.11"
 tetra3 = { git = "https://github.com/oakamil/olive-solve" }
 ndarray = "0.17"
 rppal = "0.22.1"
+rayon = "1.11.0"
 
 [profile.release]
 lto = "fat"            # Enables Link-Time Optimization across all dependency crates
