@@ -9,12 +9,14 @@ use ndarray::Array2;
 
 use crate::camera::Camera;
 use tetra3::{
-    extractor::{BgSubMode, ExtractOptions, Extractor},
+    fast_extractor::{
+        FastBgSubMode, FastDownsample, FastExtractOptions, FastExtractor, FastSigmaMode,
+    },
     solver::{SolveOptions, SolveStatus},
     tetra3::Tetra3,
 };
 
-pub const TARGET_CENTROIDS: usize = 16;
+pub const TARGET_CENTROIDS: usize = 20;
 pub const MIN_CENTROIDS: usize = 4;
 pub const CALIBRATION_INTERVAL: Duration = Duration::from_secs(10);
 pub const MAX_RETRIES: usize = 15; // Increased to allow downward floor probing
@@ -46,7 +48,7 @@ pub struct Engine {
     camera: Arc<Camera>,
     config: EngineConfig,
     solver: Tetra3,
-    extractor: Extractor,
+    extractor: Option<FastExtractor>,
     fov: Option<f64>,
     last_processed_timestamp: Option<std::time::SystemTime>,
 }
@@ -54,12 +56,11 @@ pub struct Engine {
 impl Engine {
     pub fn new(camera: Arc<Camera>, config: EngineConfig) -> Self {
         let solver = Tetra3::new(&config.database_path);
-        let extractor = Extractor::new();
         Self {
             camera,
             config,
             solver,
-            extractor,
+            extractor: None,
             fov: None,
             last_processed_timestamp: None,
         }
@@ -103,18 +104,30 @@ impl Engine {
             }
         };
 
-        let mut options = ExtractOptions::default();
-        options.bg_sub_mode = Some(BgSubMode::GlobalMean);
-        //options.downsample = Some(2);
+        if self.extractor.is_none() {
+            let options = FastExtractOptions {
+                sigma: 8.0,
+                downsample: FastDownsample::X2,
+                bg_sub_mode: Some(FastBgSubMode::BlockMedian { block_size: 32 }),
+                sigma_mode: FastSigmaMode::GlobalRootSquare,
+                binary_open: false,
+                min_area: Some(1),
+                centroid_window: Some(3),
+                ..FastExtractOptions::default()
+            };
+            self.extractor = Some(FastExtractor::new(width, height, options));
+        }
+
+        let extractor = self.extractor.as_mut().unwrap();
 
         let extract_start = Instant::now();
-        let result = self.extractor.extract_u8(&array_img, options);
+        let result = extractor.extract(&array_img);
         let extract_time = extract_start.elapsed();
 
-        let num_centroids = result.centroids.len();
+        let num_centroids = result.len();
 
         let mut centroids_arr = Array2::<f64>::zeros((num_centroids, 2));
-        for (i, c) in result.centroids.iter().enumerate() {
+        for (i, c) in result.iter().enumerate() {
             centroids_arr[[i, 0]] = c.y;
             centroids_arr[[i, 1]] = c.x;
         }
