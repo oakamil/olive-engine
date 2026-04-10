@@ -29,7 +29,11 @@ struct Args {
 
     /// ISP mode configuration
     #[arg(long)]
-    use_isp_mode: bool,
+    isp: bool,
+
+    /// Use GlobalMedian instead of BlockMedian for extraction
+    #[arg(long)]
+    fast: bool,
 }
 
 #[tokio::main]
@@ -53,13 +57,15 @@ async fn main() {
         max_exposure_us: args.max_exposure,
         gain: args.gain,
         database_path,
+        isp: args.isp,
+        fast: args.fast,
     };
 
     info!("Starting Olive Engine with configuration: {:?}", config);
 
     // Initialize and start the camera
     let mut camera = Camera::new();
-    camera.set_isp_mode(args.use_isp_mode);
+    camera.set_isp_mode(args.isp);
     camera
         .start_capture()
         .expect("Failed to start camera capture");

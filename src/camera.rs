@@ -9,6 +9,7 @@ use libcamera::{
     framebuffer_allocator::{FrameBuffer, FrameBufferAllocator},
     framebuffer_map::MemoryMappedFrameBuffer,
     pixel_format::PixelFormat,
+    properties,
     request::ReuseFlag,
     stream::StreamRole,
 };
@@ -60,6 +61,7 @@ enum CaptureCommand {
 /// Represents metadata for the selected camera configuration.
 #[derive(Clone)]
 pub struct CameraConfiguration {
+    pub model: String,
     pub format: PixelFormat,
     pub bit_depth: u8,
     pub is_color: bool,
@@ -90,6 +92,14 @@ fn is_color(s: &str) -> bool {
             || s.contains('B')
             || s.contains('Y')
             || s.contains('V'))
+}
+
+fn is_hcg_supported(model: &str) -> bool {
+    let model = model.to_lowercase();
+    model.contains("imx290")
+        || model.contains("imx327")
+        || model.contains("imx462")
+        || model.contains("imx662")
 }
 
 pub struct Camera {
@@ -556,6 +566,13 @@ impl Camera {
         role: StreamRole,
         isp_mode: bool,
     ) -> Result<(CameraConfiguration, libcamera::stream::Stream), String> {
+        let model = active_camera
+            .properties()
+            .get::<properties::Model>()
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| "Unknown".to_string());
+        info!("Camera model: {}", model);
+
         if isp_mode {
             info!("Using ISP mode");
             let mut cfgs = active_camera
@@ -693,6 +710,7 @@ impl Camera {
 
             return Ok((
                 CameraConfiguration {
+                    model,
                     format: selected_format,
                     bit_depth,
                     is_color: is_color_val,
@@ -824,6 +842,7 @@ impl Camera {
 
         Ok((
             CameraConfiguration {
+                model,
                 format: selected_format,
                 bit_depth: final_bit_depth,
                 is_color: is_color_val,
@@ -927,6 +946,13 @@ impl Camera {
                 match cmd {
                     CaptureCommand::StopCaptureThread => break 'capture,
                     CaptureCommand::SetHcg(enable) => {
+                        if !is_hcg_supported(&cam_config.model) {
+                            log::info!(
+                                "HCG isn't supported on the current camera: {}",
+                                cam_config.model
+                            );
+                            continue;
+                        }
                         log::info!("Initiating HCG toggle sequence (Target: {})", enable);
 
                         // 1. Drain any pending/completed requests into a holding vector

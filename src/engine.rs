@@ -27,6 +27,8 @@ pub struct EngineConfig {
     pub max_exposure_us: i32,
     pub gain: f32,
     pub database_path: String,
+    pub isp: bool,
+    pub fast: bool,
 }
 
 impl Default for EngineConfig {
@@ -39,6 +41,8 @@ impl Default for EngineConfig {
                 "{}/data/default_database.npz",
                 std::env::var("HOME").unwrap_or_default()
             ),
+            isp: false,
+            fast: false,
         }
     }
 }
@@ -122,10 +126,23 @@ impl Engine {
         };
 
         if self.extractor.is_none() {
+            let downsample = if self.config.isp {
+                // ISP mode already downsamples
+                FastDownsample::None
+            } else {
+                FastDownsample::X2
+            };
+
+            let bg_sub_mode = if self.config.fast {
+                Some(FastBgSubMode::GlobalMedian)
+            } else {
+                Some(FastBgSubMode::BlockMedian { block_size: 32 })
+            };
+
             let options = FastExtractOptions {
                 sigma: 3.5,
-                //downsample: FastDownsample::X2,
-                bg_sub_mode: Some(FastBgSubMode::BlockMedian { block_size: 32 }),
+                downsample,
+                bg_sub_mode,
                 //sigma_mode: FastSigmaMode::GlobalRootSquare,
                 binary_open: false,
                 min_area: Some(1),
