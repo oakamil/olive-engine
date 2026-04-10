@@ -6,3 +6,6 @@ pub use crate::camera::*;
 
 pub mod engine;
 pub use crate::engine::*;
+
+pub mod telescope_server;
+pub use crate::telescope_server::*;

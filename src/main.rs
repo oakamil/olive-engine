@@ -78,6 +78,6 @@ async fn main() {
     });
 
     // Run the engine
-    engine.run_calibration_loop();
-    engine.run_solving_loop();
+    engine.run_calibration_loop().await;
+    engine.run_solving_loop().await;
 }

@@ -8,10 +8,9 @@ use log::{error, info, warn};
 use ndarray::Array2;
 
 use crate::camera::Camera;
+use crate::telescope_server::{Lx200Telescope, Lx200WifiTelescope, SharedPosition, TargetOp};
 use tetra3::{
-    fast_extractor::{
-        FastBgSubMode, FastDownsample, FastExtractOptions, FastExtractor, FastSigmaMode,
-    },
+    fast_extractor::{FastBgSubMode, FastDownsample, FastExtractOptions, FastExtractor},
     solver::{SolveOptions, SolveStatus},
     tetra3::Tetra3,
 };
@@ -51,11 +50,25 @@ pub struct Engine {
     extractor: Option<FastExtractor>,
     fov: Option<f64>,
     last_processed_timestamp: Option<std::time::SystemTime>,
+
+    shared_position: Arc<tokio::sync::Mutex<SharedPosition>>,
+    target_ra: Option<f64>,
+    target_dec: Option<f64>,
+    target_pixel: Option<(f64, f64)>,
 }
 
 impl Engine {
     pub fn new(camera: Arc<Camera>, config: EngineConfig) -> Self {
         let solver = Tetra3::new(&config.database_path);
+        let shared_position = Arc::new(tokio::sync::Mutex::new(SharedPosition::default()));
+
+        let mut server = Lx200WifiTelescope::new(shared_position.clone());
+        tokio::spawn(async move {
+            if let Err(e) = server.serve_requests().await {
+                error!("Telescope server error: {}", e);
+            }
+        });
+
         Self {
             camera,
             config,
@@ -63,6 +76,10 @@ impl Engine {
             extractor: None,
             fov: None,
             last_processed_timestamp: None,
+            shared_position,
+            target_ra: None,
+            target_dec: None,
+            target_pixel: None,
         }
     }
 
@@ -106,10 +123,10 @@ impl Engine {
 
         if self.extractor.is_none() {
             let options = FastExtractOptions {
-                sigma: 8.0,
-                downsample: FastDownsample::X2,
+                sigma: 3.5,
+                //downsample: FastDownsample::X2,
                 bg_sub_mode: Some(FastBgSubMode::BlockMedian { block_size: 32 }),
-                sigma_mode: FastSigmaMode::GlobalRootSquare,
+                //sigma_mode: FastSigmaMode::GlobalRootSquare,
                 binary_open: false,
                 min_area: Some(1),
                 centroid_window: Some(3),
@@ -141,7 +158,7 @@ impl Engine {
         ))
     }
 
-    pub fn run_calibration_loop(&mut self) {
+    pub async fn run_calibration_loop(&mut self) {
         info!("Starting auto-calibration loop...");
 
         // Apply static hardware settings ONCE at startup
@@ -193,7 +210,7 @@ impl Engine {
                         last_centroids_arr = Some(arr);
                         valid_samples += 1;
                     } else {
-                        std::thread::sleep(Duration::from_millis(50));
+                        tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                 }
 
@@ -299,6 +316,30 @@ impl Engine {
                         self.clamp_exposure((current_exposure as f64 * factor) as i32);
 
                     if next_exposure == current_exposure {
+                        if next_exposure == self.config.min_exposure_us {
+                            info!(
+                                "Minimum exposure limit reached ({} us). Checking if it solves...",
+                                next_exposure
+                            );
+                            let camera_config = self.camera.get_config().unwrap();
+                            let size = (camera_config.height as f64, camera_config.width as f64);
+
+                            if let Some(arr) = &last_centroids_arr {
+                                let solution = self.solver.solve_from_centroids(arr, size, SolveOptions::default())
+                                    .expect("Critical Error: solver failed to execute during calibration.");
+
+                                if matches!(solution.status, SolveStatus::MatchFound) {
+                                    self.fov = solution.fov;
+                                    info!(
+                                        "Solves at minimum exposure! FOV: {:?}. Calibration complete.",
+                                        self.fov
+                                    );
+                                    calibrated = true;
+                                    break;
+                                }
+                            }
+                        }
+
                         warn!(
                             "Exposure limit reached ({} us) and still outside target range. Aborting attempt.",
                             current_exposure
@@ -331,11 +372,11 @@ impl Engine {
                 "Calibration failed or in progress, waiting {:?}...",
                 CALIBRATION_INTERVAL
             );
-            std::thread::sleep(CALIBRATION_INTERVAL);
+            tokio::time::sleep(CALIBRATION_INTERVAL).await;
         }
     }
 
-    pub fn run_solving_loop(&mut self) {
+    pub async fn run_solving_loop(&mut self) {
         info!("Entering solving loop...");
         let mut current_exposure = self.camera.get_exposure();
         let target_max = (TARGET_CENTROIDS as f64 * 1.5).round() as usize;
@@ -363,12 +404,36 @@ impl Engine {
                 let mut solved = false;
                 let solve_start = Instant::now();
                 let camera_config = self.camera.get_config().unwrap();
-                let size = (camera_config.height as f64, camera_config.width as f64);
+                let width = camera_config.width as f64;
+                let height = camera_config.height as f64;
+                let size = (height, width);
 
                 let mut solve_options = SolveOptions::default();
                 if let Some(fov) = self.fov {
                     solve_options.fov_estimate = Some(fov);
                     solve_options.fov_max_error = Some(0.5); // Provide a reasonable constraint based on FOV
+                }
+
+                // Check for pending sync to include in the solve
+                let mut pending_sync = None;
+                {
+                    let locked = self.shared_position.lock().await;
+                    if locked.target_op == Some(TargetOp::Sync)
+                        && locked.target_ra.is_some()
+                        && locked.target_dec.is_some()
+                    {
+                        pending_sync =
+                            Some((locked.target_ra.unwrap(), locked.target_dec.unwrap()));
+                    }
+                }
+
+                if let Some(tp) = self.target_pixel {
+                    solve_options.target_pixel =
+                        Some(Array2::from_shape_vec((1, 2), vec![tp.1, tp.0]).unwrap());
+                }
+                if let Some((t_ra, t_dec)) = pending_sync {
+                    solve_options.target_sky_coord =
+                        Some(Array2::from_shape_vec((1, 2), vec![t_ra, t_dec]).unwrap());
                 }
 
                 let solution = self.solver.solve_from_centroids(&centroids_arr, size, solve_options)
@@ -378,11 +443,53 @@ impl Engine {
 
                 match solution.status {
                     SolveStatus::MatchFound => {
+                        let mut locked = self.shared_position.lock().await;
+
+                        // Report to telescope server
+                        // If we have a target_ra from the solver (for target_pixel), use it.
+                        // Otherwise use the image center.
+                        let (mut ra, mut dec) = if let (Some(tra), Some(tdec)) =
+                            (&solution.target_ra, &solution.target_dec)
+                        {
+                            (tra[0], tdec[0])
+                        } else {
+                            (solution.ra.unwrap(), solution.dec.unwrap())
+                        };
+
+                        // Sync logic: update target_pixel based on the solver's coordinate mapping
+                        if let Some((t_ra, t_dec)) = pending_sync {
+                            // The solver found the pixel coordinates for our requested sync RA/Dec
+                            if let (Some(tx), Some(ty)) = (&solution.target_x, &solution.target_y) {
+                                if let (Some(x), Some(y)) = (tx[0], ty[0]) {
+                                    self.target_pixel = Some((x, y));
+                                    self.target_ra = Some(t_ra);
+                                    self.target_dec = Some(t_dec);
+                                    info!(
+                                        "Synced to target RA/Dec: ({}, {}). New target pixel: {:?}",
+                                        t_ra, t_dec, self.target_pixel
+                                    );
+
+                                    // Use the synced values for reporting in this frame
+                                    ra = t_ra;
+                                    dec = t_dec;
+                                } else {
+                                    warn!(
+                                        "Solver could not project sync RA/Dec to pixels (out of bounds?). Sync failed."
+                                    );
+                                }
+                            }
+
+                            // Consume the fields
+                            locked.target_op = None;
+                            locked.target_ra = None;
+                            locked.target_dec = None;
+                        }
+
                         info!(
-                            "Solved! RA: {:?}, Dec: {:?}, Roll: {:?} | Centroids: {} | Exposure: {:?} | Post-Process: {:?} | Extract: {:?} | Solve: {:?}",
-                            solution.ra,
-                            solution.dec,
-                            solution.roll,
+                            "Solved! RA: {:.6}, Dec: {:.6}, Roll: {:.2} | Centroids: {} | Exposure: {:?} | Post-Process: {:?} | Extract: {:?} | Solve: {:?}",
+                            ra,
+                            dec,
+                            solution.roll.unwrap(),
                             count,
                             exp_time,
                             pp_time,
@@ -395,6 +502,9 @@ impl Engine {
                             self.fov = Some(new_fov);
                         }
                         solved = true;
+
+                        locked.telescope_ra = ra;
+                        locked.telescope_dec = dec;
                     }
                     _ => {
                         warn!(
@@ -471,7 +581,7 @@ impl Engine {
                     }
                 }
             } else {
-                std::thread::sleep(Duration::from_millis(100));
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
     }
