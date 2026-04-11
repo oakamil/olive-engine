@@ -2225,6 +2225,7 @@ dependencies = [
  "ndarray 0.17.2",
  "rayon",
  "rppal",
+ "serde",
  "starfield",
  "tetra3",
  "tokio",

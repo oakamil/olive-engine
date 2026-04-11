@@ -6,6 +6,7 @@ use log::info;
 use std::sync::Arc;
 
 use olive_engine::camera::Camera;
+use olive_engine::control_server;
 use olive_engine::engine::{Engine, EngineConfig};
 
 #[derive(Parser, Debug)]
@@ -64,15 +65,28 @@ async fn main() {
     info!("Starting Olive Engine with configuration: {:?}", config);
 
     // Initialize and start the camera
-    let mut camera = Camera::new();
-    camera.set_isp_mode(args.isp);
+    let mut camera = Camera::new(args.isp);
     camera
         .start_capture()
         .expect("Failed to start camera capture");
     let camera = Arc::new(camera);
 
+    let client_connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let engine_state = Arc::new(std::sync::RwLock::new(
+        olive_engine::engine::EngineStateData::default(),
+    ));
+
+    // Start the control server in the background
+    let server_camera = camera.clone();
+    let server_client_connected = client_connected.clone();
+    let server_engine_state = engine_state.clone();
+    tokio::spawn(async move {
+        control_server::start_server(server_camera, server_client_connected, server_engine_state)
+            .await;
+    });
+
     // Initialize the engine
-    let mut engine = Engine::new(camera, config);
+    let mut engine = Engine::new(camera, config, client_connected, engine_state);
 
     // Trap Ctrl-C to handle graceful shutdown
     tokio::spawn(async move {
@@ -84,6 +98,8 @@ async fn main() {
     });
 
     // Run the engine
-    engine.run_calibration_loop().await;
-    engine.run_solving_loop().await;
+    loop {
+        engine.run_calibration_loop().await;
+        engine.run_solving_loop().await;
+    }
 }

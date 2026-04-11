@@ -30,7 +30,6 @@ use std::time::{Duration, SystemTime};
 
 // --- Defined Constants ---
 const I2C_ADDR: u16 = 0x1A;
-const INITIAL_GAIN: f32 = 31.0;
 const INITIAL_EXPOSURE_US: i32 = 50_000;
 const I2C_BUSES_TO_SCAN: &[u8] = &[0, 1, 4, 6, 10, 11, 12, 13, 14, 15];
 
@@ -110,6 +109,8 @@ pub struct Camera {
     // Cached atomic values for lock-free getter access
     current_gain: Arc<AtomicU32>, // f32 stored as u32 bits for atomic operations
     current_exposure: Arc<AtomicI32>,
+    min_gain: Arc<AtomicU32>,
+    max_gain: Arc<AtomicU32>,
 
     isp_mode: bool,
     config: Arc<Mutex<Option<CameraConfiguration>>>,
@@ -117,16 +118,69 @@ pub struct Camera {
 
 impl Camera {
     /// Instantiates the camera module and sets initial cached state.
-    /// Actual hardware setup occurs when `start_capture` is called to keep
-    /// the libcamera context localized to the capture thread.
-    pub fn new() -> Self {
+    /// Performs hardware discovery immediately to populate gain limits.
+    pub fn new(isp_mode: bool) -> Self {
         let store = Arc::new(CaptureStore {
             image: Mutex::new(None),
             cvar: Condvar::new(),
         });
 
-        let current_gain = Arc::new(AtomicU32::new(INITIAL_GAIN.to_bits()));
         let current_exposure = Arc::new(AtomicI32::new(INITIAL_EXPOSURE_US));
+        let min_gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let max_gain = Arc::new(AtomicU32::new(31.0f32.to_bits()));
+        let config = Arc::new(Mutex::new(None));
+
+        // Perform hardware discovery immediately
+        {
+            unsafe {
+                std::env::set_var("LIBCAMERA_LOG_LEVELS", "*:ERROR");
+            }
+            libcamera::logging::log_set_target(libcamera::logging::LoggingTarget::None).ok();
+
+            if let Ok(mut mgr) = CameraManager::new() {
+                if mgr.start().is_ok() {
+                    let cameras = mgr.cameras();
+                    if let Some(camera) = cameras.get(0) {
+                        if let Ok(mut active_camera) = camera.acquire() {
+                            if let Ok((cam_config, _)) = Self::configure_camera(
+                                &mut active_camera,
+                                StreamRole::Raw,
+                                isp_mode,
+                            ) {
+                                *config.lock().unwrap() = Some(cam_config);
+
+                                use libcamera::control::ControlEntry;
+                                if let Ok(info) = active_camera.controls().find(AnalogueGain::ID) {
+                                    let min_val = info.min().clone();
+                                    let max_val = info.max().clone();
+                                    if let libcamera::control_value::ControlValue::Float(min_vec) =
+                                        min_val
+                                    {
+                                        if let libcamera::control_value::ControlValue::Float(
+                                            max_vec,
+                                        ) = max_val
+                                        {
+                                            if let (Some(&min), Some(&max)) =
+                                                (min_vec.first(), max_vec.first())
+                                            {
+                                                min_gain.store(min.to_bits(), Ordering::Relaxed);
+                                                max_gain.store(max.to_bits(), Ordering::Relaxed);
+                                                info!(
+                                                    "Camera analogue gain range discovered: {} - {}",
+                                                    min, max
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let current_gain = Arc::new(AtomicU32::new(max_gain.load(Ordering::Relaxed)));
 
         Self {
             command_tx: None,
@@ -134,18 +188,15 @@ impl Camera {
             capture_thread: None,
             current_gain,
             current_exposure,
-            isp_mode: false,
-            config: Arc::new(Mutex::new(None)),
+            min_gain,
+            max_gain,
+            isp_mode,
+            config,
         }
     }
 
     pub fn get_config(&self) -> Option<CameraConfiguration> {
         self.config.lock().unwrap().as_ref().cloned()
-    }
-
-    /// Set ISP mode for the camera.
-    pub fn set_isp_mode(&mut self, enabled: bool) {
-        self.isp_mode = enabled;
     }
 
     /// Kicks off the capture operation on a separate thread.
@@ -161,9 +212,9 @@ impl Camera {
         let store_clone = Arc::clone(&self.store);
         let isp_mode = self.isp_mode;
         let config_clone = Arc::clone(&self.config);
-
+        let max_gain = Arc::clone(&self.max_gain);
         self.capture_thread = Some(thread::spawn(move || {
-            Self::capture_loop(rx, store_clone, isp_mode, config_clone);
+            Self::capture_loop(rx, store_clone, isp_mode, config_clone, max_gain);
         }));
 
         Ok(())
@@ -176,10 +227,25 @@ impl Camera {
         f32::from_bits(self.current_gain.load(Ordering::Relaxed))
     }
 
+    /// Returns the minimum analog gain allowed by the sensor (lock-free).
+    pub fn get_min_gain(&self) -> f32 {
+        f32::from_bits(self.min_gain.load(Ordering::Relaxed))
+    }
+
+    /// Returns the maximum analog gain allowed by the sensor (lock-free).
+    pub fn get_max_gain(&self) -> f32 {
+        f32::from_bits(self.max_gain.load(Ordering::Relaxed))
+    }
+
     /// Sets the analog gain and notifies the capture thread to apply it.
+    /// The value is clamped to the sensor's supported range.
     pub fn set_gain(&self, gain: f32) {
-        self.current_gain.store(gain.to_bits(), Ordering::Relaxed);
-        self.send_command(CaptureCommand::SetGain(gain));
+        let min = self.get_min_gain();
+        let max = self.get_max_gain();
+        let clamped_gain = gain.clamp(min, max);
+        self.current_gain
+            .store(clamped_gain.to_bits(), Ordering::Relaxed);
+        self.send_command(CaptureCommand::SetGain(clamped_gain));
     }
 
     /// Returns the currently set exposure in microseconds (lock-free).
@@ -490,6 +556,14 @@ impl Camera {
 
     // --- Private Helpers ---
 
+    /// Applies the standard control settings to a ControlList.
+    fn apply_controls(controls: &mut ControlList, gain: f32, exposure_us: i32) {
+        let _ = controls.set(AeEnable(false));
+        let _ = controls.set(AnalogueGain(gain));
+        let _ = controls.set(ExposureTime(exposure_us));
+        let _ = controls.set(FrameDurationLimits([16667, 1000000]));
+    }
+
     /// Queues a command to the capture thread.
     fn send_command(&self, cmd: CaptureCommand) {
         if let Some(tx) = &self.command_tx {
@@ -570,7 +644,7 @@ impl Camera {
             .properties()
             .get::<properties::Model>()
             .map(|m| m.to_string())
-            .unwrap_or_else(|| "Unknown".to_string());
+            .unwrap_or_else(|_| "Unknown".to_string());
         info!("Camera model: {}", model);
 
         if isp_mode {
@@ -862,6 +936,7 @@ impl Camera {
         store: Arc<CaptureStore>,
         isp_mode: bool,
         config_store: Arc<Mutex<Option<CameraConfiguration>>>,
+        max_gain: Arc<AtomicU32>,
     ) {
         // Aggressively suppress libcamera logs via environment variable
         unsafe {
@@ -917,15 +992,13 @@ impl Camera {
         }
 
         // Local state for actively driven exposure and gain
-        let mut target_gain = INITIAL_GAIN;
+        let sensor_max = f32::from_bits(max_gain.load(Ordering::Relaxed));
+        let mut target_gain = sensor_max;
         let mut target_exposure = INITIAL_EXPOSURE_US;
 
         // --- 3. Initial Controls Application ---
         let mut control_list = ControlList::new();
-        let _ = control_list.set(AeEnable(false));
-        let _ = control_list.set(AnalogueGain(target_gain));
-        let _ = control_list.set(ExposureTime(target_exposure));
-        let _ = control_list.set(FrameDurationLimits([16667, 1000000]));
+        Self::apply_controls(&mut control_list, target_gain, target_exposure);
 
         active_camera
             .start(Some(&control_list))
@@ -1030,13 +1103,7 @@ impl Camera {
                 // Re-queue older frames with the absolute latest controls applied.
                 while let Ok(newer_req) = req_rx.try_recv() {
                     latest_req.reuse(ReuseFlag::REUSE_BUFFERS);
-                    {
-                        let req_ctrls = latest_req.controls_mut();
-                        let _ = req_ctrls.set(AeEnable(false));
-                        let _ = req_ctrls.set(AnalogueGain(target_gain));
-                        let _ = req_ctrls.set(ExposureTime(target_exposure));
-                        let _ = req_ctrls.set(FrameDurationLimits([16667, 1000000]));
-                    }
+                    Self::apply_controls(latest_req.controls_mut(), target_gain, target_exposure);
                     let _ = active_camera.queue_request(latest_req);
                     latest_req = newer_req;
                 }
@@ -1046,13 +1113,7 @@ impl Camera {
                 // this mostly catches unexpected hardware stutters.
                 if latest_req.status() == libcamera::request::RequestStatus::Cancelled {
                     latest_req.reuse(ReuseFlag::REUSE_BUFFERS);
-                    {
-                        let req_ctrls = latest_req.controls_mut();
-                        let _ = req_ctrls.set(AeEnable(false));
-                        let _ = req_ctrls.set(AnalogueGain(target_gain));
-                        let _ = req_ctrls.set(ExposureTime(target_exposure));
-                        let _ = req_ctrls.set(FrameDurationLimits([16667, 1000000]));
-                    }
+                    Self::apply_controls(latest_req.controls_mut(), target_gain, target_exposure);
                     let _ = active_camera.queue_request(latest_req);
                     continue;
                 }

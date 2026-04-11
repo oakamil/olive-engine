@@ -9,3 +9,6 @@ pub use crate::engine::*;
 
 pub mod telescope_server;
 pub use crate::telescope_server::*;
+
+pub mod control_server;
+pub use crate::control_server::*;

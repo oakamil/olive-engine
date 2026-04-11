@@ -47,6 +47,22 @@ impl Default for EngineConfig {
     }
 }
 
+use serde::Serialize;
+use std::sync::RwLock;
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct EngineStateData {
+    pub status: String,
+    pub ra: Option<f64>,
+    pub dec: Option<f64>,
+    pub roll: Option<f64>,
+    pub exposure_us: i32,
+    pub post_process_ms: f64,
+    pub extract_ms: f64,
+    pub solve_ms: f64,
+    pub solve_rate_hz: f64,
+}
+
 pub struct Engine {
     camera: Arc<Camera>,
     config: EngineConfig,
@@ -59,10 +75,18 @@ pub struct Engine {
     target_ra: Option<f64>,
     target_dec: Option<f64>,
     target_pixel: Option<(f64, f64)>,
+    client_connected: Arc<std::sync::atomic::AtomicBool>,
+    engine_state: Arc<RwLock<EngineStateData>>,
+    solve_timestamps: std::collections::VecDeque<Instant>,
 }
 
 impl Engine {
-    pub fn new(camera: Arc<Camera>, config: EngineConfig) -> Self {
+    pub fn new(
+        camera: Arc<Camera>,
+        config: EngineConfig,
+        client_connected: Arc<std::sync::atomic::AtomicBool>,
+        engine_state: Arc<RwLock<EngineStateData>>,
+    ) -> Self {
         let solver = Tetra3::new(&config.database_path);
         let shared_position = Arc::new(tokio::sync::Mutex::new(SharedPosition::default()));
 
@@ -84,11 +108,48 @@ impl Engine {
             target_ra: None,
             target_dec: None,
             target_pixel: None,
+            client_connected,
+            engine_state,
+            solve_timestamps: std::collections::VecDeque::new(),
         }
     }
 
     fn clamp_exposure(&self, exposure: i32) -> i32 {
         exposure.clamp(self.config.min_exposure_us, self.config.max_exposure_us)
+    }
+
+    fn update_status(&self, status: &str) {
+        let mut state = self.engine_state.write().unwrap();
+        state.status = status.to_string();
+    }
+
+    fn update_solve_stats(
+        &mut self,
+        solved: bool,
+        ra: Option<f64>,
+        dec: Option<f64>,
+        roll: Option<f64>,
+        exposure_us: i32,
+        post_process: Duration,
+        extract: Duration,
+        solve: Duration,
+    ) {
+        if solved {
+            self.solve_timestamps.push_back(Instant::now());
+        }
+        self.solve_timestamps
+            .retain(|t| t.elapsed() <= Duration::from_secs(5));
+        let solve_rate_hz = self.solve_timestamps.len() as f64 / 5.0;
+
+        let mut state = self.engine_state.write().unwrap();
+        state.ra = ra;
+        state.dec = dec;
+        state.roll = roll;
+        state.exposure_us = exposure_us;
+        state.post_process_ms = post_process.as_secs_f64() * 1000.0;
+        state.extract_ms = extract.as_secs_f64() * 1000.0;
+        state.solve_ms = solve.as_secs_f64() * 1000.0;
+        state.solve_rate_hz = solve_rate_hz;
     }
 
     fn extract_image_centroids(
@@ -177,15 +238,37 @@ impl Engine {
 
     pub async fn run_calibration_loop(&mut self) {
         info!("Starting auto-calibration loop...");
+        self.update_status("Calibration");
 
         // Apply static hardware settings ONCE at startup
-        self.camera.set_gain(self.config.gain);
+        let max_gain = self.camera.get_max_gain();
+        info!("Setting gain to sensor maximum: {}", max_gain);
+        self.camera.set_gain(max_gain);
         self.camera.enable_hcg();
 
         let target_min = TARGET_CENTROIDS;
         let target_max = (TARGET_CENTROIDS as f64 * 1.25).round() as usize;
 
+        let mut was_connected = false;
+
         loop {
+            if self
+                .client_connected
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                was_connected = true;
+                self.update_status("Camera Mode");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            } else if was_connected {
+                info!("Client disconnected. Restarting calibration.");
+                was_connected = false;
+                let max_gain = self.camera.get_max_gain();
+                self.camera.set_gain(max_gain);
+                self.camera.enable_hcg();
+            }
+            self.update_status("Calibration");
+
             let mut current_exposure = CALIBRATION_EXPOSURE_US;
             current_exposure = self.clamp_exposure(current_exposure);
             self.camera.set_exposure(current_exposure);
@@ -194,6 +277,13 @@ impl Engine {
             let mut last_good_exposure: Option<i32> = None;
 
             for retry in 0..MAX_RETRIES {
+                if self
+                    .client_connected
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    break;
+                }
+
                 info!(
                     "Calibration attempt {}/{} (Exposure: {} us)",
                     retry + 1,
@@ -208,7 +298,26 @@ impl Engine {
 
                 // Fetch frames until we verify the hardware has applied our new exposure, then collect 5
                 while valid_samples < 5 {
-                    if let Some((count, exp_time, _, _, arr)) = self.extract_image_centroids() {
+                    if self
+                        .client_connected
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        break;
+                    }
+
+                    if let Some((count, exp_time, pp_time, extract_time, arr)) =
+                        self.extract_image_centroids()
+                    {
+                        self.update_solve_stats(
+                            false,
+                            None,
+                            None,
+                            None,
+                            current_exposure,
+                            pp_time,
+                            extract_time,
+                            Duration::ZERO,
+                        );
                         let actual_exp = exp_time.as_micros() as i32;
 
                         // Hardware quantization tolerance (5% or 100us, whichever is larger)
@@ -229,6 +338,13 @@ impl Engine {
                     } else {
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
+                }
+
+                if self
+                    .client_connected
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    break;
                 }
 
                 // Use floating point math to prevent truncation (e.g. 11.8 becoming 11)
@@ -403,8 +519,23 @@ impl Engine {
 
         // Rolling average buffer to smooth out frame-to-frame scintillation dips
         let mut recent_centroids: Vec<usize> = Vec::with_capacity(5);
+        let mut was_connected = false;
 
         loop {
+            if self
+                .client_connected
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                was_connected = true;
+                self.update_status("Camera Mode");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            } else if was_connected {
+                info!("Client disconnected. Returning to calibration mode.");
+                return;
+            }
+            self.update_status("Solving");
+
             if let Some((count, exp_time, pp_time, extract_time, centroids_arr)) =
                 self.extract_image_centroids()
             {
@@ -522,8 +653,29 @@ impl Engine {
 
                         locked.telescope_ra = ra;
                         locked.telescope_dec = dec;
+                        drop(locked);
+                        self.update_solve_stats(
+                            true,
+                            Some(ra),
+                            Some(dec),
+                            solution.roll,
+                            current_exposure,
+                            pp_time,
+                            extract_time,
+                            solve_time,
+                        );
                     }
                     _ => {
+                        self.update_solve_stats(
+                            false,
+                            None,
+                            None,
+                            None,
+                            current_exposure,
+                            pp_time,
+                            extract_time,
+                            solve_time,
+                        );
                         warn!(
                             "No Solution (Status: {:?}) | Centroids: {} | Exposure: {:?} | Post-Process: {:?} | Extract: {:?} | Solve: {:?}",
                             solution.status, count, exp_time, pp_time, extract_time, solve_time
