@@ -383,6 +383,21 @@ async fn stream_handler(State(state): State<Arc<ServerState>>) -> impl IntoRespo
         .unwrap()
 }
 
+async fn get_engine_state(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
+    let engine_state = state.engine_state.read().unwrap().clone();
+    (
+        [
+            (
+                header::CACHE_CONTROL,
+                "no-store, no-cache, must-revalidate, proxy-revalidate",
+            ),
+            (header::PRAGMA, "no-cache"),
+            (header::EXPIRES, "0"),
+        ],
+        Json(engine_state),
+    )
+}
+
 pub async fn start_server(
     camera: Arc<Camera>,
     client_connected: Arc<AtomicBool>,
@@ -400,6 +415,7 @@ pub async fn start_server(
         .route("/", get(index))
         .route("/stream", get(stream_handler))
         .route("/api/controls", get(get_controls).post(post_controls))
+        .route("/api/engine_state", get(get_engine_state))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();

@@ -50,7 +50,7 @@ impl Default for EngineConfig {
 use serde::Serialize;
 use std::sync::RwLock;
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct EngineStateData {
     pub status: String,
     pub ra: Option<f64>,
@@ -61,6 +61,22 @@ pub struct EngineStateData {
     pub extract_ms: f64,
     pub solve_ms: f64,
     pub solve_rate_hz: f64,
+}
+
+impl Default for EngineStateData {
+    fn default() -> Self {
+        Self {
+            status: "Idle".to_string(),
+            ra: None,
+            dec: None,
+            roll: None,
+            exposure_us: 0,
+            post_process_ms: 0.0,
+            extract_ms: 0.0,
+            solve_ms: 0.0,
+            solve_rate_hz: 0.0,
+        }
+    }
 }
 
 pub struct Engine {
@@ -119,6 +135,7 @@ impl Engine {
     }
 
     fn update_status(&self, status: &str) {
+        log::debug!("Engine status changing to: {}", status);
         let mut state = self.engine_state.write().unwrap();
         state.status = status.to_string();
     }
@@ -261,17 +278,29 @@ impl Engine {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             } else if was_connected {
-                info!("Client disconnected. Restarting calibration.");
+                info!("Client disconnected. Restarting calibration hardware reset.");
                 was_connected = false;
                 let max_gain = self.camera.get_max_gain();
                 self.camera.set_gain(max_gain);
                 self.camera.enable_hcg();
             }
-            self.update_status("Calibration");
 
             let mut current_exposure = CALIBRATION_EXPOSURE_US;
             current_exposure = self.clamp_exposure(current_exposure);
             self.camera.set_exposure(current_exposure);
+
+            // Immediate UI update for exposure and status
+            self.update_status("Calibration");
+            self.update_solve_stats(
+                false,
+                None,
+                None,
+                None,
+                current_exposure,
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::ZERO,
+            );
 
             let mut calibrated = false;
             let mut last_good_exposure: Option<i32> = None;
@@ -283,6 +312,12 @@ impl Engine {
                 {
                     break;
                 }
+
+                self.update_status(&format!(
+                    "Calibration (Attempt {}/{})",
+                    retry + 1,
+                    MAX_RETRIES
+                ));
 
                 info!(
                     "Calibration attempt {}/{} (Exposure: {} us)",
@@ -368,12 +403,23 @@ impl Engine {
                     let size = (camera_config.height as f64, camera_config.width as f64);
 
                     if let Some(arr) = &last_centroids_arr {
-                        // We unwrap here because an Err means a catastrophic failure (e.g., missing database), not a failure to match stars.
+                        let solve_start = Instant::now();
                         let solution = self.solver.solve_from_centroids(arr, size, SolveOptions::default())
                             .expect("Critical Error: solver failed to execute during calibration. Is the database path valid?");
+                        let solve_time = solve_start.elapsed();
 
                         if matches!(solution.status, SolveStatus::MatchFound) {
                             self.fov = solution.fov;
+                            self.update_solve_stats(
+                                true,
+                                solution.ra,
+                                solution.dec,
+                                solution.roll,
+                                current_exposure,
+                                Duration::ZERO,
+                                Duration::ZERO,
+                                solve_time,
+                            );
                             info!("Sanity check passed! FOV: {:?}", self.fov);
 
                             // Now check if we are below the ceiling
@@ -501,17 +547,45 @@ impl Engine {
                 break;
             }
 
+            if self
+                .client_connected
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                continue;
+            }
+
             info!(
                 "Calibration failed or in progress, waiting {:?}...",
                 CALIBRATION_INTERVAL
             );
-            tokio::time::sleep(CALIBRATION_INTERVAL).await;
+
+            // Responsive wait that checks for connections
+            let wait_start = Instant::now();
+            while wait_start.elapsed() < CALIBRATION_INTERVAL {
+                if self
+                    .client_connected
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
         }
     }
 
     pub async fn run_solving_loop(&mut self) {
         info!("Entering solving loop...");
         let mut current_exposure = self.camera.get_exposure();
+        self.update_solve_stats(
+            false,
+            None,
+            None,
+            None,
+            current_exposure,
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
         let target_max = (TARGET_CENTROIDS as f64 * 1.5).round() as usize;
 
         let mut consecutive_failures = 0;
