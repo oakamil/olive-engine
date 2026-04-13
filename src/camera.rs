@@ -1,6 +1,7 @@
 // Required Notice: Copyright (c) 2026 Omair Kamil
 // See LICENSE file in root directory for license terms.
 
+use crate::{CameraConfig, CameraTrait, Image};
 use libcamera::{
     camera::ActiveCamera,
     camera_manager::CameraManager,
@@ -35,14 +36,6 @@ const I2C_BUSES_TO_SCAN: &[u8] = &[0, 1, 4, 6, 10, 11, 12, 13, 14, 15];
 
 // --- Data Structures ---
 
-/// Represents a captured image frame with its timestamp.
-pub struct Image {
-    pub data: Vec<u8>,
-    pub timestamp: SystemTime,
-    pub exposure_time_us: i32,
-    pub post_process_time: Duration,
-}
-
 /// Thread-safe atomic store for the latest capture.
 struct CaptureStore {
     image: Mutex<Option<Arc<Image>>>,
@@ -59,7 +52,7 @@ enum CaptureCommand {
 
 /// Represents metadata for the selected camera configuration.
 #[derive(Clone)]
-pub struct CameraConfiguration {
+pub struct LibCameraConfiguration {
     pub model: String,
     pub format: PixelFormat,
     pub bit_depth: u8,
@@ -113,7 +106,111 @@ pub struct Camera {
     max_gain: Arc<AtomicU32>,
 
     isp_mode: bool,
-    config: Arc<Mutex<Option<CameraConfiguration>>>,
+    config: Arc<Mutex<Option<LibCameraConfiguration>>>,
+}
+
+impl CameraTrait for Camera {
+    fn get_config(&self) -> Option<CameraConfig> {
+        self.config.lock().unwrap().as_ref().map(|c| CameraConfig {
+            model: c.model.clone(),
+            width: c.width,
+            height: c.height,
+        })
+    }
+
+    /// Kicks off the capture operation on a separate thread.
+    /// This thread handles libcamera initialization, format selection, and the capture loop.
+    fn start_capture(&mut self) -> Result<(), String> {
+        if self.capture_thread.is_some() {
+            return Ok(()); // Already running
+        }
+
+        let (tx, rx) = mpsc::channel();
+        self.command_tx = Some(tx);
+
+        let store_clone = Arc::clone(&self.store);
+        let isp_mode = self.isp_mode;
+        let config_clone = Arc::clone(&self.config);
+        let max_gain = Arc::clone(&self.max_gain);
+        self.capture_thread = Some(thread::spawn(move || {
+            Self::capture_loop(rx, store_clone, isp_mode, config_clone, max_gain);
+        }));
+
+        Ok(())
+    }
+
+    // --- Configuration Getters & Setters ---
+
+    /// Returns the currently set analog gain (lock-free).
+    fn get_gain(&self) -> f32 {
+        f32::from_bits(self.current_gain.load(Ordering::Relaxed))
+    }
+
+    /// Returns the minimum analog gain allowed by the sensor (lock-free).
+    fn get_min_gain(&self) -> f32 {
+        f32::from_bits(self.min_gain.load(Ordering::Relaxed))
+    }
+
+    /// Returns the maximum analog gain allowed by the sensor (lock-free).
+    fn get_max_gain(&self) -> f32 {
+        f32::from_bits(self.max_gain.load(Ordering::Relaxed))
+    }
+
+    /// Sets the analog gain and notifies the capture thread to apply it.
+    /// The value is clamped to the sensor's supported range.
+    fn set_gain(&self, gain: f32) {
+        let min = self.get_min_gain();
+        let max = self.get_max_gain();
+        let clamped_gain = gain.clamp(min, max);
+        self.current_gain
+            .store(clamped_gain.to_bits(), Ordering::Relaxed);
+        self.send_command(CaptureCommand::SetGain(clamped_gain));
+    }
+
+    /// Returns the currently set exposure in microseconds (lock-free).
+    fn get_exposure(&self) -> i32 {
+        self.current_exposure.load(Ordering::Relaxed)
+    }
+
+    /// Sets the exposure in microseconds and notifies the capture thread to apply it.
+    fn set_exposure(&self, exposure_us: i32) {
+        self.current_exposure.store(exposure_us, Ordering::Relaxed);
+        self.send_command(CaptureCommand::SetExposure(exposure_us));
+    }
+
+    /// Enables High Conversion Gain (HCG) via I2C on address 0x1A.
+    fn enable_hcg(&self) {
+        self.send_command(CaptureCommand::SetHcg(true));
+    }
+
+    /// Disables High Conversion Gain (HCG) via I2C on address 0x1A.
+    fn disable_hcg(&self) {
+        self.send_command(CaptureCommand::SetHcg(false));
+    }
+
+    // --- Data Retrieval ---
+
+    /// Returns the last capture from the store. Returns None if empty.
+    /// Optimization: Returns an Arc to avoid copying the heap buffer.
+    fn get_last_capture(&self) -> Option<Arc<Image>> {
+        let lock = self.store.image.lock().unwrap();
+        lock.clone()
+    }
+
+    /// Blocks until an image newer than `last_timestamp` is available, then returns it.
+    /// Optimization: Returns an Arc to avoid copying the heap buffer.
+    fn wait_for_next_capture(&self, last_timestamp: Option<SystemTime>) -> Arc<Image> {
+        let mut lock = self.store.image.lock().unwrap();
+        loop {
+            if let Some(img) = &*lock {
+                if last_timestamp.is_none() || Some(img.timestamp) != last_timestamp {
+                    return img.clone();
+                }
+            }
+            // Wait to be notified by the capture thread that a new image is ready
+            lock = self.store.cvar.wait(lock).unwrap();
+        }
+    }
 }
 
 impl Camera {
@@ -195,107 +292,9 @@ impl Camera {
         }
     }
 
-    pub fn get_config(&self) -> Option<CameraConfiguration> {
-        self.config.lock().unwrap().as_ref().cloned()
-    }
-
-    /// Kicks off the capture operation on a separate thread.
-    /// This thread handles libcamera initialization, format selection, and the capture loop.
-    pub fn start_capture(&mut self) -> Result<(), String> {
-        if self.capture_thread.is_some() {
-            return Ok(()); // Already running
-        }
-
-        let (tx, rx) = mpsc::channel();
-        self.command_tx = Some(tx);
-
-        let store_clone = Arc::clone(&self.store);
-        let isp_mode = self.isp_mode;
-        let config_clone = Arc::clone(&self.config);
-        let max_gain = Arc::clone(&self.max_gain);
-        self.capture_thread = Some(thread::spawn(move || {
-            Self::capture_loop(rx, store_clone, isp_mode, config_clone, max_gain);
-        }));
-
-        Ok(())
-    }
-
-    // --- Configuration Getters & Setters ---
-
-    /// Returns the currently set analog gain (lock-free).
-    pub fn get_gain(&self) -> f32 {
-        f32::from_bits(self.current_gain.load(Ordering::Relaxed))
-    }
-
-    /// Returns the minimum analog gain allowed by the sensor (lock-free).
-    pub fn get_min_gain(&self) -> f32 {
-        f32::from_bits(self.min_gain.load(Ordering::Relaxed))
-    }
-
-    /// Returns the maximum analog gain allowed by the sensor (lock-free).
-    pub fn get_max_gain(&self) -> f32 {
-        f32::from_bits(self.max_gain.load(Ordering::Relaxed))
-    }
-
-    /// Sets the analog gain and notifies the capture thread to apply it.
-    /// The value is clamped to the sensor's supported range.
-    pub fn set_gain(&self, gain: f32) {
-        let min = self.get_min_gain();
-        let max = self.get_max_gain();
-        let clamped_gain = gain.clamp(min, max);
-        self.current_gain
-            .store(clamped_gain.to_bits(), Ordering::Relaxed);
-        self.send_command(CaptureCommand::SetGain(clamped_gain));
-    }
-
-    /// Returns the currently set exposure in microseconds (lock-free).
-    pub fn get_exposure(&self) -> i32 {
-        self.current_exposure.load(Ordering::Relaxed)
-    }
-
-    /// Sets the exposure in microseconds and notifies the capture thread to apply it.
-    pub fn set_exposure(&self, exposure_us: i32) {
-        self.current_exposure.store(exposure_us, Ordering::Relaxed);
-        self.send_command(CaptureCommand::SetExposure(exposure_us));
-    }
-
-    /// Enables High Conversion Gain (HCG) via I2C on address 0x1A.
-    pub fn enable_hcg(&self) {
-        self.send_command(CaptureCommand::SetHcg(true));
-    }
-
-    /// Disables High Conversion Gain (HCG) via I2C on address 0x1A.
-    pub fn disable_hcg(&self) {
-        self.send_command(CaptureCommand::SetHcg(false));
-    }
-
-    // --- Data Retrieval ---
-
-    /// Returns the last capture from the store. Returns None if empty.
-    /// Optimization: Returns an Arc to avoid copying the heap buffer.
-    pub fn get_last_capture(&self) -> Option<Arc<Image>> {
-        let lock = self.store.image.lock().unwrap();
-        lock.clone()
-    }
-
-    /// Blocks until an image newer than `last_timestamp` is available, then returns it.
-    /// Optimization: Returns an Arc to avoid copying the heap buffer.
-    pub fn wait_for_next_capture(&self, last_timestamp: Option<SystemTime>) -> Arc<Image> {
-        let mut lock = self.store.image.lock().unwrap();
-        loop {
-            if let Some(img) = &*lock {
-                if last_timestamp.is_none() || Some(img.timestamp) != last_timestamp {
-                    return img.clone();
-                }
-            }
-            // Wait to be notified by the capture thread that a new image is ready
-            lock = self.store.cvar.wait(lock).unwrap();
-        }
-    }
-
     fn store_as_8bit(
         store: &Arc<CaptureStore>,
-        config: &CameraConfiguration,
+        config: &LibCameraConfiguration,
         buf_data: &[u8],
         exposure_time_us: i32,
         timestamp: SystemTime,
@@ -639,7 +638,7 @@ impl Camera {
         active_camera: &mut ActiveCamera<'_>,
         role: StreamRole,
         isp_mode: bool,
-    ) -> Result<(CameraConfiguration, libcamera::stream::Stream), String> {
+    ) -> Result<(LibCameraConfiguration, libcamera::stream::Stream), String> {
         let model = active_camera
             .properties()
             .get::<properties::Model>()
@@ -783,7 +782,7 @@ impl Camera {
             info!("  Is Packed: {}", is_packed_val);
 
             return Ok((
-                CameraConfiguration {
+                LibCameraConfiguration {
                     model,
                     format: selected_format,
                     bit_depth,
@@ -915,7 +914,7 @@ impl Camera {
         info!("  Is Packed: {}", is_packed_val);
 
         Ok((
-            CameraConfiguration {
+            LibCameraConfiguration {
                 model,
                 format: selected_format,
                 bit_depth: final_bit_depth,
@@ -935,7 +934,7 @@ impl Camera {
         rx: mpsc::Receiver<CaptureCommand>,
         store: Arc<CaptureStore>,
         isp_mode: bool,
-        config_store: Arc<Mutex<Option<CameraConfiguration>>>,
+        config_store: Arc<Mutex<Option<LibCameraConfiguration>>>,
         max_gain: Arc<AtomicU32>,
     ) {
         // Aggressively suppress libcamera logs via environment variable

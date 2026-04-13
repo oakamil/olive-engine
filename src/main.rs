@@ -5,9 +5,11 @@ use clap::Parser;
 use log::info;
 use std::sync::Arc;
 
-use olive_engine::camera::Camera;
+use olive_engine::CameraTrait;
+use olive_engine::camera::Camera as LibCamera;
 use olive_engine::control_server;
 use olive_engine::engine::{Engine, EngineConfig};
+use olive_engine::uvc_camera::Camera as UvcCamera;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -32,9 +34,17 @@ struct Args {
     #[arg(long)]
     isp: bool,
 
+    /// Use UVC camera instead of libcamera
+    #[arg(long)]
+    uvc: bool,
+
     /// Use GlobalMedian instead of BlockMedian for extraction
     #[arg(long)]
     fast: bool,
+
+    /// Rayon threads configuration
+    #[arg(long, default_value_t = 2)]
+    rayon_threads: usize,
 }
 
 #[tokio::main]
@@ -44,6 +54,12 @@ async fn main() {
 
     // Parse command line arguments
     let args = Args::parse();
+
+    // Initialize Rayon thread pool
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(args.rayon_threads)
+        .build_global()
+        .expect("Failed to initialize Rayon thread pool");
 
     // Resolve $HOME in database path if present
     let database_path = if args.database_path.starts_with("$HOME") {
@@ -58,18 +74,23 @@ async fn main() {
         max_exposure_us: args.max_exposure,
         gain: args.gain,
         database_path,
-        isp: args.isp,
+        isp: if args.uvc { false } else { args.isp },
         fast: args.fast,
+        uvc: args.uvc,
     };
 
     info!("Starting Olive Engine with configuration: {:?}", config);
 
     // Initialize and start the camera
-    let mut camera = Camera::new(args.isp);
-    camera
-        .start_capture()
-        .expect("Failed to start camera capture");
-    let camera = Arc::new(camera);
+    let camera: Arc<dyn CameraTrait> = if args.uvc {
+        let mut cam = UvcCamera::new(false);
+        cam.start_capture().expect("Failed to start UVC camera");
+        Arc::new(cam)
+    } else {
+        let mut cam = LibCamera::new(args.isp);
+        cam.start_capture().expect("Failed to start libcamera");
+        Arc::new(cam)
+    };
 
     let client_connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let engine_state = Arc::new(std::sync::RwLock::new(

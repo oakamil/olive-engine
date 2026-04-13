@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use log::{error, info, warn};
 use ndarray::Array2;
 
-use crate::camera::Camera;
+use crate::CameraTrait;
 use crate::telescope_server::{Lx200Telescope, Lx200WifiTelescope, SharedPosition, TargetOp};
 use tetra3::{
     fast_extractor::{FastBgSubMode, FastDownsample, FastExtractOptions, FastExtractor},
@@ -29,6 +29,7 @@ pub struct EngineConfig {
     pub database_path: String,
     pub isp: bool,
     pub fast: bool,
+    pub uvc: bool,
 }
 
 impl Default for EngineConfig {
@@ -43,6 +44,7 @@ impl Default for EngineConfig {
             ),
             isp: false,
             fast: false,
+            uvc: false,
         }
     }
 }
@@ -80,7 +82,7 @@ impl Default for EngineStateData {
 }
 
 pub struct Engine {
-    camera: Arc<Camera>,
+    camera: Arc<dyn CameraTrait>,
     config: EngineConfig,
     solver: Tetra3,
     extractor: Option<FastExtractor>,
@@ -98,7 +100,7 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(
-        camera: Arc<Camera>,
+        camera: Arc<dyn CameraTrait>,
         config: EngineConfig,
         client_connected: Arc<std::sync::atomic::AtomicBool>,
         engine_state: Arc<RwLock<EngineStateData>>,
@@ -204,11 +206,10 @@ impl Engine {
         };
 
         if self.extractor.is_none() {
-            let downsample = if self.config.isp {
-                // ISP mode already downsamples
-                FastDownsample::None
-            } else {
+            let downsample = if width * height > 1_000_000 {
                 FastDownsample::X2
+            } else {
+                FastDownsample::None
             };
 
             let bg_sub_mode = if self.config.fast {
@@ -233,7 +234,11 @@ impl Engine {
         let extractor = self.extractor.as_mut().unwrap();
 
         let extract_start = Instant::now();
-        let result = extractor.extract_sequential(&array_img);
+        let result = if self.config.fast {
+            extractor.extract_sequential(&array_img)
+        } else {
+            extractor.extract(&array_img)
+        };
         let extract_time = extract_start.elapsed();
 
         let num_centroids = result.len();

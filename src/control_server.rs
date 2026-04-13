@@ -14,12 +14,11 @@ use std::sync::{
 use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::camera::Camera;
-
+use crate::CameraTrait;
 use std::sync::RwLock;
 
 pub struct ServerState {
-    pub camera: Arc<Camera>,
+    pub camera: Arc<dyn CameraTrait>,
     pub semaphore: Arc<Semaphore>,
     pub hcg_enabled: AtomicBool,
     pub client_connected: Arc<AtomicBool>,
@@ -56,7 +55,7 @@ const INDEX_HTML: &str = r#"
   #controls { width: 100%; padding: 20px; border-bottom: 1px solid #f00; display: flex; flex-direction: column; box-sizing: border-box; overflow-y: auto; flex-shrink: 0; max-height: 50vh; }
   #viewer { flex-grow: 1; overflow: hidden; position: relative; display: flex; justify-content: center; align-items: center; background: #000; cursor: grab; touch-action: none; }
   #viewer:active { cursor: grabbing; }
-  #cam-image { transform-origin: center; transition: transform 0.1s ease-out; pointer-events: none; max-width: 100%; max-height: 100%; }
+  #cam-image { transform-origin: center; transition: transform 0.1s ease-out; pointer-events: none; max-width: 100%; max-height: 100%; image-rendering: pixelated; }
   label { display: block; margin-top: 15px; font-size: 0.9em; color: #f00; }
   input[type=range] { width: 100%; }
   .value { float: right; color: #f00; }
@@ -162,7 +161,7 @@ const INDEX_HTML: &str = r#"
       const zoomSensitivity = 0.001;
       const delta = -e.deltaY * zoomSensitivity;
       let newScale = scale * Math.exp(delta);
-      newScale = Math.max(0.1, Math.min(newScale, 50));
+      newScale = Math.max(0.1, Math.min(newScale, 200));
       scale = newScale;
       updateTransform();
     });
@@ -217,7 +216,7 @@ const INDEX_HTML: &str = r#"
           e.touches[0].clientY - e.touches[1].clientY
         );
         let newScale = initialScale * (currentDistance / initialPinchDistance);
-        scale = Math.max(0.1, Math.min(newScale, 50));
+        scale = Math.max(0.1, Math.min(newScale, 200));
         updateTransform();
       }
     }, {passive: false});
@@ -399,7 +398,7 @@ async fn get_engine_state(State(state): State<Arc<ServerState>>) -> impl IntoRes
 }
 
 pub async fn start_server(
-    camera: Arc<Camera>,
+    camera: Arc<dyn CameraTrait>,
     client_connected: Arc<AtomicBool>,
     engine_state: Arc<RwLock<crate::engine::EngineStateData>>,
 ) {
