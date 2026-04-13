@@ -3308,7 +3308,6 @@ dependencies = [
 [[package]]
 name = "tetra3"
 version = "0.1.0"
-source = "git+https://github.com/oakamil/olive-solve#84c23bab24d2024acea4ebe04f981acdccd87e71"
 dependencies = [
  "kiddo",
  "nalgebra 0.34.2",

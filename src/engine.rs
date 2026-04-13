@@ -233,7 +233,7 @@ impl Engine {
         let extractor = self.extractor.as_mut().unwrap();
 
         let extract_start = Instant::now();
-        let result = extractor.extract(&array_img);
+        let result = extractor.extract_sequential(&array_img);
         let extract_time = extract_start.elapsed();
 
         let num_centroids = result.len();
