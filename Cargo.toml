@@ -16,7 +16,8 @@ base64 = "0.22"
 clap = { version = "4.4", features = ["derive"] }
 image = "0.25"
 env_logger = "0.11"
-tetra3 = { git = "https://github.com/oakamil/olive-solve" }
+#tetra3 = { git = "https://github.com/oakamil/olive-solve" }
+tetra3 = { path = "../olive-solve/tetra3" }
 starfield = "0.10.2"
 nalgebra = "0.32"
 ndarray = "0.17"

@@ -1075,10 +1075,7 @@ impl Camera {
                             req.reuse(ReuseFlag::REUSE_BUFFERS);
                             {
                                 let req_ctrls = req.controls_mut();
-                                let _ = req_ctrls.set(AeEnable(false));
-                                let _ = req_ctrls.set(AnalogueGain(target_gain));
-                                let _ = req_ctrls.set(ExposureTime(target_exposure));
-                                let _ = req_ctrls.set(FrameDurationLimits([16667, 1000000]));
+                                apply_controls(&req_ctrls);
                             }
                             let _ = active_camera.queue_request(req);
                         }
@@ -1176,10 +1173,7 @@ impl Camera {
                 latest_req.reuse(ReuseFlag::REUSE_BUFFERS);
                 {
                     let req_ctrls = latest_req.controls_mut();
-                    let _ = req_ctrls.set(AeEnable(false));
-                    let _ = req_ctrls.set(AnalogueGain(target_gain));
-                    let _ = req_ctrls.set(ExposureTime(target_exposure));
-                    let _ = req_ctrls.set(FrameDurationLimits([16667, 1000000]));
+                    apply_controls(&req_ctrls);
                 }
 
                 let _ = active_camera.queue_request(latest_req);
