@@ -1075,7 +1075,7 @@ impl Camera {
                             req.reuse(ReuseFlag::REUSE_BUFFERS);
                             {
                                 let req_ctrls = req.controls_mut();
-                                apply_controls(&req_ctrls);
+                                Self::apply_controls(req_ctrls, target_gain, target_exposure);
                             }
                             let _ = active_camera.queue_request(req);
                         }
@@ -1173,7 +1173,7 @@ impl Camera {
                 latest_req.reuse(ReuseFlag::REUSE_BUFFERS);
                 {
                     let req_ctrls = latest_req.controls_mut();
-                    apply_controls(&req_ctrls);
+                    Self::apply_controls(req_ctrls, target_gain, target_exposure);
                 }
 
                 let _ = active_camera.queue_request(latest_req);

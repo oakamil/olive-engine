@@ -803,11 +803,11 @@ impl Engine {
                         let factor = if needs_downward {
                             // Needs less exposure. Drop quickly (max 50% per frame)
                             1.0 + (raw_factor - 1.0).max(-0.5) * 0.8
-                        } else if needs_upward && raw_factor > 1.0 {
-                            // Failed to solve and average is below target. Increase VERY slowly (max 5% per frame)
-                            1.0 + (raw_factor - 1.0).min(0.5) * 0.1
+                        } else if needs_upward && avg_count < target_max {
+                            // Failed to solve and we are below 150% limit. Increase exposure by a small amount (5%)
+                            1.05
                         } else {
-                            // Failed to solve, but star count is already high. Don't blindly increase exposure.
+                            // Star count is already very high. Don't blindly increase exposure further.
                             1.0
                         };
 
