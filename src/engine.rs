@@ -15,7 +15,6 @@ use tetra3::{
     tetra3::Tetra3,
 };
 
-pub const TARGET_CENTROIDS: usize = 20;
 pub const MIN_CENTROIDS: usize = 4;
 pub const CALIBRATION_INTERVAL: Duration = Duration::from_secs(10);
 pub const MAX_RETRIES: usize = 15; // Increased to allow downward floor probing
@@ -26,9 +25,11 @@ pub struct EngineConfig {
     pub min_exposure_us: i32,
     pub max_exposure_us: i32,
     pub gain: f32,
+    pub target_centroids: usize,
     pub database_path: String,
     pub isp: bool,
-    pub fast: bool,
+    pub fast_bg: bool,
+    pub fast_extract: bool,
     pub uvc: bool,
 }
 
@@ -38,12 +39,14 @@ impl Default for EngineConfig {
             min_exposure_us: 16670,
             max_exposure_us: 1000000,
             gain: 31.0,
+            target_centroids: 20,
             database_path: format!(
                 "{}/data/default_database.npz",
                 std::env::var("HOME").unwrap_or_default()
             ),
             isp: false,
-            fast: false,
+            fast_bg: false,
+            fast_extract: false,
             uvc: false,
         }
     }
@@ -58,6 +61,9 @@ pub struct EngineStateData {
     pub ra: Option<f64>,
     pub dec: Option<f64>,
     pub roll: Option<f64>,
+    pub centroids: usize,
+    pub target_ra: Option<f64>,
+    pub target_dec: Option<f64>,
     pub exposure_us: i32,
     pub post_process_ms: f64,
     pub extract_ms: f64,
@@ -72,6 +78,9 @@ impl Default for EngineStateData {
             ra: None,
             dec: None,
             roll: None,
+            centroids: 0,
+            target_ra: None,
+            target_dec: None,
             exposure_us: 0,
             post_process_ms: 0.0,
             extract_ms: 0.0,
@@ -148,6 +157,9 @@ impl Engine {
         ra: Option<f64>,
         dec: Option<f64>,
         roll: Option<f64>,
+        centroids: usize,
+        target_ra: Option<f64>,
+        target_dec: Option<f64>,
         exposure_us: i32,
         post_process: Duration,
         extract: Duration,
@@ -164,6 +176,9 @@ impl Engine {
         state.ra = ra;
         state.dec = dec;
         state.roll = roll;
+        state.centroids = centroids;
+        state.target_ra = target_ra;
+        state.target_dec = target_dec;
         state.exposure_us = exposure_us;
         state.post_process_ms = post_process.as_secs_f64() * 1000.0;
         state.extract_ms = extract.as_secs_f64() * 1000.0;
@@ -212,7 +227,7 @@ impl Engine {
                 FastDownsample::None
             };
 
-            let bg_sub_mode = if self.config.fast {
+            let bg_sub_mode = if self.config.fast_bg {
                 Some(FastBgSubMode::GlobalMedian)
             } else {
                 Some(FastBgSubMode::BlockMedian { block_size: 32 })
@@ -234,7 +249,7 @@ impl Engine {
         let extractor = self.extractor.as_mut().unwrap();
 
         let extract_start = Instant::now();
-        let result = if self.config.fast {
+        let result = if self.config.fast_extract {
             extractor.extract_sequential(&array_img)
         } else {
             extractor.extract(&array_img)
@@ -268,8 +283,8 @@ impl Engine {
         self.camera.set_gain(max_gain);
         self.camera.enable_hcg();
 
-        let target_min = TARGET_CENTROIDS;
-        let target_max = (TARGET_CENTROIDS as f64 * 1.25).round() as usize;
+        let target_min = self.config.target_centroids;
+        let target_max = (self.config.target_centroids as f64 * 1.25).round() as usize;
 
         let mut was_connected = false;
 
@@ -299,6 +314,9 @@ impl Engine {
             self.update_solve_stats(
                 false,
                 None,
+                None,
+                None,
+                0,
                 None,
                 None,
                 current_exposure,
@@ -353,6 +371,9 @@ impl Engine {
                             None,
                             None,
                             None,
+                            count,
+                            self.target_ra,
+                            self.target_dec,
                             current_exposure,
                             pp_time,
                             extract_time,
@@ -420,6 +441,9 @@ impl Engine {
                                 solution.ra,
                                 solution.dec,
                                 solution.roll,
+                                0,
+                                None,
+                                None,
                                 current_exposure,
                                 Duration::ZERO,
                                 Duration::ZERO,
@@ -493,7 +517,8 @@ impl Engine {
                 if needs_standard_adjustment {
                     // Finer Adjustment: We only move 33% of the way to the "ideal" mathematical factor.
                     // This dampens the change so we creep up on the target range and settle lower.
-                    let raw_factor = TARGET_CENTROIDS as f64 / (avg_centroids.max(1)) as f64;
+                    let raw_factor =
+                        self.config.target_centroids as f64 / (avg_centroids.max(1)) as f64;
                     let factor = 1.0 + (raw_factor - 1.0) * 0.33;
 
                     let next_exposure =
@@ -586,12 +611,15 @@ impl Engine {
             None,
             None,
             None,
+            0,
+            None,
+            None,
             current_exposure,
             Duration::ZERO,
             Duration::ZERO,
             Duration::ZERO,
         );
-        let target_max = (TARGET_CENTROIDS as f64 * 1.5).round() as usize;
+        let target_max = (self.config.target_centroids as f64 * 1.5).round() as usize;
 
         let mut consecutive_failures = 0;
         const MAX_FAILURES: usize = 3;
@@ -738,6 +766,9 @@ impl Engine {
                             Some(ra),
                             Some(dec),
                             solution.roll,
+                            count,
+                            self.target_ra,
+                            self.target_dec,
                             current_exposure,
                             pp_time,
                             extract_time,
@@ -750,6 +781,9 @@ impl Engine {
                             None,
                             None,
                             None,
+                            count,
+                            self.target_ra,
+                            self.target_dec,
                             current_exposure,
                             pp_time,
                             extract_time,
@@ -798,7 +832,7 @@ impl Engine {
 
                     if needs_downward || needs_upward {
                         let safe_count = avg_count.max(1);
-                        let raw_factor = TARGET_CENTROIDS as f64 / safe_count as f64;
+                        let raw_factor = self.config.target_centroids as f64 / safe_count as f64;
 
                         let factor = if needs_downward {
                             // Needs less exposure. Drop quickly (max 50% per frame)

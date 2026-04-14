@@ -26,6 +26,10 @@ struct Args {
     #[arg(long, default_value_t = 31.0)]
     gain: f32,
 
+    /// Target number of centroids for auto-exposure
+    #[arg(long, default_value_t = 20)]
+    target_centroids: usize,
+
     /// Path to the Tetra3 database NPZ file
     #[arg(long, default_value = "$HOME/data/default_database.npz")]
     database_path: String,
@@ -40,7 +44,11 @@ struct Args {
 
     /// Use GlobalMedian instead of BlockMedian for extraction
     #[arg(long)]
-    fast: bool,
+    fast_bg: bool,
+
+    /// Use sequential extraction instead of parallel
+    #[arg(long)]
+    fast_extract: bool,
 
     /// Rayon threads configuration
     #[arg(long, default_value_t = 2)]
@@ -73,9 +81,11 @@ async fn main() {
         min_exposure_us: args.min_exposure,
         max_exposure_us: args.max_exposure,
         gain: args.gain,
+        target_centroids: args.target_centroids,
         database_path,
         isp: if args.uvc { false } else { args.isp },
-        fast: args.fast,
+        fast_bg: args.fast_bg,
+        fast_extract: args.fast_extract,
         uvc: args.uvc,
     };
 

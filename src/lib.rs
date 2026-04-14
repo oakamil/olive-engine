@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime};
 pub mod camera;
 pub mod control_server;
 pub mod engine;
+pub mod python;
 pub mod telescope_server;
 pub mod uvc_camera;
 
