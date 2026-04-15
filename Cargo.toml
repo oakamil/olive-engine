@@ -29,7 +29,11 @@ chrono = "0.4"
 memchr = "2.7"
 futures = "0.3.32"
 serde = { version = "1.0.228", features = ["derive"] }
-pyo3 = { version = "0.21.2", features = ["extension-module"] }
+pyo3 = { version = "0.21.2" }
+
+[features]
+extension-module = ["pyo3/extension-module"]
+default = []
 
 [lib]
 name = "olive_engine"

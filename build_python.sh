@@ -19,7 +19,7 @@ find target/release -maxdepth 2 -name "libolive_engine.so" -delete
 rm -rf target/maturin
 
 echo "Building Python wheel with Maturin..."
-maturin build --release
+maturin build --release --features extension-module
 
 echo "Build complete."
 cp target/wheels/*manylinux*.whl dist/.
