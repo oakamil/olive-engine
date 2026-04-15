@@ -117,20 +117,13 @@ async fn main() {
     });
 
     // Initialize the engine
-    let mut engine = Engine::new(camera, config, client_connected, engine_state);
+    let engine = Engine::new(camera, config, client_connected, engine_state);
+    engine.start();
 
     // Trap Ctrl-C to handle graceful shutdown
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to listen for Ctrl-C");
-        info!("Received Ctrl-C, shutting down...");
-        std::process::exit(0);
-    });
-
-    // Run the engine
-    loop {
-        engine.run_calibration_loop().await;
-        engine.run_solving_loop().await;
-    }
+    tokio::signal::ctrl_c()
+        .await
+        .expect("Failed to listen for Ctrl-C");
+    info!("Received Ctrl-C, shutting down...");
+    std::process::exit(0);
 }

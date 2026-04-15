@@ -75,14 +75,8 @@ fn start_engine(
             .await;
     });
 
-    let mut engine = Engine::new(camera, config, client_connected, engine_state.clone());
-
-    rt.spawn(async move {
-        loop {
-            engine.run_calibration_loop().await;
-            engine.run_solving_loop().await;
-        }
-    });
+    let engine = Engine::new(camera, config, client_connected, engine_state.clone());
+    engine.start();
 
     loop {
         py.check_signals()?;

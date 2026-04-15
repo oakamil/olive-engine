@@ -52,6 +52,14 @@ impl Default for EngineConfig {
     }
 }
 
+pub struct IntermediateResult {
+    pub count: usize,
+    pub exp_time: Duration,
+    pub pp_time: Duration,
+    pub extract_time: Duration,
+    pub centroids_arr: Array2<f64>,
+}
+
 use serde::Serialize;
 use std::sync::RwLock;
 
@@ -94,9 +102,7 @@ pub struct Engine {
     camera: Arc<dyn CameraTrait>,
     config: EngineConfig,
     solver: Tetra3,
-    extractor: Option<FastExtractor>,
     fov: Option<f64>,
-    last_processed_timestamp: Option<std::time::SystemTime>,
 
     shared_position: Arc<tokio::sync::Mutex<SharedPosition>>,
     target_ra: Option<f64>,
@@ -105,6 +111,10 @@ pub struct Engine {
     client_connected: Arc<std::sync::atomic::AtomicBool>,
     engine_state: Arc<RwLock<EngineStateData>>,
     solve_timestamps: std::collections::VecDeque<Instant>,
+    shared_result: Arc<(
+        std::sync::Mutex<Option<IntermediateResult>>,
+        std::sync::Condvar,
+    )>,
 }
 
 impl Engine {
@@ -128,9 +138,7 @@ impl Engine {
             camera,
             config,
             solver,
-            extractor: None,
             fov: None,
-            last_processed_timestamp: None,
             shared_position,
             target_ra: None,
             target_dec: None,
@@ -138,6 +146,7 @@ impl Engine {
             client_connected,
             engine_state,
             solve_timestamps: std::collections::VecDeque::new(),
+            shared_result: Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new())),
         }
     }
 
@@ -186,94 +195,128 @@ impl Engine {
         state.solve_rate_hz = solve_rate_hz;
     }
 
-    fn extract_image_centroids(
-        &mut self,
-    ) -> Option<(usize, Duration, Duration, Duration, Array2<f64>)> {
-        let img_arc = self
-            .camera
-            .wait_for_next_capture(self.last_processed_timestamp);
-        self.last_processed_timestamp = Some(img_arc.timestamp);
+    pub fn start(self) {
+        let camera_ext = self.camera.clone();
+        let config_ext = self.config.clone();
+        let shared_res_ext = self.shared_result.clone();
 
-        // Extract metadata before we consume the Arc
-        let exposure_us = img_arc.exposure_time_us;
-        let post_process_time = img_arc.post_process_time;
+        std::thread::spawn(move || {
+            let mut extractor: Option<FastExtractor> = None;
+            let mut last_processed_timestamp = None;
 
-        // Try to take ownership of the Vec to avoid a 2MB memory allocation and copy.
-        // If the camera thread has already captured the next frame, it has dropped its reference
-        // to this Arc, leaving the engine as the sole owner.
-        let img_data = match Arc::try_unwrap(img_arc) {
-            Ok(img) => img.data,          // Zero-copy! We stole the memory directly.
-            Err(arc) => arc.data.clone(), // Fallback to copy if camera thread still holds it
-        };
+            loop {
+                let img_arc = camera_ext.wait_for_next_capture(last_processed_timestamp);
+                last_processed_timestamp = Some(img_arc.timestamp);
 
-        let config = self.camera.get_config().expect("Camera config missing");
+                let exposure_us = img_arc.exposure_time_us;
+                let post_process_time = img_arc.post_process_time;
 
-        let width = config.width as usize;
-        let height = config.height as usize;
+                let img_data = match Arc::try_unwrap(img_arc) {
+                    Ok(img) => img.data,
+                    Err(arc) => arc.data.clone(),
+                };
 
-        // Build ndarray directly from the stolen memory
-        let array_img = match Array2::from_shape_vec((height, width), img_data) {
-            Ok(arr) => arr,
-            Err(e) => {
-                error!("Failed to create Array2 from image data: {}", e);
-                return None;
+                let cam_config = camera_ext.get_config().expect("Camera config missing");
+                let width = cam_config.width as usize;
+                let height = cam_config.height as usize;
+
+                let array_img = match Array2::from_shape_vec((height, width), img_data) {
+                    Ok(arr) => arr,
+                    Err(e) => {
+                        error!("Failed to create Array2 from image data: {}", e);
+                        continue;
+                    }
+                };
+
+                if extractor.is_none() {
+                    let downsample = if width * height > 1_000_000 {
+                        FastDownsample::X2
+                    } else {
+                        FastDownsample::None
+                    };
+
+                    let bg_sub_mode = if config_ext.fast_bg {
+                        Some(FastBgSubMode::GlobalMedian)
+                    } else {
+                        Some(FastBgSubMode::BlockMedian { block_size: 32 })
+                    };
+
+                    let options = FastExtractOptions {
+                        sigma: 3.5,
+                        downsample,
+                        bg_sub_mode,
+                        binary_open: false,
+                        min_area: Some(1),
+                        centroid_window: Some(3),
+                        ..FastExtractOptions::default()
+                    };
+                    extractor = Some(FastExtractor::new(width, height, options));
+                }
+
+                let ext = extractor.as_mut().unwrap();
+
+                let extract_start = Instant::now();
+                let result = if config_ext.fast_extract {
+                    ext.extract_sequential(&array_img)
+                } else {
+                    ext.extract(&array_img)
+                };
+                let extract_time = extract_start.elapsed();
+
+                let num_centroids = result.len();
+                let mut centroids_arr = Array2::<f64>::zeros((num_centroids, 2));
+                for (i, c) in result.iter().enumerate() {
+                    centroids_arr[[i, 0]] = c.y;
+                    centroids_arr[[i, 1]] = c.x;
+                }
+
+                let intermediate = IntermediateResult {
+                    count: num_centroids,
+                    exp_time: Duration::from_micros(exposure_us as u64),
+                    pp_time: post_process_time,
+                    extract_time,
+                    centroids_arr,
+                };
+
+                let (lock, cvar) = &*shared_res_ext;
+                let mut inner = lock.lock().unwrap();
+                *inner = Some(intermediate);
+                cvar.notify_all();
             }
-        };
+        });
 
-        if self.extractor.is_none() {
-            let downsample = if width * height > 1_000_000 {
-                FastDownsample::X2
-            } else {
-                FastDownsample::None
-            };
-
-            let bg_sub_mode = if self.config.fast_bg {
-                Some(FastBgSubMode::GlobalMedian)
-            } else {
-                Some(FastBgSubMode::BlockMedian { block_size: 32 })
-            };
-
-            let options = FastExtractOptions {
-                sigma: 3.5,
-                downsample,
-                bg_sub_mode,
-                //sigma_mode: FastSigmaMode::GlobalRootSquare,
-                binary_open: false,
-                min_area: Some(1),
-                centroid_window: Some(3),
-                ..FastExtractOptions::default()
-            };
-            self.extractor = Some(FastExtractor::new(width, height, options));
-        }
-
-        let extractor = self.extractor.as_mut().unwrap();
-
-        let extract_start = Instant::now();
-        let result = if self.config.fast_extract {
-            extractor.extract_sequential(&array_img)
-        } else {
-            extractor.extract(&array_img)
-        };
-        let extract_time = extract_start.elapsed();
-
-        let num_centroids = result.len();
-
-        let mut centroids_arr = Array2::<f64>::zeros((num_centroids, 2));
-        for (i, c) in result.iter().enumerate() {
-            centroids_arr[[i, 0]] = c.y;
-            centroids_arr[[i, 1]] = c.x;
-        }
-
-        Some((
-            num_centroids,
-            Duration::from_micros(exposure_us as u64),
-            post_process_time,
-            extract_time,
-            centroids_arr,
-        ))
+        std::thread::spawn(move || {
+            let mut engine = self;
+            loop {
+                engine.run_calibration_loop();
+                engine.run_solving_loop();
+            }
+        });
     }
 
-    pub async fn run_calibration_loop(&mut self) {
+    fn wait_for_extraction(&self) -> Option<(usize, Duration, Duration, Duration, Array2<f64>)> {
+        let (lock, cvar) = &*self.shared_result;
+        let mut inner = lock.lock().unwrap();
+
+        let result = cvar
+            .wait_timeout(inner, Duration::from_millis(100))
+            .unwrap();
+        inner = result.0;
+
+        if let Some(res) = inner.take() {
+            Some((
+                res.count,
+                res.exp_time,
+                res.pp_time,
+                res.extract_time,
+                res.centroids_arr,
+            ))
+        } else {
+            None
+        }
+    }
+
+    pub fn run_calibration_loop(&mut self) {
         info!("Starting auto-calibration loop...");
         self.update_status("Calibration");
 
@@ -295,7 +338,7 @@ impl Engine {
             {
                 was_connected = true;
                 self.update_status("Camera Mode");
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                std::thread::sleep(Duration::from_millis(500));
                 continue;
             } else if was_connected {
                 info!("Client disconnected. Restarting calibration hardware reset.");
@@ -364,7 +407,7 @@ impl Engine {
                     }
 
                     if let Some((count, exp_time, pp_time, extract_time, arr)) =
-                        self.extract_image_centroids()
+                        self.wait_for_extraction()
                     {
                         self.update_solve_stats(
                             false,
@@ -397,7 +440,7 @@ impl Engine {
                         last_centroids_arr = Some(arr);
                         valid_samples += 1;
                     } else {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        std::thread::sleep(Duration::from_millis(50));
                     }
                 }
 
@@ -598,12 +641,12 @@ impl Engine {
                 {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                std::thread::sleep(Duration::from_millis(250));
             }
         }
     }
 
-    pub async fn run_solving_loop(&mut self) {
+    pub fn run_solving_loop(&mut self) {
         info!("Entering solving loop...");
         let mut current_exposure = self.camera.get_exposure();
         self.update_solve_stats(
@@ -635,7 +678,7 @@ impl Engine {
             {
                 was_connected = true;
                 self.update_status("Camera Mode");
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                std::thread::sleep(Duration::from_millis(500));
                 continue;
             } else if was_connected {
                 info!("Client disconnected. Returning to calibration mode.");
@@ -644,7 +687,7 @@ impl Engine {
             self.update_status("Solving");
 
             if let Some((count, exp_time, pp_time, extract_time, centroids_arr)) =
-                self.extract_image_centroids()
+                self.wait_for_extraction()
             {
                 if count < MIN_CENTROIDS {
                     // Frame discarded completely. Not added to buffer, does not count as a failure.
@@ -672,7 +715,7 @@ impl Engine {
                 // Check for pending sync to include in the solve
                 let mut pending_sync = None;
                 {
-                    let locked = self.shared_position.lock().await;
+                    let locked = self.shared_position.blocking_lock();
                     if locked.target_op == Some(TargetOp::Sync)
                         && locked.target_ra.is_some()
                         && locked.target_dec.is_some()
@@ -698,7 +741,7 @@ impl Engine {
 
                 match solution.status {
                     SolveStatus::MatchFound => {
-                        let mut locked = self.shared_position.lock().await;
+                        let mut locked = self.shared_position.blocking_lock();
 
                         // Report to telescope server
                         // If we have a target_ra from the solver (for target_pixel), use it.
@@ -863,7 +906,7 @@ impl Engine {
                     }
                 }
             } else {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                std::thread::sleep(Duration::from_millis(100));
             }
         }
     }
