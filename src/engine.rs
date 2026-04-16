@@ -29,7 +29,7 @@ pub struct EngineConfig {
     pub database_path: String,
     pub isp: bool,
     pub fast_bg: bool,
-    pub fast_extract: bool,
+    pub extractor_type: ExtractorType,
     pub uvc: bool,
 }
 
@@ -46,7 +46,7 @@ impl Default for EngineConfig {
             ),
             isp: false,
             fast_bg: false,
-            fast_extract: false,
+            extractor_type: ExtractorType::Sequential,
             uvc: false,
         }
     }
@@ -60,8 +60,16 @@ pub struct IntermediateResult {
     pub centroids_arr: Array2<f64>,
 }
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::RwLock;
+
+#[derive(Clone, Debug, PartialEq, Eq, Default, clap::ValueEnum, Serialize, Deserialize)]
+pub enum ExtractorType {
+    #[default]
+    Sequential,
+    FastExtract,
+    CedarDetect,
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct EngineStateData {
@@ -77,6 +85,7 @@ pub struct EngineStateData {
     pub extract_ms: f64,
     pub solve_ms: f64,
     pub solve_rate_hz: f64,
+    pub capture_requested: bool,
 }
 
 impl Default for EngineStateData {
@@ -94,6 +103,7 @@ impl Default for EngineStateData {
             extract_ms: 0.0,
             solve_ms: 0.0,
             solve_rate_hz: 0.0,
+            capture_requested: false,
         }
     }
 }
@@ -199,6 +209,7 @@ impl Engine {
         let camera_ext = self.camera.clone();
         let config_ext = self.config.clone();
         let shared_res_ext = self.shared_result.clone();
+        let engine_state_ext = self.engine_state.clone();
 
         std::thread::spawn(move || {
             let mut extractor: Option<FastExtractor> = None;
@@ -207,6 +218,15 @@ impl Engine {
             loop {
                 let img_arc = camera_ext.wait_for_next_capture(last_processed_timestamp);
                 last_processed_timestamp = Some(img_arc.timestamp);
+
+                let mut do_capture = false;
+                {
+                    let mut state = engine_state_ext.write().unwrap();
+                    if state.capture_requested {
+                        state.capture_requested = false;
+                        do_capture = true;
+                    }
+                }
 
                 let exposure_us = img_arc.exposure_time_us;
                 let post_process_time = img_arc.post_process_time;
@@ -220,55 +240,120 @@ impl Engine {
                 let width = cam_config.width as usize;
                 let height = cam_config.height as usize;
 
-                let array_img = match Array2::from_shape_vec((height, width), img_data) {
-                    Ok(arr) => arr,
-                    Err(e) => {
-                        error!("Failed to create Array2 from image data: {}", e);
-                        continue;
+                if do_capture {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                    let captures_dir = format!("{}/captures", home);
+                    if let Err(e) = std::fs::create_dir_all(&captures_dir) {
+                        error!("Failed to create captures directory: {}", e);
+                    } else {
+                        let timestamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
+                        let path = format!("{}/capture_{}.jpg", captures_dir, timestamp);
+                        let mut jpeg_data = Vec::new();
+                        let mut encoder =
+                            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_data, 90);
+                        if let Err(e) = encoder.encode(
+                            &img_data,
+                            width as u32,
+                            height as u32,
+                            image::ExtendedColorType::L8,
+                        ) {
+                            error!("Failed to encode captured image to JPEG: {}", e);
+                        } else if let Err(e) = std::fs::write(&path, jpeg_data) {
+                            error!("Failed to write captured image to {}: {}", path, e);
+                        } else {
+                            info!("Captured image saved to {}", path);
+                        }
                     }
-                };
-
-                if extractor.is_none() {
-                    let downsample = if width * height > 1_000_000 {
-                        FastDownsample::X2
-                    } else {
-                        FastDownsample::None
-                    };
-
-                    let bg_sub_mode = if config_ext.fast_bg {
-                        Some(FastBgSubMode::GlobalMedian)
-                    } else {
-                        Some(FastBgSubMode::BlockMedian { block_size: 32 })
-                    };
-
-                    let options = FastExtractOptions {
-                        sigma: 3.5,
-                        downsample,
-                        bg_sub_mode,
-                        binary_open: false,
-                        min_area: Some(1),
-                        centroid_window: Some(3),
-                        ..FastExtractOptions::default()
-                    };
-                    extractor = Some(FastExtractor::new(width, height, options));
                 }
-
-                let ext = extractor.as_mut().unwrap();
 
                 let extract_start = Instant::now();
-                let result = if config_ext.fast_extract {
-                    ext.extract_sequential(&array_img)
-                } else {
-                    ext.extract(&array_img)
-                };
-                let extract_time = extract_start.elapsed();
+                let num_centroids;
+                let mut centroids_arr;
 
-                let num_centroids = result.len();
-                let mut centroids_arr = Array2::<f64>::zeros((num_centroids, 2));
-                for (i, c) in result.iter().enumerate() {
-                    centroids_arr[[i, 0]] = c.y;
-                    centroids_arr[[i, 1]] = c.x;
+                match config_ext.extractor_type {
+                    ExtractorType::Sequential | ExtractorType::FastExtract => {
+                        let array_img = match Array2::from_shape_vec((height, width), img_data) {
+                            Ok(arr) => arr,
+                            Err(e) => {
+                                error!("Failed to create Array2 from image data: {}", e);
+                                continue;
+                            }
+                        };
+
+                        if extractor.is_none() {
+                            let downsample = if width * height > 1_000_000 {
+                                FastDownsample::X2
+                            } else {
+                                FastDownsample::None
+                            };
+
+                            let bg_sub_mode = if config_ext.fast_bg {
+                                Some(FastBgSubMode::GlobalMedian)
+                            } else {
+                                Some(FastBgSubMode::BlockMedian { block_size: 32 })
+                            };
+
+                            let options = FastExtractOptions {
+                                sigma: 3.5,
+                                downsample,
+                                bg_sub_mode,
+                                binary_open: false,
+                                min_area: Some(1),
+                                max_area: Some(20),
+                                //centroid_window: Some(3),
+                                ..FastExtractOptions::default()
+                            };
+                            extractor = Some(FastExtractor::new(width, height, options));
+                        }
+
+                        let ext = extractor.as_mut().unwrap();
+
+                        let result = if config_ext.extractor_type == ExtractorType::Sequential {
+                            ext.extract_sequential(&array_img)
+                        } else {
+                            ext.extract(&array_img)
+                        };
+
+                        num_centroids = result.len();
+                        centroids_arr = Array2::<f64>::zeros((num_centroids, 2));
+                        for (i, c) in result.iter().enumerate() {
+                            centroids_arr[[i, 0]] = c.y;
+                            centroids_arr[[i, 1]] = c.x;
+                        }
+                    }
+                    ExtractorType::CedarDetect => {
+                        if let Some(gray_img) =
+                            image::ImageBuffer::from_raw(width as u32, height as u32, img_data)
+                        {
+                            let noise_estimate =
+                                cedar_detect::algorithm::estimate_noise_from_image(&gray_img);
+                            let (stars, _, _, _) = cedar_detect::algorithm::get_stars_from_image(
+                                &gray_img,
+                                noise_estimate,
+                                8.0,                                            // sigma
+                                true,                                           // normalize_rows
+                                if width * height > 1_000_000 { 2 } else { 1 }, // binning
+                                false,                                          // detect_hot_pixels
+                                false, // return_binned_image
+                            );
+
+                            num_centroids = stars.len();
+                            centroids_arr = Array2::<f64>::zeros((num_centroids, 2));
+                            for (i, c) in stars.iter().enumerate() {
+                                centroids_arr[[i, 0]] = c.centroid_y;
+                                centroids_arr[[i, 1]] = c.centroid_x;
+                            }
+                        } else {
+                            error!("Failed to create ImageBuffer from image data");
+                            continue;
+                        }
+                    }
                 }
+
+                let extract_time = extract_start.elapsed();
 
                 let intermediate = IntermediateResult {
                     count: num_centroids,

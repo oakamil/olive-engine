@@ -13,12 +13,12 @@ use crate::engine::{Engine, EngineConfig, EngineStateData};
 use crate::uvc_camera::Camera as UvcCamera;
 
 #[pyfunction]
-#[pyo3(signature = (isp=false, fast_bg=false, fast_extract=false, rayon_threads=2, uvc=false, target_centroids=20, database_path=None, callback=None))]
+#[pyo3(signature = (isp=false, fast_bg=false, extractor_type="fast_extract_sequential".to_string(), rayon_threads=2, uvc=false, target_centroids=20, database_path=None, callback=None))]
 fn start_engine(
     py: Python,
     isp: bool,
     fast_bg: bool,
-    fast_extract: bool,
+    extractor_type: String,
     rayon_threads: usize,
     uvc: bool,
     target_centroids: usize,
@@ -35,6 +35,15 @@ fn start_engine(
         format!("{}/data/default_database.npz", home)
     });
 
+    let ext_type = match extractor_type.to_lowercase().as_str() {
+        "sequential" | "sequential" => crate::engine::ExtractorType::Sequential,
+        "fast_extract" | "fastextract" => crate::engine::ExtractorType::FastExtract,
+        "cedar_detect" | "cedardetect" | "cedar-detect" => {
+            crate::engine::ExtractorType::CedarDetect
+        }
+        _ => crate::engine::ExtractorType::Sequential,
+    };
+
     let config = EngineConfig {
         min_exposure_us: 16670,
         max_exposure_us: 1000000,
@@ -43,7 +52,7 @@ fn start_engine(
         database_path: db_path,
         isp,
         fast_bg,
-        fast_extract,
+        extractor_type: ext_type,
         uvc,
     };
 

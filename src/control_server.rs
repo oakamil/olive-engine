@@ -4,7 +4,7 @@ use axum::{
     extract::State,
     http::{StatusCode, header},
     response::{Html, IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use std::sync::{
@@ -81,6 +81,7 @@ const INDEX_HTML: &str = r#"
     <p>Solve: <span id="solve">-</span> ms</p>
     <p>Solve Rate (5s): <span id="solve_rate">-</span> Hz</p>
     <button onclick="goCamera()" style="margin-top: 20px;">Camera Mode</button>
+    <button onclick="captureImage()" style="margin-top: 10px;">Capture Image</button>
   </div>
 
   <!-- Camera Mode View -->
@@ -119,6 +120,15 @@ const INDEX_HTML: &str = r#"
       document.getElementById('camera-mode').classList.remove('active');
       document.getElementById('home').classList.add('active');
       document.getElementById('cam-image').src = ''; // stop stream
+    }
+
+    async function captureImage() {
+      try {
+        await fetch('/api/capture', { method: 'POST' });
+        alert('Capture requested');
+      } catch (e) {
+        alert('Failed to request capture');
+      }
     }
 
     // Engine Polling
@@ -397,6 +407,12 @@ async fn get_engine_state(State(state): State<Arc<ServerState>>) -> impl IntoRes
     )
 }
 
+async fn post_capture(State(state): State<Arc<ServerState>>) -> StatusCode {
+    let mut engine_state = state.engine_state.write().unwrap();
+    engine_state.capture_requested = true;
+    StatusCode::OK
+}
+
 pub async fn start_server(
     camera: Arc<dyn CameraTrait>,
     client_connected: Arc<AtomicBool>,
@@ -414,6 +430,7 @@ pub async fn start_server(
         .route("/", get(index))
         .route("/stream", get(stream_handler))
         .route("/api/controls", get(get_controls).post(post_controls))
+        .route("/api/capture", post(post_capture))
         .route("/api/engine_state", get(get_engine_state))
         .with_state(state);
 

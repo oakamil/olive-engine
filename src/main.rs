@@ -46,9 +46,9 @@ struct Args {
     #[arg(long)]
     fast_bg: bool,
 
-    /// Use sequential extraction instead of parallel
-    #[arg(long)]
-    fast_extract: bool,
+    /// Extractor type to use
+    #[arg(long, value_enum, default_value_t = olive_engine::engine::ExtractorType::FastExtractSequential)]
+    extractor_type: olive_engine::engine::ExtractorType,
 
     /// Rayon threads configuration
     #[arg(long, default_value_t = 2)]
@@ -85,7 +85,7 @@ async fn main() {
         database_path,
         isp: if args.uvc { false } else { args.isp },
         fast_bg: args.fast_bg,
-        fast_extract: args.fast_extract,
+        extractor_type: args.extractor_type,
         uvc: args.uvc,
     };
 

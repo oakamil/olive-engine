@@ -30,6 +30,7 @@ memchr = "2.7"
 futures = "0.3.32"
 serde = { version = "1.0.228", features = ["derive"] }
 pyo3 = { version = "0.21.2" }
+cedar_detect = { git = "https://github.com/oakamil/cedar-detect" }
 
 [features]
 extension-module = ["pyo3/extension-module"]
