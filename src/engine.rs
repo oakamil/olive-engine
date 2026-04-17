@@ -1,11 +1,12 @@
 // Required Notice: Copyright (c) 2026 Omair Kamil
 // See LICENSE file in root directory for license terms.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use log::{error, info, warn};
 use ndarray::Array2;
+use serde::{Deserialize, Serialize};
 
 use crate::CameraTrait;
 use crate::telescope_server::{Lx200Telescope, Lx200WifiTelescope, SharedPosition, TargetOp};
@@ -28,8 +29,8 @@ pub struct EngineConfig {
     pub target_centroids: usize,
     pub database_path: String,
     pub isp: bool,
-    pub fast_bg: bool,
-    pub extractor_type: ExtractorType,
+    pub bg_mode: BgMode,
+    pub extractor_type: Extractor,
     pub uvc: bool,
 }
 
@@ -45,8 +46,8 @@ impl Default for EngineConfig {
                 std::env::var("HOME").unwrap_or_default()
             ),
             isp: false,
-            fast_bg: false,
-            extractor_type: ExtractorType::Sequential,
+            bg_mode: BgMode::Line,
+            extractor_type: Extractor::Sequential,
             uvc: false,
         }
     }
@@ -60,15 +61,20 @@ pub struct IntermediateResult {
     pub centroids_arr: Array2<f64>,
 }
 
-use serde::{Deserialize, Serialize};
-use std::sync::RwLock;
-
 #[derive(Clone, Debug, PartialEq, Eq, Default, clap::ValueEnum, Serialize, Deserialize)]
-pub enum ExtractorType {
+pub enum Extractor {
     #[default]
     Sequential,
-    FastExtract,
-    CedarDetect,
+    Fast,
+    Cedar,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default, clap::ValueEnum, Serialize, Deserialize)]
+pub enum BgMode {
+    #[default]
+    Line,
+    Global,
+    Block,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -114,7 +120,7 @@ pub struct Engine {
     solver: Tetra3,
     fov: Option<f64>,
 
-    shared_position: Arc<tokio::sync::Mutex<SharedPosition>>,
+    shared_position: Arc<std::sync::RwLock<SharedPosition>>,
     target_ra: Option<f64>,
     target_dec: Option<f64>,
     target_pixel: Option<(f64, f64)>,
@@ -135,7 +141,7 @@ impl Engine {
         engine_state: Arc<RwLock<EngineStateData>>,
     ) -> Self {
         let solver = Tetra3::new(&config.database_path);
-        let shared_position = Arc::new(tokio::sync::Mutex::new(SharedPosition::default()));
+        let shared_position = Arc::new(RwLock::new(SharedPosition::default()));
 
         let mut server = Lx200WifiTelescope::new(shared_position.clone());
         tokio::spawn(async move {
@@ -274,7 +280,7 @@ impl Engine {
                 let mut centroids_arr;
 
                 match config_ext.extractor_type {
-                    ExtractorType::Sequential | ExtractorType::FastExtract => {
+                    Extractor::Sequential | Extractor::Fast => {
                         let array_img = match Array2::from_shape_vec((height, width), img_data) {
                             Ok(arr) => arr,
                             Err(e) => {
@@ -290,10 +296,12 @@ impl Engine {
                                 FastDownsample::None
                             };
 
-                            let bg_sub_mode = if config_ext.fast_bg {
-                                Some(FastBgSubMode::GlobalMedian)
-                            } else {
-                                Some(FastBgSubMode::BlockMedian { block_size: 32 })
+                            let bg_sub_mode = match config_ext.bg_mode {
+                                BgMode::Global => Some(FastBgSubMode::GlobalMedian),
+                                BgMode::Block => {
+                                    Some(FastBgSubMode::BlockMedian { block_size: 32 })
+                                }
+                                BgMode::Line => Some(FastBgSubMode::LineMedian),
                             };
 
                             let options = FastExtractOptions {
@@ -311,7 +319,7 @@ impl Engine {
 
                         let ext = extractor.as_mut().unwrap();
 
-                        let result = if config_ext.extractor_type == ExtractorType::Sequential {
+                        let result = if config_ext.extractor_type == Extractor::Sequential {
                             ext.extract_sequential(&array_img)
                         } else {
                             ext.extract(&array_img)
@@ -324,7 +332,7 @@ impl Engine {
                             centroids_arr[[i, 1]] = c.x;
                         }
                     }
-                    ExtractorType::CedarDetect => {
+                    Extractor::Cedar => {
                         if let Some(gray_img) =
                             image::ImageBuffer::from_raw(width as u32, height as u32, img_data)
                         {
@@ -800,7 +808,7 @@ impl Engine {
                 // Check for pending sync to include in the solve
                 let mut pending_sync = None;
                 {
-                    let locked = self.shared_position.blocking_lock();
+                    let locked = self.shared_position.read().unwrap();
                     if locked.target_op == Some(TargetOp::Sync)
                         && locked.target_ra.is_some()
                         && locked.target_dec.is_some()
@@ -826,7 +834,7 @@ impl Engine {
 
                 match solution.status {
                     SolveStatus::MatchFound => {
-                        let mut locked = self.shared_position.blocking_lock();
+                        let mut locked = self.shared_position.write().unwrap();
 
                         // Report to telescope server
                         // If we have a target_ra from the solver (for target_pixel), use it.

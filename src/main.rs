@@ -42,13 +42,13 @@ struct Args {
     #[arg(long)]
     uvc: bool,
 
-    /// Use GlobalMedian instead of BlockMedian for extraction
-    #[arg(long)]
-    fast_bg: bool,
+    /// Background subtraction mode for extraction
+    #[arg(long, value_enum, default_value_t = olive_engine::engine::BgMode::Line)]
+    bg_mode: olive_engine::engine::BgMode,
 
     /// Extractor type to use
-    #[arg(long, value_enum, default_value_t = olive_engine::engine::ExtractorType::FastExtractSequential)]
-    extractor_type: olive_engine::engine::ExtractorType,
+    #[arg(long, value_enum, default_value_t = olive_engine::engine::Extractor::Sequential)]
+    extractor_type: olive_engine::engine::Extractor,
 
     /// Rayon threads configuration
     #[arg(long, default_value_t = 2)]
@@ -84,7 +84,7 @@ async fn main() {
         target_centroids: args.target_centroids,
         database_path,
         isp: if args.uvc { false } else { args.isp },
-        fast_bg: args.fast_bg,
+        bg_mode: args.bg_mode,
         extractor_type: args.extractor_type,
         uvc: args.uvc,
     };

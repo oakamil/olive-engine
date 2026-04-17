@@ -7,7 +7,7 @@
 //    https://skymtn.com/mapug-astronomy/ragreiner/LX200Commands.html
 //
 
-use std::{error::Error, f64::consts::TAU, sync::Arc};
+use std::{error::Error, f64::consts::TAU, sync::Arc, sync::RwLock};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, FixedOffset, Local, Utc};
@@ -73,7 +73,7 @@ pub trait Lx200Telescope {
 }
 
 pub struct Lx200WifiTelescope {
-    controller: Lx200Controller,
+    controller: Arc<RwLock<Lx200Controller>>,
 }
 
 #[async_trait]
@@ -90,8 +90,11 @@ impl Lx200Telescope for Lx200WifiTelescope {
                 Ok((stream, _)) => {
                     debug!("WiFi LX200 connection opened");
                     let (reader, writer) = stream.into_split();
-                    self.controller.handle_connection(reader, writer).await;
-                    debug!("WiFi LX200 connection closed");
+                    let controller = self.controller.clone();
+                    tokio::spawn(async move {
+                        Lx200Controller::handle_connection(controller, reader, writer).await;
+                        debug!("WiFi LX200 connection closed");
+                    });
                 }
                 Err(e) => {
                     warn!("Failed to accept WiFi LX200 connection: {:?}", e);
@@ -102,16 +105,16 @@ impl Lx200Telescope for Lx200WifiTelescope {
 }
 
 impl Lx200WifiTelescope {
-    pub fn new(shared_position: Arc<tokio::sync::Mutex<SharedPosition>>) -> Self {
+    pub fn new(shared_position: Arc<RwLock<SharedPosition>>) -> Self {
         Lx200WifiTelescope {
-            controller: Lx200Controller::new(shared_position),
+            controller: Arc::new(RwLock::new(Lx200Controller::new(shared_position))),
         }
     }
 }
 
 #[derive(Default, Debug)]
 struct Lx200Controller {
-    shared_position: Arc<tokio::sync::Mutex<SharedPosition>>,
+    shared_position: Arc<RwLock<SharedPosition>>,
 
     // Pending target coordinates (in jnow_epoch) for sync/slew
     target_ra: Option<f64>,
@@ -143,7 +146,7 @@ struct Lx200Controller {
 }
 
 impl Lx200Controller {
-    pub fn new(shared_position: Arc<tokio::sync::Mutex<SharedPosition>>) -> Self {
+    pub fn new(shared_position: Arc<RwLock<SharedPosition>>) -> Self {
         let dt = Local::now();
         let jnow = ((dt.year() as f64 + dt.ordinal0() as f64 / 365.0) * 10.0).round() / 10.0;
         debug!("Using now epoch: {}", jnow);
@@ -201,16 +204,16 @@ impl Lx200Controller {
         precess_coordinates(ra, dec, 2000.0, self.jnow_epoch)
     }
 
-    async fn get_ra(&self) -> String {
-        let locked_position = self.shared_position.lock().await;
+    fn get_ra(&self) -> String {
+        let locked_position = self.shared_position.read().unwrap();
         let (ra, _) =
             self.convert_to_jnow(locked_position.telescope_ra, locked_position.telescope_dec);
         let (h, m, s) = Self::to_hms((ra / 15.0).rem_euclid(24.0));
         format!("{h:02}:{m:02}:{s:02}#")
     }
 
-    async fn get_dec(&mut self) -> String {
-        let locked_position = self.shared_position.lock().await;
+    fn get_dec(&self) -> String {
+        let locked_position = self.shared_position.read().unwrap();
         let dec = {
             let (_, dec) =
                 self.convert_to_jnow(locked_position.telescope_ra, locked_position.telescope_dec);
@@ -227,7 +230,7 @@ impl Lx200Controller {
         format!("{sign}{h:02}*{m:02}'{s:02}#")
     }
 
-    async fn set_target_ra(&mut self, cmd: &str) -> String {
+    fn set_target_ra(&mut self, cmd: &str) -> String {
         if cmd.len() < 11 {
             warn!("Unexpected ra length, cmd: {}", cmd);
             return Self::get_failure();
@@ -244,7 +247,7 @@ impl Lx200Controller {
         }
     }
 
-    async fn set_target_dec(&mut self, cmd: &str) -> String {
+    fn set_target_dec(&mut self, cmd: &str) -> String {
         if cmd.len() < 12 {
             warn!("Unexpected dec length, cmd: {}", cmd);
             return Self::get_failure();
@@ -260,11 +263,11 @@ impl Lx200Controller {
         }
     }
 
-    async fn slew(&mut self) -> String {
+    fn slew(&mut self) -> String {
         if let (Some(ra), Some(dec)) = (self.target_ra.take(), self.target_dec.take()) {
             let (j2000_ra, j2000_dec) = self.convert_to_j2000(ra, dec);
             debug!("Slewing to {}, {}", j2000_ra, j2000_dec);
-            let mut locked = self.shared_position.lock().await;
+            let mut locked = self.shared_position.write().unwrap();
             locked.target_ra = Some(j2000_ra);
             locked.target_dec = Some(j2000_dec);
             locked.target_op = Some(TargetOp::Slew);
@@ -274,11 +277,11 @@ impl Lx200Controller {
         }
     }
 
-    async fn sync(&mut self) -> String {
+    fn sync(&mut self) -> String {
         if let (Some(ra), Some(dec)) = (self.target_ra.take(), self.target_dec.take()) {
             let (j2000_ra, j2000_dec) = self.convert_to_j2000(ra, dec);
             debug!("Syncing to {}, {}", j2000_ra, j2000_dec);
-            let mut locked = self.shared_position.lock().await;
+            let mut locked = self.shared_position.write().unwrap();
             locked.target_ra = Some(j2000_ra);
             locked.target_dec = Some(j2000_dec);
             locked.target_op = Some(TargetOp::Sync);
@@ -286,13 +289,13 @@ impl Lx200Controller {
         " M31 EX GAL MAG 3.5 SZ178.0'#".to_string()
     }
 
-    async fn abort(&mut self) {
-        let mut locked = self.shared_position.lock().await;
+    fn abort(&mut self) {
+        let mut locked = self.shared_position.write().unwrap();
         locked.target_op = None;
         debug!("Stopping slew");
     }
 
-    async fn set_latitude(&mut self, cmd: &str) -> String {
+    fn set_latitude(&mut self, cmd: &str) -> String {
         if cmd.len() < 9 {
             warn!("Unexpected lat length, cmd: {}", cmd);
             return Self::get_failure();
@@ -302,7 +305,7 @@ impl Lx200Controller {
             Some(n) => {
                 info!("Set observer latitude");
                 self.latitude = cmd[3..9].to_string();
-                let mut locked = self.shared_position.lock().await;
+                let mut locked = self.shared_position.write().unwrap();
                 locked.site_latitude = Some(n);
                 Self::get_success()
             }
@@ -310,7 +313,7 @@ impl Lx200Controller {
         }
     }
 
-    async fn set_longitude(&mut self, cmd: &str) -> String {
+    fn set_longitude(&mut self, cmd: &str) -> String {
         if cmd.len() < 9 {
             warn!("Unexpected lon length, cmd: {}", cmd);
             return Self::get_failure();
@@ -321,7 +324,7 @@ impl Lx200Controller {
                 self.longitude = cmd[3..9].to_string();
                 let longitude = if n > 180.0 { 360.0 - n } else { -n };
                 info!("Set observer longitude");
-                let mut locked = self.shared_position.lock().await;
+                let mut locked = self.shared_position.write().unwrap();
                 locked.site_longitude = Some(longitude);
                 Self::get_success()
             }
@@ -359,7 +362,7 @@ impl Lx200Controller {
         Self::get_success()
     }
 
-    async fn set_date(&mut self, cmd: &str) -> String {
+    fn set_date(&mut self, cmd: &str) -> String {
         if cmd.len() < 11 {
             warn!("Unexpected date length, cmd: {}", cmd);
             return Self::get_failure();
@@ -374,7 +377,7 @@ impl Lx200Controller {
                     self.datetime = dt;
                     self.jnow_epoch =
                         ((dt.year() as f64 + dt.ordinal0() as f64 / 365.0) * 10.0).round() / 10.0;
-                    let mut locked = self.shared_position.lock().await;
+                    let mut locked = self.shared_position.write().unwrap();
                     locked.site_date = Some(dt.with_timezone(&Utc));
                     return "1Updating Planetary Data# #".to_string();
                 }
@@ -415,8 +418,8 @@ impl Lx200Controller {
         format!("{0}#", self.longitude)
     }
 
-    async fn get_distance_bars(&self) -> String {
-        let locked = self.shared_position.lock().await;
+    fn get_distance_bars(&self) -> String {
+        let locked = self.shared_position.read().unwrap();
         if locked.target_op == Some(TargetOp::Slew) {
             "\x7f#".to_string()
         } else {
@@ -483,7 +486,7 @@ impl Lx200Controller {
         Self::parse_coordinates(deg, min, "0")
     }
 
-    async fn handle_connection<R, W>(&mut self, reader: R, mut writer: W)
+    async fn handle_connection<R, W>(controller: Arc<RwLock<Self>>, reader: R, mut writer: W)
     where
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
@@ -538,7 +541,7 @@ impl Lx200Controller {
                 if buffer == ACK_CMD {
                     debug!("Received ack command");
                     buffer.clear();
-                    self.is_stellarium = true;
+                    controller.write().unwrap().is_stellarium = true;
 
                     if let Err(e) = Self::process_output(&mut writer, "A".to_string()).await {
                         warn!("Failed to send ack response: {:?}", e);
@@ -553,11 +556,12 @@ impl Lx200Controller {
             if buffer.len() == 1 {
                 continue;
             }
-            match self.process_input(&buffer).await {
-                Some(result) => {
-                    debug!("Writing to client: {}", result);
+            let result = controller.write().unwrap().process_input(&buffer);
+            match result {
+                Some(res) => {
+                    debug!("Writing to client: {}", res);
 
-                    if let Err(e) = Self::process_output(&mut writer, result).await {
+                    if let Err(e) = Self::process_output(&mut writer, res).await {
                         warn!("Failed to send data to client: {:?}", e);
                         return;
                     }
@@ -576,18 +580,18 @@ impl Lx200Controller {
         Ok(())
     }
 
-    async fn process_input(&mut self, buffer: &[u8]) -> Option<String> {
+    fn process_input(&mut self, buffer: &[u8]) -> Option<String> {
         let input = String::from_utf8_lossy(&buffer);
         let in_data = input.as_ref();
         if let Some(command) = Self::extract_command(in_data) {
             match command {
                 "CM" => {
                     debug!("Received sync command");
-                    Some(self.sync().await)
+                    Some(self.sync())
                 }
                 "D" => {
                     debug!("Received distance bars command");
-                    Some(self.get_distance_bars().await)
+                    Some(self.get_distance_bars())
                 }
                 "GC" => {
                     debug!("Received get date command");
@@ -595,7 +599,7 @@ impl Lx200Controller {
                 }
                 "GD" => {
                     debug!("Received get declination command");
-                    Some(self.get_dec().await)
+                    Some(self.get_dec())
                 }
                 "GG" => {
                     debug!("Received get hours to UTC command");
@@ -607,7 +611,7 @@ impl Lx200Controller {
                 }
                 "GR" => {
                     debug!("Received get ra command");
-                    Some(self.get_ra().await)
+                    Some(self.get_ra())
                 }
                 "GVD" => {
                     debug!("Received get firmware date command");
@@ -639,7 +643,7 @@ impl Lx200Controller {
                 }
                 "MS" => {
                     debug!("Received slew to object command");
-                    Some(self.slew().await)
+                    Some(self.slew())
                 }
                 "Me" | "Mn" | "Ms" | "Mw" => {
                     debug!("Received movement command");
@@ -647,7 +651,7 @@ impl Lx200Controller {
                 }
                 "Q" => {
                     debug!("Received abort command");
-                    self.abort().await;
+                    self.abort();
                     None
                 }
                 "Qe" | "Qn" | "Qs" | "Qw" => {
@@ -660,7 +664,7 @@ impl Lx200Controller {
                 }
                 "SC" => {
                     debug!("Received set date command: {}", in_data);
-                    Some(self.set_date(in_data).await)
+                    Some(self.set_date(in_data))
                 }
                 "SG" => {
                     debug!("Received set hours to UTC command: {}", in_data);
@@ -672,19 +676,19 @@ impl Lx200Controller {
                 }
                 "Sd" => {
                     debug!("Received set declination command: {}", in_data);
-                    Some(self.set_target_dec(in_data).await)
+                    Some(self.set_target_dec(in_data))
                 }
                 "Sg" => {
                     debug!("Received set longitude command: {}", in_data);
-                    Some(self.set_longitude(in_data).await)
+                    Some(self.set_longitude(in_data))
                 }
                 "Sr" => {
                     debug!("Received set ra command: {}", in_data);
-                    Some(self.set_target_ra(in_data).await)
+                    Some(self.set_target_ra(in_data))
                 }
                 "St" => {
                     debug!("Received set latitude command: {}", in_data);
-                    Some(self.set_latitude(in_data).await)
+                    Some(self.set_latitude(in_data))
                 }
                 "Sw" => {
                     debug!("Received set max slew rate command: {}", in_data);
@@ -712,12 +716,11 @@ mod tests {
 
     use approx::assert_abs_diff_eq;
     use chrono::TimeZone;
-    use tokio::sync::Mutex;
 
     use super::*;
 
-    async fn setup_controller() -> (Lx200Controller, Arc<Mutex<SharedPosition>>) {
-        let shared_position = Arc::new(Mutex::new(SharedPosition::default()));
+    async fn setup_controller() -> (Lx200Controller, Arc<RwLock<SharedPosition>>) {
+        let shared_position = Arc::new(RwLock::new(SharedPosition::default()));
         let controller = Lx200Controller::new(shared_position.clone());
         (controller, shared_position)
     }
@@ -813,15 +816,15 @@ mod tests {
 
         // Set position in a block to release the lock at the end
         {
-            let mut locked_position = position_arc.lock().await;
+            let mut locked_position = position_arc.write().unwrap();
             locked_position.telescope_ra = ra_j2000;
             locked_position.telescope_dec = dec_j2000;
         }
 
-        let result_ra = controller.process_input(b":GR#").await;
+        let result_ra = controller.process_input(b":GR#");
         assert_eq!(result_ra.as_deref(), Some("01:30:00#"));
 
-        let result_dec = controller.process_input(b":GD#").await;
+        let result_dec = controller.process_input(b":GD#");
         assert_eq!(result_dec.as_deref(), Some("+30*30'00#"));
     }
 
@@ -832,36 +835,36 @@ mod tests {
         let (mut controller, position_arc) = setup_controller().await;
         controller.jnow_epoch = 2000.0;
 
-        let set_ra = controller.process_input(b":Sr10:30:00#").await;
+        let set_ra = controller.process_input(b":Sr10:30:00#");
         assert_eq!(set_ra.as_deref(), Some("1"));
         assert_approx_eq(controller.target_ra.unwrap(), 157.5);
 
-        let set_dec = controller.process_input(b":Sd-15*30:00#").await;
+        let set_dec = controller.process_input(b":Sd-15*30:00#");
         assert_eq!(set_dec.as_deref(), Some("1"));
         assert_approx_eq(controller.target_dec.unwrap(), -15.5);
 
-        let slew_result = controller.process_input(b":MS#").await;
+        let slew_result = controller.process_input(b":MS#");
         // 0 is success for slew
         assert_eq!(slew_result.as_deref(), Some("0"));
 
         // Check shared position state
         {
-            let locked_position = position_arc.lock().await;
+            let locked_position = position_arc.read().unwrap();
             assert_approx_eq(locked_position.target_ra.unwrap(), 157.5);
             assert_approx_eq(locked_position.target_dec.unwrap(), -15.5);
             assert_eq!(locked_position.target_op, Some(TargetOp::Slew));
         }
 
-        let abort = controller.process_input(b":Q#").await;
+        let abort = controller.process_input(b":Q#");
         assert_eq!(abort, None);
 
         {
-            let locked_position = position_arc.lock().await;
+            let locked_position = position_arc.read().unwrap();
             assert!(locked_position.target_op.is_none());
         }
 
         // Slew should fail if no target
-        let slew_fail_result = controller.process_input(b":MS#").await;
+        let slew_fail_result = controller.process_input(b":MS#");
         assert_eq!(slew_fail_result.as_deref(), Some("1No object#"));
     }
 
@@ -871,17 +874,17 @@ mod tests {
         controller.jnow_epoch = 2000.0;
 
         // Even with no target we should still return canned result
-        let mut sync = controller.process_input(b":CM#").await;
+        let mut sync = controller.process_input(b":CM#");
         assert_eq!(sync.as_deref(), Some(" M31 EX GAL MAG 3.5 SZ178.0'#"));
 
-        controller.process_input(b":Sr01:00:00#").await;
-        controller.process_input(b":Sd+20*00:00#").await;
+        controller.process_input(b":Sr01:00:00#");
+        controller.process_input(b":Sd+20*00:00#");
 
-        sync = controller.process_input(b":CM#").await;
+        sync = controller.process_input(b":CM#");
         assert_eq!(sync.as_deref(), Some(" M31 EX GAL MAG 3.5 SZ178.0'#"));
 
         // Check shared position state
-        let locked_position = position_arc.lock().await;
+        let locked_position = position_arc.read().unwrap();
         assert_approx_eq(locked_position.target_ra.unwrap(), 15.0);
         assert_approx_eq(locked_position.target_dec.unwrap(), 20.0);
         assert_eq!(locked_position.target_op, Some(TargetOp::Sync));
@@ -892,36 +895,36 @@ mod tests {
     async fn test_set_get_location() {
         let (mut controller, position_arc) = setup_controller().await;
 
-        let set_lat_n = controller.process_input(b":St+37:46#").await;
+        let set_lat_n = controller.process_input(b":St+37:46#");
         assert_eq!(set_lat_n.as_deref(), Some("1"));
         assert_eq!(controller.latitude, "+37:46");
-        let lat_n = position_arc.lock().await.site_latitude.unwrap();
+        let lat_n = position_arc.read().unwrap().site_latitude.unwrap();
         assert_approx_eq(lat_n, 37.7667);
 
-        let set_lat_s = controller.process_input(b":St-37:46#").await;
+        let set_lat_s = controller.process_input(b":St-37:46#");
         assert_eq!(set_lat_s.as_deref(), Some("1"));
         assert_eq!(controller.latitude, "-37:46");
-        let lat_s = position_arc.lock().await.site_latitude.unwrap();
+        let lat_s = position_arc.read().unwrap().site_latitude.unwrap();
         assert_approx_eq(lat_s, -37.7667);
 
         // Less than 180 is West for longitude
-        let set_lon_w = controller.process_input(b":Sg122:25#").await;
+        let set_lon_w = controller.process_input(b":Sg122:25#");
         assert_eq!(set_lon_w.as_deref(), Some("1"));
         assert_eq!(controller.longitude, "122:25");
-        let lon_w = position_arc.lock().await.site_longitude.unwrap();
+        let lon_w = position_arc.read().unwrap().site_longitude.unwrap();
         assert_approx_eq(lon_w, -122.4167);
 
         // Longitude values are > 180 for East
-        let set_lon_e = controller.process_input(b":Sg300:00#").await;
+        let set_lon_e = controller.process_input(b":Sg300:00#");
         assert_eq!(set_lon_e.as_deref(), Some("1"));
         assert_eq!(controller.longitude, "300:00");
-        let lon_e = position_arc.lock().await.site_longitude.unwrap();
+        let lon_e = position_arc.read().unwrap().site_longitude.unwrap();
         // 360 - 300 = 60.0
         assert_approx_eq(lon_e, 60.0);
 
-        let get_lat_result = controller.process_input(b":Gt#").await;
+        let get_lat_result = controller.process_input(b":Gt#");
         assert_eq!(get_lat_result.as_deref(), Some("-37:46#"));
-        let get_lon_result = controller.process_input(b":Gg#").await;
+        let get_lon_result = controller.process_input(b":Gg#");
         assert_eq!(get_lon_result.as_deref(), Some("300:00#"));
     }
 
@@ -930,15 +933,15 @@ mod tests {
         let (mut controller, position_arc) = setup_controller().await;
 
         // Since LX200 protocol involves passing hours to UTC, flip the sign
-        let set_time_to_utc = controller.process_input(b":SG+08.0#").await;
+        let set_time_to_utc = controller.process_input(b":SG+08.0#");
         assert_eq!(set_time_to_utc.as_deref(), Some("1"));
         assert_eq!(controller.timezone, Some("-0800".to_string()));
 
-        let set_time = controller.process_input(b":SL10:30:00#").await;
+        let set_time = controller.process_input(b":SL10:30:00#");
         assert_eq!(set_time.as_deref(), Some("1"));
         assert_eq!(controller.time, Some("10:30:00".to_string()));
 
-        let set_date = controller.process_input(b":SC11/15/25#").await;
+        let set_date = controller.process_input(b":SC11/15/25#");
         assert_eq!(set_date.as_deref(), Some("1Updating Planetary Data# #"));
 
         // Pending time and timezone should be consumed
@@ -954,7 +957,7 @@ mod tests {
 
         // Check the SharedPosition's time
         {
-            let locked_position = position_arc.lock().await;
+            let locked_position = position_arc.read().unwrap();
             assert_eq!(
                 locked_position.site_date,
                 Some(expected_dt.with_timezone(&Utc))
@@ -962,18 +965,15 @@ mod tests {
         }
 
         assert_eq!(
-            controller.process_input(b":GL#").await.as_deref(),
+            controller.process_input(b":GL#").as_deref(),
             Some("10:30:00#")
         );
         assert_eq!(
-            controller.process_input(b":GC#").await.as_deref(),
+            controller.process_input(b":GC#").as_deref(),
             Some("11/15/25#")
         );
         // Sign flip here as well to match the LX200 protocol
-        assert_eq!(
-            controller.process_input(b":GG#").await.as_deref(),
-            Some("+08.0#")
-        );
+        assert_eq!(controller.process_input(b":GG#").as_deref(), Some("+08.0#"));
     }
 
     // --- Tests for Remaining Get Commands ---
@@ -983,22 +983,19 @@ mod tests {
         let (mut controller, _) = setup_controller().await;
 
         // Firmware date should be something like "Nov 14 2025#"
-        assert_eq!(controller.process_input(b":GVD#").await.unwrap().len(), 12);
+        assert_eq!(controller.process_input(b":GVD#").unwrap().len(), 12);
         // Firmware version should be something like "01.0#"
-        assert_eq!(controller.process_input(b":GVN#").await.unwrap().len(), 5);
+        assert_eq!(controller.process_input(b":GVN#").unwrap().len(), 5);
         // Model shouldn't change
         assert_eq!(
-            controller.process_input(b":GVP#").await.as_deref(),
+            controller.process_input(b":GVP#").as_deref(),
             Some("Lx200Server#")
         );
         // Firmware time should be something like "23:00:00#"
-        assert_eq!(controller.process_input(b":GVT#").await.unwrap().len(), 9);
+        assert_eq!(controller.process_input(b":GVT#").unwrap().len(), 9);
         // Status command indicates A for Alt-Az, T for tracking state, and 1
         // for 1-star aligned
-        assert_eq!(
-            controller.process_input(b":GW#").await.as_deref(),
-            Some("AT1")
-        );
+        assert_eq!(controller.process_input(b":GW#").as_deref(), Some("AT1"));
     }
 
     #[tokio::test]
@@ -1006,19 +1003,16 @@ mod tests {
         let (mut controller, position_arc) = setup_controller().await;
 
         {
-            let mut locked_position = position_arc.lock().await;
+            let mut locked_position = position_arc.write().unwrap();
             locked_position.target_op = None;
         }
-        assert_eq!(controller.process_input(b":D#").await.as_deref(), Some("#"));
+        assert_eq!(controller.process_input(b":D#").as_deref(), Some("#"));
 
         {
-            let mut locked_position = position_arc.lock().await;
+            let mut locked_position = position_arc.write().unwrap();
             locked_position.target_op = Some(TargetOp::Slew);
         }
-        assert_eq!(
-            controller.process_input(b":D#").await.as_deref(),
-            Some("\x7f#")
-        );
+        assert_eq!(controller.process_input(b":D#").as_deref(), Some("\x7f#"));
     }
 
     // --- Special Case Tests ---
@@ -1027,16 +1021,16 @@ mod tests {
     async fn test_handle_connection_ack() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let (mut controller, _) = setup_controller().await;
+        let (controller, _) = setup_controller().await;
+        let controller_arc = Arc::new(RwLock::new(controller));
         let (client, server) = tokio::io::duplex(1024);
         let (server_read, server_write) = tokio::io::split(server);
         let (mut client_read, mut client_write) = tokio::io::split(client);
 
         let server_handle = tokio::spawn(async move {
-            controller
-                .handle_connection(server_read, server_write)
+            Lx200Controller::handle_connection(controller_arc.clone(), server_read, server_write)
                 .await;
-            controller
+            controller_arc
         });
 
         // Ack command is unterminated, should result in A for Alt-Az mode
@@ -1049,8 +1043,8 @@ mod tests {
         // Shut down the client write half so the server sees EOF and exits
         client_write.shutdown().await.unwrap();
 
-        let controller = server_handle.await.unwrap();
-        assert!(controller.is_stellarium);
+        let controller_res = server_handle.await.unwrap();
+        assert!(controller_res.read().unwrap().is_stellarium);
     }
 
     #[tokio::test]
@@ -1059,15 +1053,14 @@ mod tests {
 
         let (mut controller, _) = setup_controller().await;
         controller.jnow_epoch = 2000.0;
+        let controller_arc = Arc::new(RwLock::new(controller));
 
         let (client, server) = tokio::io::duplex(1024);
         let (server_read, server_write) = tokio::io::split(server);
         let (mut client_read, mut client_write) = tokio::io::split(client);
 
         let server_handle = tokio::spawn(async move {
-            controller
-                .handle_connection(server_read, server_write)
-                .await;
+            Lx200Controller::handle_connection(controller_arc, server_read, server_write).await;
         });
 
         // Stellarium sends a leading #
@@ -1087,15 +1080,14 @@ mod tests {
 
         let (mut controller, _) = setup_controller().await;
         controller.jnow_epoch = 2000.0;
+        let controller_arc = Arc::new(RwLock::new(controller));
 
         let (client, server) = tokio::io::duplex(1024);
         let (server_read, server_write) = tokio::io::split(server);
         let (mut client_read, mut client_write) = tokio::io::split(client);
 
         let server_handle = tokio::spawn(async move {
-            controller
-                .handle_connection(server_read, server_write)
-                .await;
+            Lx200Controller::handle_connection(controller_arc, server_read, server_write).await;
         });
 
         // Send the first fragment of the command
@@ -1129,9 +1121,10 @@ mod tests {
 
         let (mut controller, position_arc) = setup_controller().await;
         controller.jnow_epoch = 2000.0;
+        let controller_arc = Arc::new(RwLock::new(controller));
 
         {
-            let mut locked_position = position_arc.lock().await;
+            let mut locked_position = position_arc.write().unwrap();
             locked_position.telescope_ra = 0.0;
             locked_position.telescope_dec = 0.0;
         }
@@ -1141,9 +1134,7 @@ mod tests {
         let (mut client_read, mut client_write) = tokio::io::split(client);
 
         let server_handle = tokio::spawn(async move {
-            controller
-                .handle_connection(server_read, server_write)
-                .await;
+            Lx200Controller::handle_connection(controller_arc, server_read, server_write).await;
         });
 
         // SkySafari in Bluetooth mode sets slew rate and gets RA together
@@ -1172,28 +1163,28 @@ mod tests {
         let internal_ra = 150.0;
         let internal_dec = 45.0;
         {
-            let mut locked_position = position_arc.lock().await;
+            let mut locked_position = position_arc.write().unwrap();
             locked_position.telescope_ra = internal_ra;
             locked_position.telescope_dec = internal_dec;
         }
 
         // Ensure no precessing for telescope position
-        let ra_result = controller.process_input(b":GR#").await;
+        let ra_result = controller.process_input(b":GR#");
         assert_eq!(ra_result.as_deref(), Some("10:00:00#"));
-        let dec_result = controller.process_input(b":GD#").await;
+        let dec_result = controller.process_input(b":GD#");
         assert_eq!(dec_result.as_deref(), Some("+45*00'00#"));
 
         // Target: 20h RA (300 degrees), -30d Dec
-        let set_ra_res = controller.process_input(b":Sr20:00:00#").await;
+        let set_ra_res = controller.process_input(b":Sr20:00:00#");
         assert_eq!(set_ra_res.as_deref(), Some("1"));
-        let set_dec_res = controller.process_input(b":Sd-30*00:00#").await;
+        let set_dec_res = controller.process_input(b":Sd-30*00:00#");
         assert_eq!(set_dec_res.as_deref(), Some("1"));
-        let slew_res = controller.process_input(b":MS#").await;
+        let slew_res = controller.process_input(b":MS#");
         assert_eq!(slew_res.as_deref(), Some("0"));
 
         // Ensure no precessing for target
         {
-            let locked_position = position_arc.lock().await;
+            let locked_position = position_arc.read().unwrap();
             assert_eq!(locked_position.target_op, Some(TargetOp::Slew));
             assert_approx_eq(locked_position.target_ra.unwrap(), 300.0);
             assert_approx_eq(locked_position.target_dec.unwrap(), -30.0);
