@@ -7,7 +7,7 @@
 //    https://skymtn.com/mapug-astronomy/ragreiner/LX200Commands.html
 //
 
-use std::{error::Error, f64::consts::TAU, sync::Arc, sync::RwLock};
+use std::{error::Error, f64::consts::TAU, sync::Arc, sync::RwLock, sync::OnceLock};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, FixedOffset, Local, Utc};
@@ -20,8 +20,14 @@ use tokio::{
     net::TcpListener,
 };
 
+static TIMESCALE: OnceLock<Timescale> = OnceLock::new();
+
+fn get_timescale() -> &'static Timescale {
+    TIMESCALE.get_or_init(|| Timescale::default())
+}
+
 fn precess_coordinates(ra: f64, dec: f64, epoch_from_j: f64, epoch_to_j: f64) -> (f64, f64) {
-    let ts = Timescale::default();
+    let ts = get_timescale();
     let epoch_from = ts.j(epoch_from_j);
     let epoch_to = ts.j(epoch_to_j);
 
