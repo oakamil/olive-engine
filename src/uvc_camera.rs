@@ -217,6 +217,8 @@ impl Camera {
             let _ = devh.set_sharpness(range.min);
         }
 
+        let _ = devh.set_gamma(1);
+
         // Turn off auto-exposure and auto-white-balance
         let _ = devh.set_ae_mode(AutoExposureMode::Manual);
         let _ = devh.set_white_balance_temperature_auto(false);
