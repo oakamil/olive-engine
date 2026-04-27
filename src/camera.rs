@@ -648,10 +648,12 @@ impl Camera {
 
         if isp_mode {
             info!("Using ISP mode");
+
             let mut cfgs = active_camera
                 .generate_configuration(&[StreamRole::VideoRecording])
                 .ok_or_else(|| "Failed to generate configuration".to_string())?;
 
+            // --- 1. Identify Target Formats ---
             let stream_cfg = cfgs
                 .get_mut(0)
                 .ok_or_else(|| "Failed to get stream configuration".to_string())?;
@@ -670,7 +672,9 @@ impl Camera {
                 }
             }
 
-            // Sniff native sensor mode
+            // --- 2. Sniff Native Sensor Mode ---
+            // We generate a temporary Raw configuration to read the exact dimensions
+            // and bit-depth the sensor driver inherently supports.
             let raw_cfg = active_camera
                 .generate_configuration(&[StreamRole::Raw])
                 .ok_or_else(|| "Failed to generate raw configuration".to_string())?;
@@ -678,6 +682,7 @@ impl Camera {
             let raw_size = raw_stream.get_size();
             let raw_fmt_str = format!("{:?}", raw_stream.get_pixel_format());
 
+            // Extract the bit depth from the raw format string (e.g., "SRGGB12" -> 12)
             let bit_depth = if raw_fmt_str.contains("12") {
                 12
             } else if raw_fmt_str.contains("10") {
@@ -693,20 +698,27 @@ impl Camera {
                 raw_size.width, raw_size.height, bit_depth
             );
 
+            // --- 3. Apply Sensor Configuration (Lock the FOV) ---
             let mut sensor_config = libcamera::camera::SensorConfiguration::new();
             sensor_config.set_output_size(raw_size.width, raw_size.height);
             sensor_config.set_bit_depth(bit_depth);
+
+            // The ISP Scaler MUST know the analog crop bounds to calculate the scale factor.
             sensor_config.set_analog_crop(libcamera::geometry::Rectangle {
                 x: 0,
                 y: 0,
                 width: raw_size.width,
                 height: raw_size.height,
             });
+            // Explicitly disable any hardware binning/skipping at the physical sensor level
             sensor_config.set_binning(1, 1);
             sensor_config.set_skipping(1, 1, 1, 1);
 
             cfgs.set_sensor_configuration(sensor_config);
 
+            // --- 4. Calculate Strict Aspect Ratio Downsampling ---
+            // Because we locked the sensor to its native dimensions, our requested stream
+            // MUST mathematically match its aspect ratio to keep the hardware scaler happy.
             let downsample_factor = if (raw_size.width * raw_size.height) < 3_000_000 {
                 2
             } else {
@@ -715,11 +727,15 @@ impl Camera {
             let target_width = raw_size.width / downsample_factor;
             let target_height = raw_size.height / downsample_factor;
 
+            // --- 5. Configure Stream & Fallback Logic ---
+            // We prioritize R8/GREY (ideal for Mono tuning files). If the pipeline rejects it
+            // and falls back to RAW (common with Color tuning files), we seamlessly retry with YUV420.
             let mut success = false;
             let format_candidates = [("Mono 8-bit", format_r8), ("YUV420 Planar", format_yuv)];
 
             for (desc, format_opt) in format_candidates.iter() {
                 if let Some(fmt) = format_opt {
+                    // Scope block to safely drop the mutable reference before validating
                     {
                         let mut stream0 = cfgs.get_mut(0).unwrap();
                         stream0.set_pixel_format(*fmt);
@@ -732,6 +748,7 @@ impl Camera {
                     cfgs.validate();
                     let resulted_fmt = format!("{:?}", cfgs.get(0).unwrap().get_pixel_format());
 
+                    // If the pipeline didn't panic and force a high-bit/RAW format, it worked!
                     if !resulted_fmt.contains("16")
                         && !resulted_fmt.contains("10")
                         && !resulted_fmt.contains("12")
