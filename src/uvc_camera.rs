@@ -24,7 +24,6 @@ struct CaptureStore {
 enum CaptureCommand {
     SetGain(f32),
     SetExposure(i32),
-    SetHcg(bool),
     StopCaptureThread,
 }
 
@@ -110,13 +109,9 @@ impl CameraTrait for Camera {
         self.send_command(CaptureCommand::SetExposure(exposure_us));
     }
 
-    fn enable_hcg(&self) {
-        self.send_command(CaptureCommand::SetHcg(true));
-    }
+    fn enable_hcg(&self) {}
 
-    fn disable_hcg(&self) {
-        self.send_command(CaptureCommand::SetHcg(false));
-    }
+    fn disable_hcg(&self) {}
 
     fn get_last_capture(&self) -> Option<Arc<Image>> {
         let lock = self.store.image.lock().unwrap();
@@ -183,7 +178,7 @@ impl Camera {
         let devh = dev.open().expect("Failed to open UVC device");
 
         // Find highest resolution uncompressed (YUV) format
-        let stream_format = devh
+        /*let stream_format = devh
             .get_preferred_format(|f1, f2| {
                 if f2.format == FrameFormat::Uncompressed && f1.format != FrameFormat::Uncompressed
                 {
@@ -199,22 +194,31 @@ impl Camera {
                     f1
                 }
             })
-            .expect("Failed to find suitable YUV format");
+            .expect("Failed to find suitable YUV format");*/
+        let stream_format = uvc::StreamFormat {
+            width: 640,
+            height: 480,
+            fps: 30,
+            format: uvc::FrameFormat::Uncompressed,
+        };
 
         info!("Selected UVC format: {:?}", stream_format);
 
         // Set default controls
         if let Ok(range) = devh.saturation_range() {
-            let _ = devh.set_saturation(range.default);
+            let _ = devh.set_saturation(range.min);
         }
         if let Ok(range) = devh.contrast_range() {
-            let _ = devh.set_contrast(range.default);
+            let _ = devh.set_contrast(range.min);
         }
         if let Ok(range) = devh.white_balance_temperature_range() {
             let _ = devh.set_white_balance_temperature(range.default);
         }
         if let Ok(range) = devh.sharpness_range() {
             let _ = devh.set_sharpness(range.min);
+        }
+        if let Ok(range) = devh.brightness_range() {
+            let _ = devh.set_brightness(range.min);
         }
 
         let _ = devh.set_gamma(1);
@@ -296,9 +300,6 @@ impl Camera {
                 }
                 Ok(CaptureCommand::SetExposure(exp)) => {
                     let _ = devh.set_exposure_abs(exp as u32 / 100);
-                }
-                Ok(CaptureCommand::SetHcg(enable)) => {
-                    let _ = devh.set_backlight_compensation(enable);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,

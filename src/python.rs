@@ -13,7 +13,7 @@ use crate::engine::{BgMode, Engine, EngineConfig, EngineStateData, Extractor};
 use crate::uvc_camera::Camera as UvcCamera;
 
 #[pyfunction]
-#[pyo3(signature = (isp=false, bg_mode="line".to_string(), extractor_type="sequential".to_string(), rayon_threads=2, uvc=false, target_centroids=20, database_path=None, callback=None))]
+#[pyo3(signature = (isp=false, bg_mode="line".to_string(), extractor_type="sequential".to_string(), rayon_threads=2, uvc=false, gain=None, target_centroids=20, database_path=None, callback=None))]
 fn start_engine(
     py: Python,
     isp: bool,
@@ -21,6 +21,7 @@ fn start_engine(
     extractor_type: String,
     rayon_threads: usize,
     uvc: bool,
+    gain: Option<f32>,
     target_centroids: usize,
     database_path: Option<String>,
     callback: Option<PyObject>,
@@ -50,7 +51,7 @@ fn start_engine(
     let config = EngineConfig {
         min_exposure_us: 16670,
         max_exposure_us: 1000000,
-        gain: 31.0,
+        gain,
         target_centroids,
         database_path: db_path,
         isp,

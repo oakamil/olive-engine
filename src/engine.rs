@@ -25,7 +25,7 @@ pub const CALIBRATION_EXPOSURE_US: i32 = 50000;
 pub struct EngineConfig {
     pub min_exposure_us: i32,
     pub max_exposure_us: i32,
-    pub gain: f32,
+    pub gain: Option<f32>,
     pub target_centroids: usize,
     pub database_path: String,
     pub isp: bool,
@@ -39,7 +39,7 @@ impl Default for EngineConfig {
         Self {
             min_exposure_us: 16670,
             max_exposure_us: 1000000,
-            gain: 31.0,
+            gain: None,
             target_centroids: 20,
             database_path: format!(
                 "{}/data/default_database.npz",
@@ -414,9 +414,9 @@ impl Engine {
         self.update_status("Calibration");
 
         // Apply static hardware settings ONCE at startup
-        let max_gain = self.camera.get_max_gain();
-        info!("Setting gain to sensor maximum: {}", max_gain);
-        self.camera.set_gain(max_gain);
+        let gain = self.config.gain.unwrap_or(self.camera.get_max_gain());
+        info!("Setting gain to: {}", gain);
+        self.camera.set_gain(gain);
         self.camera.enable_hcg();
 
         let target_min = self.config.target_centroids;
@@ -436,8 +436,7 @@ impl Engine {
             } else if was_connected {
                 info!("Client disconnected. Restarting calibration hardware reset.");
                 was_connected = false;
-                let max_gain = self.camera.get_max_gain();
-                self.camera.set_gain(max_gain);
+                self.camera.set_gain(gain);
                 self.camera.enable_hcg();
             }
 
@@ -800,6 +799,7 @@ impl Engine {
                 let size = (height, width);
 
                 let mut solve_options = SolveOptions::default();
+                solve_options.solve_timeout_ms = Some(5.0);
                 if let Some(fov) = self.fov {
                     solve_options.fov_estimate = Some(fov);
                     solve_options.fov_max_error = Some(0.5); // Provide a reasonable constraint based on FOV

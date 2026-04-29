@@ -23,8 +23,8 @@ struct Args {
     max_exposure: i32,
 
     /// Analog gain to apply to the camera
-    #[arg(long, default_value_t = 31.0)]
-    gain: f32,
+    #[arg(long)]
+    gain: Option<f32>,
 
     /// Target number of centroids for auto-exposure
     #[arg(long, default_value_t = 20)]
