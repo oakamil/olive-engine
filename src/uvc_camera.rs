@@ -177,30 +177,33 @@ impl Camera {
             .expect("Failed to find UVC device");
         let devh = dev.open().expect("Failed to open UVC device");
 
-        // Find highest resolution uncompressed (YUV) format
-        /*let stream_format = devh
+        // Find highest resolution uncompressed (YUV) format that supports at least 30fps
+        let stream_format = devh
             .get_preferred_format(|f1, f2| {
-                if f2.format == FrameFormat::Uncompressed && f1.format != FrameFormat::Uncompressed
-                {
-                    return f2;
+                let f1_is_uncomp = f1.format == FrameFormat::Uncompressed;
+                let f2_is_uncomp = f2.format == FrameFormat::Uncompressed;
+                
+                if f1_is_uncomp != f2_is_uncomp {
+                    return if f1_is_uncomp { f1 } else { f2 };
                 }
-                if f1.format == FrameFormat::Uncompressed && f2.format != FrameFormat::Uncompressed
-                {
-                    return f1;
+                
+                let f1_fps_ok = f1.fps >= 30;
+                let f2_fps_ok = f2.fps >= 30;
+                
+                if f1_fps_ok != f2_fps_ok {
+                    return if f1_fps_ok { f1 } else { f2 };
                 }
-                if f2.width * f2.height > f1.width * f1.height {
-                    f2
-                } else {
-                    f1
+                
+                let f1_res = f1.width * f1.height;
+                let f2_res = f2.width * f2.height;
+                
+                if f1_res != f2_res {
+                    return if f1_res > f2_res { f1 } else { f2 };
                 }
+                
+                if f1.fps > f2.fps { f1 } else { f2 }
             })
-            .expect("Failed to find suitable YUV format");*/
-        let stream_format = uvc::StreamFormat {
-            width: 640,
-            height: 480,
-            fps: 30,
-            format: uvc::FrameFormat::Uncompressed,
-        };
+            .expect("Failed to find suitable YUV format");
 
         info!("Selected UVC format: {:?}", stream_format);
 
