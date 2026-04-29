@@ -1,6 +1,6 @@
 # Olive Engine - Plate-Solving Engine in Rust
 
-A robust, fast, and async-friendly Rust implementation for astronomical plate-solving.
+A high performance astronomical plate-solving engine built on top of [`olive-solve`](https://github.com/oakamil/olive-solve).
 
 ## Features
 
@@ -8,14 +8,6 @@ A robust, fast, and async-friendly Rust implementation for astronomical plate-so
 * Implementation of the LX200 protocol for control through SkySafari (Plus/Pro) or Stellarium+ mobile applications
 * Optional ultra-fast camera pipeline option that uses the Raspberry Pi's ISP, enabling a solve rate of up to 60 Hz
 * Configurable extraction engine, integrating with both the `olive-solve` and `cedar-detect` extractors
-
-## Repository Structure
-
-* **`src`**: The core application and library.
-  * Device control and coordination logic (`engine.rs`, `camera.rs`, etc.).
-  * Server endpoints for control and telemetry (`control_server.rs`, `telescope_server.rs`).
-  * Python bindings for the engine (`python.rs`).
-* **`build_python.sh`**: Script to build the Python extension module using `maturin`.
 
 ## Getting Started
 
@@ -65,27 +57,32 @@ cargo run --release -- --database-path ~/data/default_database.npz
 * `--extractor-type <EXTRACTOR_TYPE>`: (Optional) Extractor type to use (`sequential`, `fast`, `cedar`). Default is `sequential`.
 * `--rayon-threads <RAYON_THREADS>`: (Optional) Rayon threads configuration. Default is 2.
 
+### Web server
+
+`olive-engine` runs a lightweight web server on port 8080. The server home page shows performance statistics. It also provides a live view of the camera feed that can be used to dial in the focus of the camera's lens. When the live view is active the plate-solving engine is paused.
+
 ## Roadmap
 
 Additional features are planned for this solving engine, including:
 
-1. Better UVC camera support (current implementation is a work in progress)
-2. IMU integration, initially targeting BNO085 and BMI160 sensors
-3. Bluetooth control
+1. Pre-built image for the Raspberry Pi platform
+2. Better UVC camera support (current implementation is a work in progress)
+3. IMU integration, initially targeting BNO085 and BMI160 sensors
+4. Bluetooth control
 
 ## FAQ
 
-1. Which extractor type and mode should I use?
+1\. Which extractor type and mode should I use?
 
 `cedar` provides the fastest performance, but its use is [restricted](https://github.com/smroid/cedar-detect/blob/main/LICENSE.md). `sequential` sacrifices a bit of accuracy for performance, and is recommended on lower end hardware. `fast` utilizes rayon multi-threading which can hold up CPU threads on lower end hardware. The background subtraction modes apply to `sequential` and `fast`, with `block` being the slowest but applying semi-local background processing. `global` is generally slightly faster than `line`, but `line` can better deal with certain types of image artifacts.
 
-2. What's ISP mode and why should I use it?
+2\. What's ISP mode and why should I use it?
 
 ISP mode utilizes the Raspberry Pi's built-in image signal processor to perform debayering and downsampling of images. It has 2 benefits. The available frame rate increases from ~40fps to the typical sensor maximum of 60fps, and the post-processing time drops significantly since the resulting format requires a memory copy only.
 
 Note that ISP mode requires custom tuning files to turn off most image processing in the ISP.
 
-3. What hardware should I use?
+3\. What hardware should I use?
 
 The recommended hardware configuration is as follows:
 
@@ -95,6 +92,14 @@ The recommended hardware configuration is as follows:
 * 32GB or larger microSD card
 * (Optional) Heat sinks
 * (Optional) [3D printed case](https://www.printables.com/model/1648425-cedar-zero-case-v2)
+
+4\. Can I use this engine in my own project?
+
+Yes! Part of the goal here is to provide a core engine that can be used in other projects. Rust and Python entry points are provided in order to make it easier to integrate the engine into other systems.
+
+There are some restrictions though:
+* The `cedar` extractor type uses `cedar-detect` which has a restricted license. Commercial projects that intend to use that path will need to negotiate a license with Clear Skies Astro.
+* The other extractor types and the core solver are subject to the licensing of the `olive-solve` project, which currently limits commercial use to small businesses.
 
 ## License
 
