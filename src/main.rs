@@ -42,6 +42,10 @@ struct Args {
     #[arg(long)]
     uvc: bool,
 
+    /// Target FPS for UVC camera
+    #[arg(long, default_value_t = 30)]
+    uvc_fps: u32,
+
     /// Background subtraction mode for extraction
     #[arg(long, value_enum, default_value_t = olive_engine::engine::BgMode::Line)]
     bg_mode: olive_engine::engine::BgMode,
@@ -115,7 +119,7 @@ async fn main() {
 
     // Initialize and start the camera
     let camera: Arc<dyn CameraTrait> = if args.uvc {
-        let mut cam = UvcCamera::new(false);
+        let mut cam = UvcCamera::new(args.uvc_fps);
         cam.start_capture().expect("Failed to start UVC camera");
         Arc::new(cam)
     } else {

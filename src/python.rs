@@ -13,7 +13,7 @@ use crate::engine::{BgMode, Engine, EngineConfig, EngineStateData, Extractor};
 use crate::uvc_camera::Camera as UvcCamera;
 
 #[pyfunction]
-#[pyo3(signature = (isp=false, bg_mode="line".to_string(), extractor_type="sequential".to_string(), rayon_threads=2, uvc=false, gain=None, target_centroids=20, database_path=None, callback=None))]
+#[pyo3(signature = (isp=false, bg_mode="line".to_string(), extractor_type="sequential".to_string(), rayon_threads=2, uvc=false, uvc_fps=None, gain=None, target_centroids=20, database_path=None, callback=None))]
 fn start_engine(
     py: Python,
     isp: bool,
@@ -21,6 +21,7 @@ fn start_engine(
     extractor_type: String,
     rayon_threads: usize,
     uvc: bool,
+    uvc_fps: Option<u32>,
     gain: Option<f32>,
     target_centroids: usize,
     database_path: Option<String>,
@@ -66,7 +67,7 @@ fn start_engine(
     );
 
     let camera: Arc<dyn CameraTrait> = if uvc {
-        let mut cam = UvcCamera::new(false);
+        let mut cam = UvcCamera::new(uvc_fps.unwrap_or(30));
         cam.start_capture().expect("Failed to start UVC camera");
         Arc::new(cam)
     } else {

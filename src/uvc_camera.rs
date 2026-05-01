@@ -39,6 +39,7 @@ pub struct Camera {
     max_gain: Arc<AtomicU32>,
 
     config: Arc<Mutex<Option<CameraConfig>>>,
+    target_fps: u32,
 }
 
 impl CameraTrait for Camera {
@@ -61,6 +62,7 @@ impl CameraTrait for Camera {
         let current_exposure = Arc::clone(&self.current_exposure);
         let min_gain_store = Arc::clone(&self.min_gain);
         let max_gain_store = Arc::clone(&self.max_gain);
+        let target_fps = self.target_fps;
 
         self.capture_thread = Some(thread::spawn(move || {
             Self::capture_loop(
@@ -71,6 +73,7 @@ impl CameraTrait for Camera {
                 current_exposure,
                 min_gain_store,
                 max_gain_store,
+                target_fps,
             );
         }));
 
@@ -133,7 +136,7 @@ impl CameraTrait for Camera {
 
 impl Camera {
     /// Instantiates the camera module and sets initial cached state.
-    pub fn new(_isp_mode: bool) -> Self {
+    pub fn new(target_fps: u32) -> Self {
         let store = Arc::new(CaptureStore {
             image: Mutex::new(None),
             cvar: Condvar::new(),
@@ -153,6 +156,7 @@ impl Camera {
             min_gain,
             max_gain,
             config,
+            target_fps,
         }
     }
 
@@ -170,6 +174,7 @@ impl Camera {
         current_exposure_atomic: Arc<AtomicI32>,
         min_gain_store: Arc<AtomicU32>,
         max_gain_store: Arc<AtomicU32>,
+        target_fps: u32,
     ) {
         let ctx = uvc::Context::new().expect("Failed to create UVC context");
         let dev = ctx
@@ -177,9 +182,9 @@ impl Camera {
             .expect("Failed to find UVC device");
         let devh = dev.open().expect("Failed to open UVC device");
 
-        // Find highest resolution uncompressed (YUV) format that supports at least 30fps
+        // Find highest resolution uncompressed (YUV) format that supports at least target_fps
         let stream_format = devh
-            .get_preferred_format(|f1, f2| {
+            .get_preferred_format(move |f1, f2| {
                 let f1_is_uncomp = f1.format == FrameFormat::Uncompressed;
                 let f2_is_uncomp = f2.format == FrameFormat::Uncompressed;
 
@@ -187,8 +192,8 @@ impl Camera {
                     return if f1_is_uncomp { f1 } else { f2 };
                 }
 
-                let f1_fps_ok = f1.fps >= 30;
-                let f2_fps_ok = f2.fps >= 30;
+                let f1_fps_ok = f1.fps >= target_fps;
+                let f2_fps_ok = f2.fps >= target_fps;
 
                 if f1_fps_ok != f2_fps_ok {
                     return if f1_fps_ok { f1 } else { f2 };
