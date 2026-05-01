@@ -307,8 +307,8 @@ impl Camera {
                 Ok(CaptureCommand::SetGain(gain)) => {
                     let _ = devh.set_gain(gain as u16);
                 }
-                Ok(CaptureCommand::SetExposure(exp)) => {
-                    let _ = devh.set_exposure_abs(exp as u32 / 100);
+                Ok(CaptureCommand::SetExposure(_exp)) => {
+                    // Exposure cannot be changed for UVC cameras
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
