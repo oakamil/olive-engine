@@ -1,8 +1,9 @@
 // Required Notice: Copyright (c) 2026 Omair Kamil
 // See LICENSE file in root directory for license terms.
 
+use chrono::{Datelike, Timelike};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use log::{error, info, warn};
 use ndarray::Array2;
@@ -59,6 +60,7 @@ pub struct IntermediateResult {
     pub pp_time: Duration,
     pub extract_time: Duration,
     pub centroids_arr: Array2<f64>,
+    pub timestamp: SystemTime,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default, clap::ValueEnum, Serialize, Deserialize)]
@@ -119,6 +121,7 @@ pub struct Engine {
     config: EngineConfig,
     solver: Tetra3,
     fov: Option<f64>,
+    imu: Option<Arc<crate::imu::Imu>>,
 
     shared_position: Arc<std::sync::RwLock<SharedPosition>>,
     target_ra: Option<f64>,
@@ -139,6 +142,7 @@ impl Engine {
         config: EngineConfig,
         client_connected: Arc<std::sync::atomic::AtomicBool>,
         engine_state: Arc<RwLock<EngineStateData>>,
+        imu: Option<Arc<crate::imu::Imu>>,
     ) -> Self {
         let solver = Tetra3::new(&config.database_path);
         let shared_position = Arc::new(RwLock::new(SharedPosition::default()));
@@ -155,6 +159,7 @@ impl Engine {
             config,
             solver,
             fov: None,
+            imu,
             shared_position,
             target_ra: None,
             target_dec: None,
@@ -236,6 +241,7 @@ impl Engine {
 
                 let exposure_us = img_arc.exposure_time_us;
                 let post_process_time = img_arc.post_process_time;
+                let img_timestamp = img_arc.timestamp;
 
                 let img_data = match Arc::try_unwrap(img_arc) {
                     Ok(img) => img.data,
@@ -369,6 +375,7 @@ impl Engine {
                     pp_time: post_process_time,
                     extract_time,
                     centroids_arr,
+                    timestamp: img_timestamp,
                 };
 
                 let (lock, cvar) = &*shared_res_ext;
@@ -387,7 +394,9 @@ impl Engine {
         });
     }
 
-    fn wait_for_extraction(&self) -> Option<(usize, Duration, Duration, Duration, Array2<f64>)> {
+    fn wait_for_extraction(
+        &self,
+    ) -> Option<(usize, Duration, Duration, Duration, Array2<f64>, SystemTime)> {
         let (lock, cvar) = &*self.shared_result;
         let mut inner = lock.lock().unwrap();
 
@@ -403,6 +412,7 @@ impl Engine {
                 res.pp_time,
                 res.extract_time,
                 res.centroids_arr,
+                res.timestamp,
             ))
         } else {
             None
@@ -421,6 +431,9 @@ impl Engine {
 
         let target_min = self.config.target_centroids;
         let target_max = (self.config.target_centroids as f64 * 1.25).round() as usize;
+
+        let mut imu_calibration_start: Option<Instant> = None;
+        let mut first_solve: Option<(f64, f64)> = None;
 
         let mut was_connected = false;
 
@@ -498,7 +511,7 @@ impl Engine {
                         break;
                     }
 
-                    if let Some((count, exp_time, pp_time, extract_time, arr)) =
+                    if let Some((count, exp_time, pp_time, extract_time, arr, _timestamp)) =
                         self.wait_for_extraction()
                     {
                         self.update_solve_stats(
@@ -570,6 +583,15 @@ impl Engine {
                         let solve_time = solve_start.elapsed();
 
                         if matches!(solution.status, SolveStatus::MatchFound) {
+                            if let Some(imu) = &self.imu {
+                                if imu_calibration_start.is_none() {
+                                    imu.start_calibration();
+                                    imu_calibration_start = Some(Instant::now());
+                                    if let (Some(ra), Some(dec)) = (solution.ra, solution.dec) {
+                                        first_solve = Some((ra, dec));
+                                    }
+                                }
+                            }
                             self.fov = solution.fov;
                             self.update_solve_stats(
                                 true,
@@ -709,6 +731,92 @@ impl Engine {
             }
 
             if calibrated {
+                if let Some(imu) = &self.imu {
+                    if let Some(start_time) = imu_calibration_start {
+                        let elapsed = start_time.elapsed();
+                        if elapsed < Duration::from_secs(5) {
+                            info!("Waiting for IMU calibration to reach 5 seconds...");
+                            std::thread::sleep(Duration::from_secs(5) - elapsed);
+                        }
+
+                        let mut verified = false;
+                        info!("Taking final frame for IMU calibration verification...");
+
+                        if let Some((_, _, _, _, arr, _)) = self.wait_for_extraction() {
+                            let camera_config = self.camera.get_config().unwrap();
+                            let size = (camera_config.height as f64, camera_config.width as f64);
+                            if let Ok(solution) = self.solver.solve_from_centroids(
+                                &arr,
+                                size,
+                                SolveOptions::default(),
+                            ) {
+                                if matches!(solution.status, SolveStatus::MatchFound) {
+                                    if let Some((first_ra, first_dec)) = first_solve {
+                                        let time_diff = start_time.elapsed().as_secs_f64();
+                                        let max_expected_drift_deg =
+                                            (15.0 / 3600.0) * time_diff * 1.5;
+
+                                        if let (Some(ra), Some(dec)) = (solution.ra, solution.dec) {
+                                            let mut ra_diff = (ra - first_ra).abs();
+                                            if ra_diff > 180.0 {
+                                                ra_diff = 360.0 - ra_diff;
+                                            }
+                                            let dec_diff = (dec - first_dec).abs();
+
+                                            let total_drift_deg =
+                                                (ra_diff.powi(2) + dec_diff.powi(2)).sqrt();
+
+                                            if total_drift_deg <= max_expected_drift_deg + 0.1 {
+                                                verified = true;
+                                            } else {
+                                                warn!(
+                                                    "IMU calibration rejected due to large movement: {:.3} deg drift (expected max {:.3} deg)",
+                                                    total_drift_deg, max_expected_drift_deg
+                                                );
+                                            }
+                                        } else {
+                                            warn!(
+                                                "IMU calibration verification failed: missing ra/dec in final frame"
+                                            );
+                                        }
+                                    } else {
+                                        verified = true;
+                                    }
+                                } else {
+                                    warn!(
+                                        "IMU calibration verification failed: could not solve final frame"
+                                    );
+                                }
+                            } else {
+                                warn!("IMU calibration verification failed: solver error");
+                            }
+                        } else {
+                            warn!(
+                                "IMU calibration verification failed: could not extract centroids"
+                            );
+                        }
+
+                        if verified {
+                            imu.stop_calibration();
+                        } else {
+                            imu.abort_calibration();
+                            calibrated = false;
+                            imu_calibration_start = None;
+                            first_solve = None;
+                        }
+                    }
+                }
+            } else {
+                if let Some(imu) = &self.imu {
+                    if imu_calibration_start.is_some() {
+                        imu.abort_calibration();
+                        imu_calibration_start = None;
+                        first_solve = None;
+                    }
+                }
+            }
+
+            if calibrated {
                 break;
             }
 
@@ -778,7 +886,7 @@ impl Engine {
             }
             self.update_status("Solving");
 
-            if let Some((count, exp_time, pp_time, extract_time, centroids_arr)) =
+            if let Some((count, exp_time, pp_time, extract_time, centroids_arr, img_timestamp)) =
                 self.wait_for_extraction()
             {
                 if count < MIN_CENTROIDS {
@@ -799,7 +907,7 @@ impl Engine {
                 let size = (height, width);
 
                 let mut solve_options = SolveOptions::default();
-                solve_options.solve_timeout_ms = Some(5.0);
+                solve_options.solve_timeout_ms = Some(15.0);
                 if let Some(fov) = self.fov {
                     solve_options.fov_estimate = Some(fov);
                     solve_options.fov_max_error = Some(0.5); // Provide a reasonable constraint based on FOV
@@ -896,7 +1004,26 @@ impl Engine {
 
                         locked.telescope_ra = ra;
                         locked.telescope_dec = dec;
+                        let lat_opt = locked.site_latitude;
+                        let lon_opt = locked.site_longitude;
                         drop(locked);
+
+                        if let Some(imu) = &self.imu {
+                            if let (Some(lat), Some(lon)) = (lat_opt, lon_opt) {
+                                let dt: chrono::DateTime<chrono::Utc> = img_timestamp.into();
+                                let (alt, az, alt_az_roll) =
+                                    ra_dec_to_alt_az(ra, dec, solution.roll.unwrap(), lat, lon, dt);
+                                let mount_coords = crate::imu::MountCoordinates {
+                                    pitch: alt,
+                                    yaw: az,
+                                    roll: alt_az_roll,
+                                };
+                                futures::executor::block_on(
+                                    imu.update_anchor(&mount_coords, &img_timestamp),
+                                );
+                            }
+                        }
+
                         self.update_solve_stats(
                             true,
                             Some(ra),
@@ -912,11 +1039,41 @@ impl Engine {
                         );
                     }
                     _ => {
+                        let mut est_ra = None;
+                        let mut est_dec = None;
+                        let mut est_roll = None;
+
+                        let locked = self.shared_position.read().unwrap();
+                        let lat_opt = locked.site_latitude;
+                        let lon_opt = locked.site_longitude;
+                        drop(locked);
+
+                        if let Some(imu) = &self.imu {
+                            if let (Some(lat), Some(lon)) = (lat_opt, lon_opt) {
+                                if let Ok(est) = futures::executor::block_on(
+                                    imu.get_estimated_pointing(&SystemTime::now()),
+                                ) {
+                                    let dt = chrono::Utc::now();
+                                    let (ra, dec, eq_roll) = alt_az_to_ra_dec(
+                                        est.pitch, est.yaw, est.roll, lat, lon, dt,
+                                    );
+
+                                    est_ra = Some(ra);
+                                    est_dec = Some(dec);
+                                    est_roll = Some(eq_roll);
+
+                                    let mut locked = self.shared_position.write().unwrap();
+                                    locked.telescope_ra = ra;
+                                    locked.telescope_dec = dec;
+                                }
+                            }
+                        }
+
                         self.update_solve_stats(
                             false,
-                            None,
-                            None,
-                            None,
+                            est_ra,
+                            est_dec,
+                            est_roll,
                             count,
                             self.target_ra,
                             self.target_dec,
@@ -1003,4 +1160,143 @@ impl Engine {
             }
         }
     }
+}
+
+// Meeus algorithms for RA/Dec <-> Alt/Az conversions and Parallactic Angle
+fn ra_dec_to_alt_az(
+    ra_deg: f64,
+    dec_deg: f64,
+    roll_deg: f64,
+    lat_deg: f64,
+    lon_deg: f64,
+    utc_time: chrono::DateTime<chrono::Utc>,
+) -> (f64, f64, f64) {
+    let y = utc_time.year() as f64;
+    let m = utc_time.month() as f64;
+    let d = utc_time.day() as f64;
+    let h = utc_time.hour() as f64
+        + utc_time.minute() as f64 / 60.0
+        + utc_time.second() as f64 / 3600.0;
+
+    let (mut y_jd, mut m_jd) = (y, m);
+    if m <= 2.0 {
+        y_jd -= 1.0;
+        m_jd += 12.0;
+    }
+
+    let a = (y_jd / 100.0).floor();
+    let b = 2.0 - a + (a / 4.0).floor();
+    let jd =
+        (365.25 * (y_jd + 4716.0)).floor() + (30.6001 * (m_jd + 1.0)).floor() + d + h / 24.0 + b
+            - 1524.5;
+
+    let d_jd = jd - 2451545.0; // days since J2000.0
+    let mut gmst = 280.46061837 + 360.98564736629 * d_jd;
+    gmst %= 360.0;
+    if gmst < 0.0 {
+        gmst += 360.0;
+    }
+
+    let mut lst = gmst + lon_deg;
+    lst %= 360.0;
+    if lst < 0.0 {
+        lst += 360.0;
+    }
+
+    let mut ha = lst - ra_deg;
+    ha %= 360.0;
+    if ha < 0.0 {
+        ha += 360.0;
+    }
+
+    let ha_rad = ha.to_radians();
+    let dec_rad = dec_deg.to_radians();
+    let lat_rad = lat_deg.to_radians();
+
+    let sin_alt = dec_rad.sin() * lat_rad.sin() + dec_rad.cos() * lat_rad.cos() * ha_rad.cos();
+    let alt_rad = sin_alt.asin();
+    let alt_deg = alt_rad.to_degrees();
+
+    let cos_az = (dec_rad.sin() - sin_alt * lat_rad.sin()) / (alt_rad.cos() * lat_rad.cos());
+    let mut az_rad = cos_az.clamp(-1.0, 1.0).acos();
+    if ha_rad.sin() > 0.0 {
+        az_rad = std::f64::consts::TAU - az_rad;
+    }
+    let az_deg = az_rad.to_degrees();
+
+    let q_rad = (ha_rad.sin()).atan2(lat_rad.tan() * dec_rad.cos() - dec_rad.sin() * ha_rad.cos());
+    let q_deg = q_rad.to_degrees();
+
+    let alt_az_roll = roll_deg + q_deg;
+
+    (alt_deg, az_deg, alt_az_roll)
+}
+
+fn alt_az_to_ra_dec(
+    alt_deg: f64,
+    az_deg: f64,
+    alt_az_roll: f64,
+    lat_deg: f64,
+    lon_deg: f64,
+    utc_time: chrono::DateTime<chrono::Utc>,
+) -> (f64, f64, f64) {
+    let y = utc_time.year() as f64;
+    let m = utc_time.month() as f64;
+    let d = utc_time.day() as f64;
+    let h = utc_time.hour() as f64
+        + utc_time.minute() as f64 / 60.0
+        + utc_time.second() as f64 / 3600.0;
+
+    let (mut y_jd, mut m_jd) = (y, m);
+    if m <= 2.0 {
+        y_jd -= 1.0;
+        m_jd += 12.0;
+    }
+
+    let a = (y_jd / 100.0).floor();
+    let b = 2.0 - a + (a / 4.0).floor();
+    let jd =
+        (365.25 * (y_jd + 4716.0)).floor() + (30.6001 * (m_jd + 1.0)).floor() + d + h / 24.0 + b
+            - 1524.5;
+
+    let d_jd = jd - 2451545.0;
+    let mut gmst = 280.46061837 + 360.98564736629 * d_jd;
+    gmst %= 360.0;
+    if gmst < 0.0 {
+        gmst += 360.0;
+    }
+
+    let mut lst = gmst + lon_deg;
+    lst %= 360.0;
+    if lst < 0.0 {
+        lst += 360.0;
+    }
+
+    let alt_rad = alt_deg.to_radians();
+    let az_rad = az_deg.to_radians();
+    let lat_rad = lat_deg.to_radians();
+
+    let sin_dec = alt_rad.sin() * lat_rad.sin() + alt_rad.cos() * lat_rad.cos() * az_rad.cos();
+    let dec_rad = sin_dec.asin();
+    let dec_deg = dec_rad.to_degrees();
+
+    let cos_ha = (alt_rad.sin() - sin_dec * lat_rad.sin()) / (dec_rad.cos() * lat_rad.cos());
+    let mut ha_rad = cos_ha.clamp(-1.0, 1.0).acos();
+    if az_rad.sin() > 0.0 {
+        ha_rad = std::f64::consts::TAU - ha_rad;
+    }
+    let ha_deg = ha_rad.to_degrees();
+
+    let mut ra_deg = lst - ha_deg;
+    ra_deg %= 360.0;
+    if ra_deg < 0.0 {
+        ra_deg += 360.0;
+    }
+
+    let q_rad = (ha_rad.sin()).atan2(lat_rad.tan() * dec_rad.cos() - dec_rad.sin() * ha_rad.cos());
+    let q_deg = q_rad.to_degrees();
+
+    let eq_roll = alt_az_roll - q_deg;
+
+    (ra_deg, dec_deg, eq_roll)
 }

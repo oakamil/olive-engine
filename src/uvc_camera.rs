@@ -182,25 +182,25 @@ impl Camera {
             .get_preferred_format(|f1, f2| {
                 let f1_is_uncomp = f1.format == FrameFormat::Uncompressed;
                 let f2_is_uncomp = f2.format == FrameFormat::Uncompressed;
-                
+
                 if f1_is_uncomp != f2_is_uncomp {
                     return if f1_is_uncomp { f1 } else { f2 };
                 }
-                
+
                 let f1_fps_ok = f1.fps >= 30;
                 let f2_fps_ok = f2.fps >= 30;
-                
+
                 if f1_fps_ok != f2_fps_ok {
                     return if f1_fps_ok { f1 } else { f2 };
                 }
-                
+
                 let f1_res = f1.width * f1.height;
                 let f2_res = f2.width * f2.height;
-                
+
                 if f1_res != f2_res {
                     return if f1_res > f2_res { f1 } else { f2 };
                 }
-                
+
                 if f1.fps > f2.fps { f1 } else { f2 }
             })
             .expect("Failed to find suitable YUV format");
@@ -208,23 +208,24 @@ impl Camera {
         info!("Selected UVC format: {:?}", stream_format);
 
         // Set default controls
-        if let Ok(range) = devh.saturation_range() {
-            let _ = devh.set_saturation(range.min);
-        }
-        if let Ok(range) = devh.contrast_range() {
-            let _ = devh.set_contrast(range.min);
-        }
-        if let Ok(range) = devh.white_balance_temperature_range() {
-            let _ = devh.set_white_balance_temperature(range.default);
-        }
+        //if let Ok(range) = devh.saturation_range() {
+        //    let _ = devh.set_saturation(range.default);
+        //}
+        //if let Ok(range) = devh.contrast_range() {
+        //    let _ = devh.set_contrast(range.default);
+        //}
+        //if let Ok(range) = devh.white_balance_temperature_range() {
+        //    let _ = devh.set_white_balance_temperature(range.default);
+        //}
         if let Ok(range) = devh.sharpness_range() {
             let _ = devh.set_sharpness(range.min);
         }
-        if let Ok(range) = devh.brightness_range() {
-            let _ = devh.set_brightness(range.min);
+        //if let Ok(range) = devh.brightness_range() {
+        //    let _ = devh.set_brightness(range.default);
+        //}
+        if let Ok(range) = devh.gamma_range() {
+            let _ = devh.set_gamma(range.min);
         }
-
-        let _ = devh.set_gamma(1);
 
         // Turn off auto-exposure and auto-white-balance
         let _ = devh.set_ae_mode(AutoExposureMode::Manual);

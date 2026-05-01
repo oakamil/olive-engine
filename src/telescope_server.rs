@@ -7,7 +7,7 @@
 //    https://skymtn.com/mapug-astronomy/ragreiner/LX200Commands.html
 //
 
-use std::{error::Error, f64::consts::TAU, sync::Arc, sync::RwLock, sync::OnceLock};
+use std::{error::Error, f64::consts::TAU, sync::Arc, sync::OnceLock, sync::RwLock};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, FixedOffset, Local, Utc};

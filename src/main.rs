@@ -53,6 +53,10 @@ struct Args {
     /// Rayon threads configuration
     #[arg(long, default_value_t = 2)]
     rayon_threads: usize,
+
+    /// IMU to use (none, bno085, bmi160)
+    #[arg(long, default_value = "none")]
+    imu: String,
 }
 
 #[tokio::main]
@@ -62,6 +66,24 @@ async fn main() {
 
     // Parse command line arguments
     let args = Args::parse();
+
+    // Initialize IMU if requested
+    let imu: Option<Arc<olive_engine::imu::Imu>> = match args.imu.as_str() {
+        "bno085" => {
+            let device = olive_engine::bno08x::Bno08xDevice::new(5).expect("Failed to init BNO085");
+            Some(Arc::new(
+                olive_engine::imu::Imu::start(device).expect("Failed to start IMU thread"),
+            ))
+        }
+        "bmi160" => {
+            let device = olive_engine::bmi160::Bmi160Device::new().expect("Failed to init BMI160");
+            Some(Arc::new(
+                olive_engine::imu::Imu::start(device).expect("Failed to start IMU thread"),
+            ))
+        }
+        "none" => None,
+        _ => panic!("Invalid IMU selected. Options are: none, bno085, bmi160"),
+    };
 
     // Initialize Rayon thread pool
     rayon::ThreadPoolBuilder::new()
@@ -117,7 +139,7 @@ async fn main() {
     });
 
     // Initialize the engine
-    let engine = Engine::new(camera, config, client_connected, engine_state);
+    let engine = Engine::new(camera, config, client_connected, engine_state, imu);
     engine.start();
 
     // Trap Ctrl-C to handle graceful shutdown

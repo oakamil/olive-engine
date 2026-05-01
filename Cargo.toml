@@ -31,6 +31,9 @@ futures = "0.3.32"
 serde = { version = "1.0.228", features = ["derive"] }
 pyo3 = { version = "0.21.2" }
 cedar_detect = { git = "https://github.com/oakamil/cedar-detect" }
+bno080 = { git = "https://github.com/oakamil/bno080.git", branch = "arvr" }
+bmi160 = "1.1.0"
+linux-embedded-hal = "0.4.0"
 
 [features]
 extension-module = ["pyo3/extension-module"]

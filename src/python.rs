@@ -88,7 +88,7 @@ fn start_engine(
             .await;
     });
 
-    let engine = Engine::new(camera, config, client_connected, engine_state.clone());
+    let engine = Engine::new(camera, config, client_connected, engine_state.clone(), None);
     engine.start();
 
     loop {

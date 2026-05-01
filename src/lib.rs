@@ -4,9 +4,12 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+pub mod bmi160;
+pub mod bno08x;
 pub mod camera;
 pub mod control_server;
 pub mod engine;
+pub mod imu;
 pub mod python;
 pub mod telescope_server;
 pub mod uvc_camera;
