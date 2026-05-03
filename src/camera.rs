@@ -34,6 +34,10 @@ const I2C_ADDR: u16 = 0x1A;
 const INITIAL_EXPOSURE_US: i32 = 50_000;
 const I2C_BUSES_TO_SCAN: &[u8] = &[0, 1, 4, 6, 10, 11, 12, 13, 14, 15];
 
+// Internal sensitivity bounds for the Pi Camera
+const MIN_EXPOSURE_US: i32 = 16_667;
+const MAX_EXPOSURE_US: i32 = 1_000_000;
+
 // --- Data Structures ---
 
 /// Thread-safe atomic store for the latest capture.
@@ -104,6 +108,7 @@ pub struct Camera {
     current_exposure: Arc<AtomicI32>,
     min_gain: Arc<AtomicU32>,
     max_gain: Arc<AtomicU32>,
+    saved_exposure: Arc<AtomicI32>,
 
     isp_mode: bool,
     config: Arc<Mutex<Option<LibCameraConfiguration>>>,
@@ -212,6 +217,33 @@ impl CameraTrait for Camera {
             lock = self.store.cvar.wait(lock).unwrap();
         }
     }
+
+    // --- Abstracted Tuning ---
+
+    fn adjust_sensitivity(&self, factor: f64) -> bool {
+        let current = self.get_exposure();
+        let next = ((current as f64) * factor) as i32;
+        let clamped = next.clamp(MIN_EXPOSURE_US, MAX_EXPOSURE_US);
+
+        if clamped != current {
+            self.set_exposure(clamped);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn save_state(&self) {
+        self.saved_exposure.store(
+            self.current_exposure.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn restore_state(&self) {
+        let exp = self.saved_exposure.load(Ordering::Relaxed);
+        self.set_exposure(exp);
+    }
 }
 
 impl Camera {
@@ -224,8 +256,10 @@ impl Camera {
         });
 
         let current_exposure = Arc::new(AtomicI32::new(INITIAL_EXPOSURE_US));
+        let saved_exposure = Arc::new(AtomicI32::new(INITIAL_EXPOSURE_US));
         let min_gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let max_gain = Arc::new(AtomicU32::new(31.0f32.to_bits()));
+
         let config = Arc::new(Mutex::new(None));
 
         // Perform hardware discovery immediately
@@ -286,6 +320,7 @@ impl Camera {
             capture_thread: None,
             current_gain,
             current_exposure,
+            saved_exposure,
             min_gain,
             max_gain,
             isp_mode,

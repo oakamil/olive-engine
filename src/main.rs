@@ -14,14 +14,6 @@ use olive_engine::uvc_camera::Camera as UvcCamera;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Minimum exposure time in microseconds
-    #[arg(long, default_value_t = 16670)]
-    min_exposure: i32,
-
-    /// Maximum exposure time in microseconds
-    #[arg(long, default_value_t = 1000000)]
-    max_exposure: i32,
-
     /// Analog gain to apply to the camera
     #[arg(long)]
     gain: Option<f32>,
@@ -104,8 +96,6 @@ async fn main() {
     };
 
     let config = EngineConfig {
-        min_exposure_us: args.min_exposure,
-        max_exposure_us: args.max_exposure,
         gain: args.gain,
         target_centroids: args.target_centroids,
         database_path,

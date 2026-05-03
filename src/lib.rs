@@ -43,4 +43,13 @@ pub trait CameraTrait: Send + Sync {
     fn disable_hcg(&self);
     fn wait_for_next_capture(&self, last_timestamp: Option<SystemTime>) -> Arc<Image>;
     fn get_last_capture(&self) -> Option<Arc<Image>>;
+
+    /// Adjusts the camera's sensitivity (light gathering) by the given factor.
+    /// Returns true if the adjustment was applied and changed the state,
+    /// false if hardware/configured limits were hit.
+    fn adjust_sensitivity(&self, factor: f64) -> bool;
+    /// Saves the current hardware sensitivity state internally.
+    fn save_state(&self);
+    /// Restores the hardware to the last saved sensitivity state.
+    fn restore_state(&self);
 }

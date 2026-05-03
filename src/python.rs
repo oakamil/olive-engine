@@ -50,8 +50,6 @@ fn start_engine(
     };
 
     let config = EngineConfig {
-        min_exposure_us: 16670,
-        max_exposure_us: 1000000,
         gain,
         target_centroids,
         database_path: db_path,

@@ -20,12 +20,9 @@ use tetra3::{
 pub const MIN_CENTROIDS: usize = 4;
 pub const CALIBRATION_INTERVAL: Duration = Duration::from_secs(10);
 pub const MAX_RETRIES: usize = 15; // Increased to allow downward floor probing
-pub const CALIBRATION_EXPOSURE_US: i32 = 50000;
 
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
-    pub min_exposure_us: i32,
-    pub max_exposure_us: i32,
     pub gain: Option<f32>,
     pub target_centroids: usize,
     pub database_path: String,
@@ -38,8 +35,6 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            min_exposure_us: 16670,
-            max_exposure_us: 1000000,
             gain: None,
             target_centroids: 20,
             database_path: format!(
@@ -169,10 +164,6 @@ impl Engine {
             solve_timestamps: std::collections::VecDeque::new(),
             shared_result: Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new())),
         }
-    }
-
-    fn clamp_exposure(&self, exposure: i32) -> i32 {
-        exposure.clamp(self.config.min_exposure_us, self.config.max_exposure_us)
     }
 
     fn update_status(&self, status: &str) {
@@ -425,10 +416,8 @@ impl Engine {
 
         // Apply static hardware settings ONCE at startup
         let gain = self.config.gain.unwrap_or(self.camera.get_max_gain());
-        if !self.config.uvc {
-            info!("Setting gain to: {}", gain);
-            self.camera.set_gain(gain);
-        }
+        info!("Setting base hardware settings...");
+        self.camera.set_gain(gain);
         self.camera.enable_hcg();
 
         let target_min = self.config.target_centroids;
@@ -436,7 +425,6 @@ impl Engine {
 
         let mut imu_calibration_start: Option<Instant> = None;
         let mut first_solve: Option<(f64, f64)> = None;
-
         let mut was_connected = false;
 
         loop {
@@ -451,20 +439,9 @@ impl Engine {
             } else if was_connected {
                 info!("Client disconnected. Restarting calibration hardware reset.");
                 was_connected = false;
+                self.camera.restore_state();
                 self.camera.set_gain(gain);
                 self.camera.enable_hcg();
-            }
-
-            let mut current_exposure = CALIBRATION_EXPOSURE_US;
-            let mut current_gain = gain;
-            
-            if self.config.uvc {
-                current_gain = current_gain.clamp(self.camera.get_min_gain(), self.camera.get_max_gain());
-                self.camera.set_gain(current_gain);
-                current_exposure = self.camera.get_exposure();
-            } else {
-                current_exposure = self.clamp_exposure(current_exposure);
-                self.camera.set_exposure(current_exposure);
             }
 
             // Immediate UI update for exposure and status
@@ -477,15 +454,14 @@ impl Engine {
                 0,
                 None,
                 None,
-                current_exposure,
+                self.camera.get_exposure(), // Pull actual starting exposure
                 Duration::ZERO,
                 Duration::ZERO,
                 Duration::ZERO,
             );
 
             let mut calibrated = false;
-            let mut last_good_exposure: Option<i32> = None;
-            let mut last_good_gain: Option<f32> = None;
+            let mut has_saved_state = false;
 
             for retry in 0..MAX_RETRIES {
                 if self
@@ -501,28 +477,20 @@ impl Engine {
                     MAX_RETRIES
                 ));
 
-                if self.config.uvc {
-                    info!(
-                        "Calibration attempt {}/{} (Gain: {:.2})",
-                        retry + 1,
-                        MAX_RETRIES,
-                        current_gain
-                    );
-                } else {
-                    info!(
-                        "Calibration attempt {}/{} (Exposure: {} us)",
-                        retry + 1,
-                        MAX_RETRIES,
-                        current_exposure
-                    );
-                }
+                info!(
+                    "Calibration attempt {}/{} (Sensitivity State -> Exp: {} us, Gain: {:.2})",
+                    retry + 1,
+                    MAX_RETRIES,
+                    self.camera.get_exposure(),
+                    self.camera.get_gain()
+                );
 
                 let mut total_centroids = 0;
                 let mut last_centroids_arr = None;
                 let mut valid_samples = 0;
                 let mut found_new_exposure = false;
 
-                // Fetch frames until we verify the hardware has applied our new exposure, then collect 5
+                // Fetch frames until we verify the hardware has applied our new setting, then collect 5
                 while valid_samples < 5 {
                     if self
                         .client_connected
@@ -542,20 +510,20 @@ impl Engine {
                             count,
                             self.target_ra,
                             self.target_dec,
-                            current_exposure,
+                            self.camera.get_exposure(),
                             pp_time,
                             extract_time,
                             Duration::ZERO,
                         );
+
                         let actual_exp = exp_time.as_micros() as i32;
 
                         // Hardware quantization tolerance (5% or 100us, whichever is larger)
-                        let tolerance = (current_exposure as f32 * 0.05).max(100.0) as i32;
+                        let tolerance =
+                            (self.camera.get_exposure() as f32 * 0.05).max(100.0) as i32;
 
                         if !found_new_exposure {
-                            if self.config.uvc {
-                                found_new_exposure = true; // Assume gain applies quickly for UVC
-                            } else if (actual_exp - current_exposure).abs() > tolerance {
+                            if (actual_exp - self.camera.get_exposure()).abs() > tolerance {
                                 // Frame is from the old exposure pipeline. Skip it without spamming the logs.
                                 continue;
                             } else {
@@ -623,7 +591,7 @@ impl Engine {
                                 0,
                                 None,
                                 None,
-                                current_exposure,
+                                self.camera.get_exposure(),
                                 Duration::ZERO,
                                 Duration::ZERO,
                                 solve_time,
@@ -632,43 +600,25 @@ impl Engine {
 
                             // Now check if we are below the ceiling
                             if avg_centroids <= target_max {
-                                if self.config.uvc {
-                                    last_good_gain = Some(current_gain);
-                                    info!("Target range reached and verified at gain {:.2}. Testing a 10% lower gain to find the optimal floor...", current_gain);
-                                    let next_gain = (current_gain * 0.9).max(self.camera.get_min_gain());
-                                    if (next_gain - current_gain).abs() < 0.1 {
-                                        info!("Gain cannot be lowered further. Calibration complete.");
-                                        calibrated = true;
-                                        break;
-                                    }
-                                    current_gain = next_gain;
-                                    self.camera.set_gain(current_gain);
-                                    needs_standard_adjustment = false;
-                                } else {
-                                    last_good_exposure = Some(current_exposure);
+                                // Save current optimal state
+                                self.camera.save_state();
+                                has_saved_state = true;
+                                info!(
+                                    "Target range reached and verified. Testing a 10% lower sensitivity to find the optimal floor..."
+                                );
+
+                                let applied = self.camera.adjust_sensitivity(0.9);
+                                if !applied {
                                     info!(
-                                        "Target range reached and verified at {} us. Testing a 10% lower exposure to find the optimal floor...",
-                                        current_exposure
+                                        "Sensitivity cannot be lowered further. Calibration complete."
                                     );
-
-                                    let next_exposure =
-                                        self.clamp_exposure((current_exposure as f64 * 0.9) as i32);
-
-                                    if next_exposure == current_exposure {
-                                        info!(
-                                            "Exposure cannot be lowered further. Calibration complete."
-                                        );
-                                        calibrated = true;
-                                        break;
-                                    }
-
-                                    current_exposure = next_exposure;
-                                    self.camera.set_exposure(current_exposure);
-                                    needs_standard_adjustment = false;
+                                    calibrated = true;
+                                    break;
                                 }
+                                needs_standard_adjustment = false;
                             } else {
                                 info!(
-                                    "Centroid count {} is too high (max {}). Scaling down exposure...",
+                                    "Centroid count {} is too high (max {}). Scaling down sensitivity...",
                                     avg_centroids, target_max
                                 );
                                 // Let it fall through to standard downward adjustment logic
@@ -679,53 +629,28 @@ impl Engine {
                                 solution.status
                             );
 
-                            if self.config.uvc {
-                                if let Some(good_gain) = last_good_gain {
-                                    info!("Sanity check failed after step-down. Reverting to optimal floor gain: {:.2}. Calibration complete.", good_gain);
-                                    current_gain = good_gain;
-                                    self.camera.set_gain(current_gain);
-                                    calibrated = true;
-                                    break;
-                                } else {
-                                    break;
-                                }
+                            if has_saved_state {
+                                info!(
+                                    "Sanity check failed after step-down. Reverting to optimal floor state. Calibration complete."
+                                );
+                                self.camera.restore_state();
+                                calibrated = true;
+                                break;
                             } else {
-                                if let Some(good_exp) = last_good_exposure {
-                                    info!(
-                                        "Sanity check failed after step-down. Reverting to optimal floor exposure: {} us. Calibration complete.",
-                                        good_exp
-                                    );
-                                    current_exposure = good_exp;
-                                    self.camera.set_exposure(current_exposure);
-                                    calibrated = true;
-                                    break;
-                                } else {
-                                    break; // Normal failure, escape the retry loop
-                                }
+                                break; // Normal failure, escape the retry loop
                             }
                         }
                     }
                 } else {
                     // avg_centroids < target_min
-                    if self.config.uvc {
-                        if let Some(good_gain) = last_good_gain {
-                            info!("Centroid count {} fell below target minimum ({}). Reverting to optimal floor gain: {:.2}. Calibration complete.", avg_centroids, target_min, good_gain);
-                            current_gain = good_gain;
-                            self.camera.set_gain(current_gain);
-                            calibrated = true;
-                            break;
-                        }
-                    } else {
-                        if let Some(good_exp) = last_good_exposure {
-                            info!(
-                                "Centroid count {} fell below target minimum ({}). Reverting to optimal floor exposure: {} us. Calibration complete.",
-                                avg_centroids, target_min, good_exp
-                            );
-                            current_exposure = good_exp;
-                            self.camera.set_exposure(current_exposure);
-                            calibrated = true;
-                            break;
-                        }
+                    if has_saved_state {
+                        info!(
+                            "Centroid count {} fell below target minimum ({}). Reverting to optimal floor state. Calibration complete.",
+                            avg_centroids, target_min
+                        );
+                        self.camera.restore_state();
+                        calibrated = true;
+                        break;
                     }
                 }
 
@@ -736,90 +661,48 @@ impl Engine {
                         self.config.target_centroids as f64 / (avg_centroids.max(1)) as f64;
                     let factor = 1.0 + (raw_factor - 1.0) * 0.33;
 
-                    if self.config.uvc {
-                        let next_gain = (current_gain * factor as f32).clamp(self.camera.get_min_gain(), self.camera.get_max_gain());
-                        if (next_gain - current_gain).abs() < 0.1 {
-                            if next_gain <= self.camera.get_min_gain() + 0.1 {
-                                info!("Minimum gain limit reached ({:.2}). Checking if it solves...", next_gain);
-                                let camera_config = self.camera.get_config().unwrap();
-                                let size = (camera_config.height as f64, camera_config.width as f64);
-                                if let Some(arr) = &last_centroids_arr {
-                                    let solution = self.solver.solve_from_centroids(arr, size, SolveOptions::default())
-                                        .expect("Critical Error: solver failed to execute during calibration.");
-                                    if matches!(solution.status, SolveStatus::MatchFound) {
-                                        self.fov = solution.fov;
-                                        info!("Solves at minimum gain! FOV: {:?}. Calibration complete.", self.fov);
-                                        calibrated = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            warn!("Gain limit reached ({:.2}) and still outside target range. Aborting attempt.", current_gain);
-                            break;
-                        }
-                        current_gain = next_gain;
-                        self.camera.set_gain(current_gain);
-                    } else {
-                        let next_exposure =
-                            self.clamp_exposure((current_exposure as f64 * factor) as i32);
+                    let applied = self.camera.adjust_sensitivity(factor);
 
-                        if next_exposure == current_exposure {
-                            if next_exposure == self.config.min_exposure_us {
-                                info!(
-                                    "Minimum exposure limit reached ({} us). Checking if it solves...",
-                                    next_exposure
+                    if !applied {
+                        info!("Sensitivity limit reached. Checking if it solves...");
+                        let camera_config = self.camera.get_config().unwrap();
+                        let size = (camera_config.height as f64, camera_config.width as f64);
+
+                        if let Some(arr) = &last_centroids_arr {
+                            let solution = self
+                                .solver
+                                .solve_from_centroids(arr, size, SolveOptions::default())
+                                .expect(
+                                    "Critical Error: solver failed to execute during calibration.",
                                 );
-                                let camera_config = self.camera.get_config().unwrap();
-                                let size = (camera_config.height as f64, camera_config.width as f64);
 
-                                if let Some(arr) = &last_centroids_arr {
-                                    let solution = self.solver.solve_from_centroids(arr, size, SolveOptions::default())
-                                        .expect("Critical Error: solver failed to execute during calibration.");
-
-                                    if matches!(solution.status, SolveStatus::MatchFound) {
-                                        self.fov = solution.fov;
-                                        info!(
-                                            "Solves at minimum exposure! FOV: {:?}. Calibration complete.",
-                                            self.fov
-                                        );
-                                        calibrated = true;
-                                        break;
-                                    }
-                                }
+                            if matches!(solution.status, SolveStatus::MatchFound) {
+                                self.fov = solution.fov;
+                                info!(
+                                    "Solves at limit! FOV: {:?}. Calibration complete.",
+                                    self.fov
+                                );
+                                calibrated = true;
+                                break;
                             }
-
-                            warn!(
-                                "Exposure limit reached ({} us) and still outside target range. Aborting attempt.",
-                                current_exposure
-                            );
-                            break; // We hit our limits, break the retry loop and sleep
                         }
 
-                        current_exposure = next_exposure;
-                        self.camera.set_exposure(current_exposure);
+                        warn!(
+                            "Hardware/config limits reached and still outside target range. Aborting attempt."
+                        );
+                        break; // We hit our limits, break the retry loop and sleep
                     }
                 }
             }
 
-            // If we exhausted all retries but had successfully verified an exposure, use it!
+            // If we exhausted all retries but had successfully verified a state, use it!
             if !calibrated {
-                if self.config.uvc {
-                    if let Some(good_gain) = last_good_gain {
-                        info!("Max retries reached during floor search. Reverting to optimal floor gain: {:.2}. Calibration complete.", good_gain);
-                        current_gain = good_gain;
-                        self.camera.set_gain(current_gain);
-                        calibrated = true;
-                    }
-                } else {
-                    if let Some(good_exp) = last_good_exposure {
-                        info!(
-                            "Max retries reached during floor search. Reverting to optimal floor exposure: {} us. Calibration complete.",
-                            good_exp
-                        );
-                        current_exposure = good_exp;
-                        self.camera.set_exposure(current_exposure);
-                        calibrated = true;
-                    }
+                if has_saved_state {
+                    info!(
+                        "Max retries reached during floor search. Reverting to optimal floor state. Calibration complete."
+                    );
+                    self.camera.restore_state();
+                    calibrated = true;
                 }
             }
 
@@ -941,8 +824,7 @@ impl Engine {
 
     pub fn run_solving_loop(&mut self) {
         info!("Entering solving loop...");
-        let mut current_exposure = self.camera.get_exposure();
-        let mut current_gain = self.camera.get_gain();
+
         self.update_solve_stats(
             false,
             None,
@@ -951,7 +833,7 @@ impl Engine {
             0,
             None,
             None,
-            current_exposure,
+            self.camera.get_exposure(),
             Duration::ZERO,
             Duration::ZERO,
             Duration::ZERO,
@@ -1126,7 +1008,7 @@ impl Engine {
                             count,
                             self.target_ra,
                             self.target_dec,
-                            current_exposure,
+                            self.camera.get_exposure(),
                             pp_time,
                             extract_time,
                             solve_time,
@@ -1171,7 +1053,7 @@ impl Engine {
                             count,
                             self.target_ra,
                             self.target_dec,
-                            current_exposure,
+                            self.camera.get_exposure(),
                             pp_time,
                             extract_time,
                             solve_time,
@@ -1193,12 +1075,10 @@ impl Engine {
                 // Continuous exposure/gain adjustment
                 let actual_exp = exp_time.as_micros() as i32;
                 // Tighter 1% tolerance prevents overlapping with our 5% adjustment steps (stops ratcheting)
-                let tolerance = (current_exposure as f32 * 0.01).max(500.0) as i32;
+                let tolerance = (self.camera.get_exposure() as f32 * 0.01).max(500.0) as i32;
 
-                // For UVC, we assume gain changes take effect quickly, so we don't strictly gate on exposure match.
-                // For regular cameras, we only evaluate if actual_exp matches current_exposure.
-                // ONLY evaluate adjustment if this image matches our currently requested exposure (or is UVC).
-                let matches_current = self.config.uvc || (actual_exp - current_exposure).abs() <= tolerance;
+                // For UVC, actual_exp will match get_exposure() immediately since it is static, passing naturally.
+                let matches_current = (actual_exp - self.camera.get_exposure()).abs() <= tolerance;
 
                 if matches_current {
                     if recent_centroids.len() >= 5 {
@@ -1233,31 +1113,14 @@ impl Engine {
                             1.0
                         };
 
-                        // Only command the camera if the clamped exposure/gain actually changes
-                        if self.config.uvc {
-                            let next_gain = (current_gain * factor as f32).clamp(self.camera.get_min_gain(), self.camera.get_max_gain());
-                            if (next_gain - current_gain).abs() > 0.1 {
-                                current_gain = next_gain;
-                                self.camera.set_gain(current_gain);
-                                // Flush the history so we evaluate the new exposure fresh, stopping the ratchet
-                                recent_centroids.clear();
-                                consecutive_failures = 0;
-                            } else if needs_upward {
-                                // Prevent spamming failure adjustments if we hit the hardware max limit
-                                consecutive_failures = 0;
-                            }
-                        } else {
-                            let next_exposure = self.clamp_exposure((current_exposure as f64 * factor) as i32);
-                            if next_exposure != current_exposure {
-                                current_exposure = next_exposure;
-                                self.camera.set_exposure(current_exposure);
-                                // Flush the history so we evaluate the new exposure fresh, stopping the ratchet
-                                recent_centroids.clear();
-                                consecutive_failures = 0;
-                            } else if needs_upward {
-                                // Prevent spamming failure adjustments if we hit the hardware max limit
-                                consecutive_failures = 0;
-                            }
+                        let applied = self.camera.adjust_sensitivity(factor);
+                        if applied {
+                            // Flush the history so we evaluate the new exposure fresh, stopping the ratchet
+                            recent_centroids.clear();
+                            consecutive_failures = 0;
+                        } else if needs_upward {
+                            // Prevent spamming failure adjustments if we hit the hardware max limit
+                            consecutive_failures = 0;
                         }
                     }
                 }

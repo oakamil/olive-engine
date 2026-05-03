@@ -58,6 +58,7 @@ pub struct Camera {
     // Cached atomic values for lock-free getter access
     current_gain: Arc<AtomicU32>, // f32 stored as u32 bits for atomic operations
     current_exposure: Arc<AtomicI32>,
+    saved_gain: Arc<AtomicU32>,
 
     config: Arc<Mutex<Option<CameraConfig>>>,
     pub ranges: Arc<Mutex<Option<UvcRanges>>>,
@@ -164,6 +165,30 @@ impl CameraTrait for Camera {
             lock = self.store.cvar.wait(lock).unwrap();
         }
     }
+
+    // --- Abstracted Tuning ---
+
+    fn adjust_sensitivity(&self, factor: f64) -> bool {
+        let current = self.get_gain();
+        let next = (current * factor as f32).clamp(self.get_min_gain(), self.get_max_gain());
+
+        if (next - current).abs() > 0.1 {
+            self.set_gain(next);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn save_state(&self) {
+        self.saved_gain
+            .store(self.current_gain.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+
+    fn restore_state(&self) {
+        let gain = f32::from_bits(self.saved_gain.load(Ordering::Relaxed));
+        self.set_gain(gain);
+    }
 }
 
 impl Camera {
@@ -184,6 +209,7 @@ impl Camera {
             capture_thread: None,
             current_gain: Arc::new(AtomicU32::new(0.0f32.to_bits())),
             current_exposure,
+            saved_gain: Arc::new(AtomicU32::new(0.0f32.to_bits())),
             config,
             ranges,
             target_fps,
@@ -262,7 +288,11 @@ impl Camera {
 
         get_range!(saturation, saturation_range, saturation);
         get_range!(contrast, contrast_range, contrast);
-        get_range!(white_balance_temperature, white_balance_temperature_range, white_balance_temperature);
+        get_range!(
+            white_balance_temperature,
+            white_balance_temperature_range,
+            white_balance_temperature
+        );
         get_range!(sharpness, sharpness_range, sharpness);
         get_range!(brightness, brightness_range, brightness);
         get_range!(gamma, gamma_range, gamma);
@@ -347,13 +377,27 @@ impl Camera {
                     // Exposure cannot be changed for UVC cameras
                 }
                 Ok(CaptureCommand::SetUvcControls(controls)) => {
-                    if let Some(val) = controls.saturation { let _ = devh.set_saturation(val.try_into().unwrap_or(0)); }
-                    if let Some(val) = controls.contrast { let _ = devh.set_contrast(val.try_into().unwrap_or(0)); }
-                    if let Some(val) = controls.white_balance_temperature { let _ = devh.set_white_balance_temperature(val.try_into().unwrap_or(0)); }
-                    if let Some(val) = controls.sharpness { let _ = devh.set_sharpness(val.try_into().unwrap_or(0)); }
-                    if let Some(val) = controls.brightness { let _ = devh.set_brightness(val.try_into().unwrap_or(0)); }
-                    if let Some(val) = controls.gamma { let _ = devh.set_gamma(val.try_into().unwrap_or(0)); }
-                    if let Some(val) = controls.gain { let _ = devh.set_gain(val.try_into().unwrap_or(0)); }
+                    if let Some(val) = controls.saturation {
+                        let _ = devh.set_saturation(val.try_into().unwrap_or(0));
+                    }
+                    if let Some(val) = controls.contrast {
+                        let _ = devh.set_contrast(val.try_into().unwrap_or(0));
+                    }
+                    if let Some(val) = controls.white_balance_temperature {
+                        let _ = devh.set_white_balance_temperature(val.try_into().unwrap_or(0));
+                    }
+                    if let Some(val) = controls.sharpness {
+                        let _ = devh.set_sharpness(val.try_into().unwrap_or(0));
+                    }
+                    if let Some(val) = controls.brightness {
+                        let _ = devh.set_brightness(val.try_into().unwrap_or(0));
+                    }
+                    if let Some(val) = controls.gamma {
+                        let _ = devh.set_gamma(val.try_into().unwrap_or(0));
+                    }
+                    if let Some(val) = controls.gain {
+                        let _ = devh.set_gain(val.try_into().unwrap_or(0));
+                    }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
