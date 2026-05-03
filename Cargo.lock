@@ -389,7 +389,7 @@ dependencies = [
  "bitflags 2.11.1",
  "cexpr",
  "clang-sys",
- "itertools 0.11.0",
+ "itertools 0.12.1",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -4527,7 +4527,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 [[package]]
 name = "uvc"
 version = "0.3.0"
-source = "git+https://github.com/oakamil/libuvc-rs#4116318c6b50b8603f89a61bd7be2495f002db7b"
+source = "git+https://github.com/oakamil/libuvc-rs#d71eff075b0cfe856b14714ea06d157155e6882e"
 dependencies = [
  "uvc-sys",
 ]
@@ -4535,7 +4535,7 @@ dependencies = [
 [[package]]
 name = "uvc-src"
 version = "0.3.0"
-source = "git+https://github.com/oakamil/libuvc-rs#4116318c6b50b8603f89a61bd7be2495f002db7b"
+source = "git+https://github.com/oakamil/libuvc-rs#d71eff075b0cfe856b14714ea06d157155e6882e"
 dependencies = [
  "cc",
  "libusb1-sys",
@@ -4545,7 +4545,7 @@ dependencies = [
 [[package]]
 name = "uvc-sys"
 version = "0.3.0"
-source = "git+https://github.com/oakamil/libuvc-rs#4116318c6b50b8603f89a61bd7be2495f002db7b"
+source = "git+https://github.com/oakamil/libuvc-rs#d71eff075b0cfe856b14714ea06d157155e6882e"
 dependencies = [
  "bindgen",
  "uvc-src",

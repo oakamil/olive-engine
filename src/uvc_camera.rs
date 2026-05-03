@@ -14,6 +14,28 @@ use uvc::{AutoExposureMode, FrameFormat};
 
 // --- Data Structures ---
 
+#[derive(Clone, Debug, Default)]
+pub struct UvcRanges {
+    pub saturation: Option<uvc::Range<i32>>,
+    pub contrast: Option<uvc::Range<i32>>,
+    pub white_balance_temperature: Option<uvc::Range<i32>>,
+    pub sharpness: Option<uvc::Range<i32>>,
+    pub brightness: Option<uvc::Range<i32>>,
+    pub gamma: Option<uvc::Range<i32>>,
+    pub gain: Option<uvc::Range<i32>>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct UvcControls {
+    pub saturation: Option<i32>,
+    pub contrast: Option<i32>,
+    pub white_balance_temperature: Option<i32>,
+    pub sharpness: Option<i32>,
+    pub brightness: Option<i32>,
+    pub gamma: Option<i32>,
+    pub gain: Option<i32>,
+}
+
 /// Thread-safe atomic store for the latest capture.
 struct CaptureStore {
     image: Mutex<Option<Arc<Image>>>,
@@ -24,6 +46,7 @@ struct CaptureStore {
 enum CaptureCommand {
     SetGain(f32),
     SetExposure(i32),
+    SetUvcControls(UvcControls),
     StopCaptureThread,
 }
 
@@ -35,10 +58,9 @@ pub struct Camera {
     // Cached atomic values for lock-free getter access
     current_gain: Arc<AtomicU32>, // f32 stored as u32 bits for atomic operations
     current_exposure: Arc<AtomicI32>,
-    min_gain: Arc<AtomicU32>,
-    max_gain: Arc<AtomicU32>,
 
     config: Arc<Mutex<Option<CameraConfig>>>,
+    pub ranges: Arc<Mutex<Option<UvcRanges>>>,
     target_fps: u32,
 }
 
@@ -58,10 +80,9 @@ impl CameraTrait for Camera {
 
         let store_clone = Arc::clone(&self.store);
         let config_clone = Arc::clone(&self.config);
+        let ranges_clone = Arc::clone(&self.ranges);
         let current_gain = Arc::clone(&self.current_gain);
         let current_exposure = Arc::clone(&self.current_exposure);
-        let min_gain_store = Arc::clone(&self.min_gain);
-        let max_gain_store = Arc::clone(&self.max_gain);
         let target_fps = self.target_fps;
 
         self.capture_thread = Some(thread::spawn(move || {
@@ -69,10 +90,9 @@ impl CameraTrait for Camera {
                 rx,
                 store_clone,
                 config_clone,
+                ranges_clone,
                 current_gain,
                 current_exposure,
-                min_gain_store,
-                max_gain_store,
                 target_fps,
             );
         }));
@@ -87,11 +107,23 @@ impl CameraTrait for Camera {
     }
 
     fn get_min_gain(&self) -> f32 {
-        f32::from_bits(self.min_gain.load(Ordering::Relaxed))
+        self.ranges
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|r| r.gain.as_ref())
+            .map(|g| g.min as f32)
+            .unwrap_or(0.0)
     }
 
     fn get_max_gain(&self) -> f32 {
-        f32::from_bits(self.max_gain.load(Ordering::Relaxed))
+        self.ranges
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|r| r.gain.as_ref())
+            .map(|g| g.max as f32)
+            .unwrap_or(100.0)
     }
 
     fn set_gain(&self, gain: f32) {
@@ -143,9 +175,8 @@ impl Camera {
         });
 
         let current_exposure = Arc::new(AtomicI32::new(50000));
-        let min_gain = Arc::new(AtomicU32::new(0.0f32.to_bits()));
-        let max_gain = Arc::new(AtomicU32::new(100.0f32.to_bits()));
         let config = Arc::new(Mutex::new(None));
+        let ranges = Arc::new(Mutex::new(None));
 
         Self {
             command_tx: None,
@@ -153,11 +184,14 @@ impl Camera {
             capture_thread: None,
             current_gain: Arc::new(AtomicU32::new(0.0f32.to_bits())),
             current_exposure,
-            min_gain,
-            max_gain,
             config,
+            ranges,
             target_fps,
         }
+    }
+
+    pub fn set_uvc_controls(&self, controls: UvcControls) {
+        self.send_command(CaptureCommand::SetUvcControls(controls));
     }
 
     fn send_command(&self, cmd: CaptureCommand) {
@@ -170,10 +204,9 @@ impl Camera {
         rx: mpsc::Receiver<CaptureCommand>,
         store: Arc<CaptureStore>,
         config_store: Arc<Mutex<Option<CameraConfig>>>,
+        ranges_store: Arc<Mutex<Option<UvcRanges>>>,
         current_gain_atomic: Arc<AtomicU32>,
         current_exposure_atomic: Arc<AtomicI32>,
-        min_gain_store: Arc<AtomicU32>,
-        max_gain_store: Arc<AtomicU32>,
         target_fps: u32,
     ) {
         let ctx = uvc::Context::new().expect("Failed to create UVC context");
@@ -212,35 +245,37 @@ impl Camera {
 
         info!("Selected UVC format: {:?}", stream_format);
 
-        // Set default controls
-        //if let Ok(range) = devh.saturation_range() {
-        //    let _ = devh.set_saturation(range.default);
-        //}
-        //if let Ok(range) = devh.contrast_range() {
-        //    let _ = devh.set_contrast(range.default);
-        //}
-        //if let Ok(range) = devh.white_balance_temperature_range() {
-        //    let _ = devh.set_white_balance_temperature(range.default);
-        //}
-        if let Ok(range) = devh.sharpness_range() {
-            let _ = devh.set_sharpness(range.min);
+        let mut uvc_ranges = UvcRanges::default();
+
+        macro_rules! get_range {
+            ($getter:ident, $range_getter:ident, $field:ident) => {
+                if let Ok(range) = devh.$range_getter() {
+                    uvc_ranges.$field = Some(uvc::Range {
+                        min: range.min as i32,
+                        max: range.max as i32,
+                        step: range.step as i32,
+                        default: range.default as i32,
+                    });
+                }
+            };
         }
-        //if let Ok(range) = devh.brightness_range() {
-        //    let _ = devh.set_brightness(range.default);
-        //}
-        if let Ok(range) = devh.gamma_range() {
-            let _ = devh.set_gamma(range.min);
+
+        get_range!(saturation, saturation_range, saturation);
+        get_range!(contrast, contrast_range, contrast);
+        get_range!(white_balance_temperature, white_balance_temperature_range, white_balance_temperature);
+        get_range!(sharpness, sharpness_range, sharpness);
+        get_range!(brightness, brightness_range, brightness);
+        get_range!(gamma, gamma_range, gamma);
+        get_range!(gain, gain_range, gain);
+
+        {
+            let mut lock = ranges_store.lock().unwrap();
+            *lock = Some(uvc_ranges);
         }
 
         // Turn off auto-exposure and auto-white-balance
         let _ = devh.set_ae_mode(AutoExposureMode::Manual);
         let _ = devh.set_white_balance_temperature_auto(false);
-
-        // Update gain limits
-        if let Ok(range) = devh.gain_range() {
-            min_gain_store.store((range.min as f32).to_bits(), Ordering::Relaxed);
-            max_gain_store.store((range.max as f32).to_bits(), Ordering::Relaxed);
-        }
 
         let initial_gain = f32::from_bits(current_gain_atomic.load(Ordering::Relaxed));
         let initial_exposure = current_exposure_atomic.load(Ordering::Relaxed);
@@ -254,6 +289,7 @@ impl Camera {
                 model: "UVC Camera".to_string(),
                 width: stream_format.width,
                 height: stream_format.height,
+                fps: stream_format.fps,
             });
         }
 
@@ -309,6 +345,15 @@ impl Camera {
                 }
                 Ok(CaptureCommand::SetExposure(_exp)) => {
                     // Exposure cannot be changed for UVC cameras
+                }
+                Ok(CaptureCommand::SetUvcControls(controls)) => {
+                    if let Some(val) = controls.saturation { let _ = devh.set_saturation(val.try_into().unwrap_or(0)); }
+                    if let Some(val) = controls.contrast { let _ = devh.set_contrast(val.try_into().unwrap_or(0)); }
+                    if let Some(val) = controls.white_balance_temperature { let _ = devh.set_white_balance_temperature(val.try_into().unwrap_or(0)); }
+                    if let Some(val) = controls.sharpness { let _ = devh.set_sharpness(val.try_into().unwrap_or(0)); }
+                    if let Some(val) = controls.brightness { let _ = devh.set_brightness(val.try_into().unwrap_or(0)); }
+                    if let Some(val) = controls.gamma { let _ = devh.set_gamma(val.try_into().unwrap_or(0)); }
+                    if let Some(val) = controls.gain { let _ = devh.set_gain(val.try_into().unwrap_or(0)); }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,

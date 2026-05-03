@@ -115,6 +115,7 @@ impl CameraTrait for Camera {
             model: c.model.clone(),
             width: c.width,
             height: c.height,
+            fps: 0,
         })
     }
 
