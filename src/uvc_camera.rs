@@ -140,10 +140,7 @@ impl CameraTrait for Camera {
         self.current_exposure.load(Ordering::Relaxed)
     }
 
-    fn set_exposure(&self, exposure_us: i32) {
-        self.current_exposure.store(exposure_us, Ordering::Relaxed);
-        self.send_command(CaptureCommand::SetExposure(exposure_us));
-    }
+    fn set_exposure(&self, _exposure_us: i32) {}
 
     fn enable_hcg(&self) {}
 
@@ -298,6 +295,26 @@ impl Camera {
         get_range!(gamma, gamma_range, gamma);
         get_range!(gain, gain_range, gain);
 
+        // Per empirical results with an SC2210 camera, set the gamma to its minimum and the other settings to their defaults
+        if let Some(range) = uvc_ranges.saturation {
+            let _ = devh.set_saturation(range.default.try_into().unwrap());
+        }
+        if let Some(range) = uvc_ranges.contrast {
+            let _ = devh.set_contrast(range.default.try_into().unwrap());
+        }
+        if let Some(range) = uvc_ranges.white_balance_temperature {
+            let _ = devh.set_white_balance_temperature(range.default.try_into().unwrap());
+        }
+        if let Some(range) = uvc_ranges.sharpness {
+            let _ = devh.set_sharpness(range.default.try_into().unwrap());
+        }
+        if let Some(range) = uvc_ranges.brightness {
+            let _ = devh.set_brightness(range.default.try_into().unwrap());
+        }
+        if let Some(range) = uvc_ranges.gamma {
+            let _ = devh.set_gamma(range.min.try_into().unwrap());
+        }
+
         {
             let mut lock = ranges_store.lock().unwrap();
             *lock = Some(uvc_ranges);
@@ -308,10 +325,9 @@ impl Camera {
         let _ = devh.set_white_balance_temperature_auto(false);
 
         let initial_gain = f32::from_bits(current_gain_atomic.load(Ordering::Relaxed));
-        let initial_exposure = current_exposure_atomic.load(Ordering::Relaxed);
+        current_exposure_atomic.store((1_000_000 / stream_format.fps) as i32, Ordering::Relaxed);
 
         let _ = devh.set_gain(initial_gain as u16);
-        let _ = devh.set_exposure_abs(initial_exposure as u32 / 100); // libuvc exposure is usually in 0.1ms units
 
         {
             let mut lock = config_store.lock().unwrap();
