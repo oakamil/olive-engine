@@ -45,7 +45,6 @@ struct CaptureStore {
 /// Commands sent from the main thread to the capture thread.
 enum CaptureCommand {
     SetGain(f32),
-    SetExposure(i32),
     SetUvcControls(UvcControls),
     StopCaptureThread,
 }
@@ -130,7 +129,7 @@ impl CameraTrait for Camera {
     fn set_gain(&self, gain: f32) {
         let min = self.get_min_gain();
         let max = self.get_max_gain();
-        let clamped_gain = gain.clamp(min, max);
+        let clamped_gain = gain.clamp(min, max).round();
         self.current_gain
             .store(clamped_gain.to_bits(), Ordering::Relaxed);
         self.send_command(CaptureCommand::SetGain(clamped_gain));
@@ -388,9 +387,6 @@ impl Camera {
                 Ok(CaptureCommand::StopCaptureThread) => break,
                 Ok(CaptureCommand::SetGain(gain)) => {
                     let _ = devh.set_gain(gain as u16);
-                }
-                Ok(CaptureCommand::SetExposure(_exp)) => {
-                    // Exposure cannot be changed for UVC cameras
                 }
                 Ok(CaptureCommand::SetUvcControls(controls)) => {
                     if let Some(val) = controls.saturation {

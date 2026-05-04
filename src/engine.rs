@@ -617,11 +617,20 @@ impl Engine {
                                 }
                                 needs_standard_adjustment = false;
                             } else {
-                                info!(
-                                    "Centroid count {} is too high (max {}). Scaling down sensitivity...",
-                                    avg_centroids, target_max
-                                );
-                                // Let it fall through to standard downward adjustment logic
+                                if retry == MAX_RETRIES - 1 {
+                                    info!(
+                                        "Centroid count {} is high but sanity check passed. Max retries reached, accepting current state as calibration.",
+                                        avg_centroids
+                                    );
+                                    calibrated = true;
+                                    break;
+                                } else {
+                                    info!(
+                                        "Centroid count {} is too high (max {}). Scaling down sensitivity...",
+                                        avg_centroids, target_max
+                                    );
+                                    // Let it fall through to standard downward adjustment logic
+                                }
                             }
                         } else {
                             warn!(
