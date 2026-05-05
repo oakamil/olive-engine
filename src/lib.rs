@@ -17,6 +17,8 @@ pub mod uvc_camera;
 #[derive(Clone, Debug)]
 pub struct Image {
     pub data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
     pub timestamp: SystemTime,
     pub exposure_time_us: i32,
     pub post_process_time: Duration,

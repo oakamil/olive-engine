@@ -582,6 +582,8 @@ impl Camera {
         let mut lock = store.image.lock().unwrap();
         *lock = Some(Arc::new(Image {
             data: image_data,
+            width: config.width,
+            height: config.height,
             timestamp,
             exposure_time_us,
             post_process_time,

@@ -646,6 +646,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
+name = "cmake"
+version = "0.1.58"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "color_quant"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1125,6 +1134,12 @@ dependencies = [
  "pin-project-lite",
  "slab",
 ]
+
+[[package]]
+name = "gcd"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d758ba1b47b00caf47f24925c0074ecb20d6dfcffe7f6d53395c0465674841a"
 
 [[package]]
 name = "generator"
@@ -2722,6 +2737,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tower-http 0.5.2",
+ "turbojpeg",
  "uvc",
 ]
 
@@ -4428,6 +4444,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 
 [[package]]
+name = "turbojpeg"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b12ab1b96184a3879b4b16a74ee67436a5ef8833c0e6954a8cbf47ec9036559"
+dependencies = [
+ "gcd",
+ "libc",
+ "thiserror 1.0.69",
+ "turbojpeg-sys",
+]
+
+[[package]]
+name = "turbojpeg-sys"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2d87290369f91af10f425f9ec0b8ce775cf79ea189291faa974c0b4e02e1e2f"
+dependencies = [
+ "anyhow",
+ "cmake",
+ "libc",
+ "pkg-config",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4527,7 +4567,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 [[package]]
 name = "uvc"
 version = "0.3.0"
-source = "git+https://github.com/oakamil/libuvc-rs#d71eff075b0cfe856b14714ea06d157155e6882e"
+source = "git+https://github.com/oakamil/libuvc-rs#4248564cfc0bc5b0631770bfb9b3ff95636c8db1"
 dependencies = [
  "uvc-sys",
 ]
@@ -4535,7 +4575,7 @@ dependencies = [
 [[package]]
 name = "uvc-src"
 version = "0.3.0"
-source = "git+https://github.com/oakamil/libuvc-rs#d71eff075b0cfe856b14714ea06d157155e6882e"
+source = "git+https://github.com/oakamil/libuvc-rs#4248564cfc0bc5b0631770bfb9b3ff95636c8db1"
 dependencies = [
  "cc",
  "libusb1-sys",
@@ -4545,7 +4585,7 @@ dependencies = [
 [[package]]
 name = "uvc-sys"
 version = "0.3.0"
-source = "git+https://github.com/oakamil/libuvc-rs#d71eff075b0cfe856b14714ea06d157155e6882e"
+source = "git+https://github.com/oakamil/libuvc-rs#4248564cfc0bc5b0631770bfb9b3ff95636c8db1"
 dependencies = [
  "bindgen",
  "uvc-src",

@@ -294,6 +294,10 @@ impl Camera {
         get_range!(gamma, gamma_range, gamma);
         get_range!(gain, gain_range, gain);
 
+        let mut streamh = devh
+            .get_stream_handle_with_format(stream_format)
+            .expect("Failed to get stream handle");
+
         // Per empirical results with an SC2210 camera, set the gamma to its minimum and the other settings to their defaults
         if let Some(range) = uvc_ranges.saturation {
             let _ = devh.set_saturation(range.default.try_into().unwrap());
@@ -338,10 +342,6 @@ impl Camera {
             });
         }
 
-        let mut streamh = devh
-            .get_stream_handle_with_format(stream_format)
-            .expect("Failed to get stream handle");
-
         let _stream = streamh
             .start_stream(
                 move |frame, _| {
@@ -371,6 +371,8 @@ impl Camera {
                     let mut lock = store.image.lock().unwrap();
                     *lock = Some(Arc::new(Image {
                         data: image_data,
+                        width: width as u32,
+                        height: height as u32,
                         timestamp,
                         exposure_time_us: current_exposure_atomic.load(Ordering::Relaxed),
                         post_process_time,

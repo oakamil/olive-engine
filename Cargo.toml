@@ -34,6 +34,7 @@ cedar_detect = { git = "https://github.com/oakamil/cedar-detect" }
 bno080 = { git = "https://github.com/oakamil/bno080.git", branch = "arvr" }
 bmi160 = "1.1.0"
 linux-embedded-hal = "0.4.0"
+turbojpeg = "1.4.0"
 
 [features]
 extension-module = ["pyo3/extension-module"]
