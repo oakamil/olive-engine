@@ -361,7 +361,7 @@ impl Camera {
             });
         }
 
-        let discard_frames = Arc::new(AtomicU32::new(stream_format.fps));
+        let discard_frames = Arc::new(AtomicU32::new(stream_format.fps * 2));
         let discard_frames_clone = Arc::clone(&discard_frames);
         let store_clone = Arc::clone(&store);
 
@@ -425,7 +425,7 @@ impl Camera {
                 Ok(CaptureCommand::StopCaptureThread) => break,
                 Ok(CaptureCommand::SetGain(gain)) => {
                     let _ = devh.set_gain(gain as u16);
-                    discard_frames.store(stream_format.fps, Ordering::Relaxed);
+                    let _ = discard_frames.fetch_add(10, Ordering::Relaxed);
                     *store.image.lock().unwrap() = None;
                 }
                 Ok(CaptureCommand::SetUvcControls(controls)) => {
