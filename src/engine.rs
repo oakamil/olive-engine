@@ -29,7 +29,6 @@ pub struct EngineConfig {
     pub isp: bool,
     pub bg_mode: BgMode,
     pub extractor_type: Extractor,
-    pub uvc: bool,
 }
 
 impl Default for EngineConfig {
@@ -44,7 +43,6 @@ impl Default for EngineConfig {
             isp: false,
             bg_mode: BgMode::Line,
             extractor_type: Extractor::Sequential,
-            uvc: false,
         }
     }
 }
@@ -413,6 +411,9 @@ impl Engine {
     pub fn run_calibration_loop(&mut self) {
         info!("Starting auto-calibration loop...");
         self.update_status("Calibration");
+
+        info!("Waiting for stream initialization...");
+        while self.wait_for_extraction().is_none() {} // this already blocks for 100ms
 
         // Apply static hardware settings ONCE at startup
         let gain = self.config.gain.unwrap_or(self.camera.get_max_gain());

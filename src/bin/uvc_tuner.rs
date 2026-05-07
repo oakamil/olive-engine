@@ -52,7 +52,7 @@ fn main() {
     };
 
     println!("Initializing UVC Tuner with target {} fps...", target_fps);
-    let mut camera = Camera::new(target_fps);
+    let mut camera = Camera::new(target_fps, false);
 
     let mut start_attempts = 0;
     while let Err(e) = camera.start_capture() {

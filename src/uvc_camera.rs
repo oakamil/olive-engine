@@ -10,6 +10,7 @@ use std::sync::{
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
+use turbojpeg;
 use uvc::{AutoExposureMode, FrameFormat};
 
 // --- Data Structures ---
@@ -64,6 +65,7 @@ pub struct Camera {
     config: Arc<Mutex<Option<CameraConfig>>>,
     pub ranges: Arc<Mutex<Option<UvcRanges>>>,
     target_fps: u32,
+    mjpeg_enabled: bool,
 }
 
 impl CameraTrait for Camera {
@@ -86,6 +88,7 @@ impl CameraTrait for Camera {
         let current_gain = Arc::clone(&self.current_gain);
         let current_exposure = Arc::clone(&self.current_exposure);
         let target_fps = self.target_fps;
+        let mjpeg_enabled = self.mjpeg_enabled;
 
         self.capture_thread = Some(thread::spawn(move || {
             Self::capture_loop(
@@ -96,6 +99,7 @@ impl CameraTrait for Camera {
                 current_gain,
                 current_exposure,
                 target_fps,
+                mjpeg_enabled,
             );
         }));
 
@@ -191,7 +195,7 @@ impl CameraTrait for Camera {
 
 impl Camera {
     /// Instantiates the camera module and sets initial cached state.
-    pub fn new(target_fps: u32) -> Self {
+    pub fn new(target_fps: u32, mjpeg_enabled: bool) -> Self {
         let store = Arc::new(CaptureStore {
             image: Mutex::new(None),
             cvar: Condvar::new(),
@@ -211,6 +215,7 @@ impl Camera {
             config,
             ranges,
             target_fps,
+            mjpeg_enabled,
         }
     }
 
@@ -232,6 +237,7 @@ impl Camera {
         current_gain_atomic: Arc<AtomicU32>,
         current_exposure_atomic: Arc<AtomicI32>,
         target_fps: u32,
+        mjpeg_enabled: bool,
     ) {
         let ctx = uvc::Context::new().expect("Failed to create UVC context");
         let dev = ctx
@@ -239,14 +245,14 @@ impl Camera {
             .expect("Failed to find UVC device");
         let devh = dev.open().expect("Failed to open UVC device");
 
-        // Find highest resolution uncompressed (YUV) format that supports at least target_fps
+        // Find highest resolution format (Uncompressed or MJPEG if enabled) that supports at least target_fps
         let stream_format = devh
             .get_preferred_format(move |f1, f2| {
-                let f1_is_uncomp = f1.format == FrameFormat::Uncompressed;
-                let f2_is_uncomp = f2.format == FrameFormat::Uncompressed;
+                let f1_is_ok = f1.format == FrameFormat::Uncompressed || (mjpeg_enabled && f1.format == FrameFormat::MJPEG);
+                let f2_is_ok = f2.format == FrameFormat::Uncompressed || (mjpeg_enabled && f2.format == FrameFormat::MJPEG);
 
-                if f1_is_uncomp != f2_is_uncomp {
-                    return if f1_is_uncomp { f1 } else { f2 };
+                if f1_is_ok != f2_is_ok {
+                    return if f1_is_ok { f1 } else { f2 };
                 }
 
                 let f1_fps_ok = f1.fps >= target_fps;
@@ -263,9 +269,14 @@ impl Camera {
                     return if f1_res > f2_res { f1 } else { f2 };
                 }
 
+                // If resolutions are equal, prefer Uncompressed over MJPEG
+                if f1.format != f2.format {
+                    return if f1.format == FrameFormat::Uncompressed { f1 } else { f2 };
+                }
+
                 if f1.fps > f2.fps { f1 } else { f2 }
             })
-            .expect("Failed to find suitable YUV format");
+            .expect("Failed to find suitable format");
 
         info!("Selected UVC format: {:?}", stream_format);
 
@@ -384,21 +395,46 @@ impl Camera {
                     let receive_time = std::time::Instant::now();
                     let timestamp = SystemTime::now();
 
-                    let width = frame.width() as usize;
-                    let height = frame.height() as usize;
+                    let mut width = frame.width() as usize;
+                    let mut height = frame.height() as usize;
                     let data = frame.to_bytes();
 
-                    // Highly optimized loop for 8-bit mono extraction (Y from YUYV)
-                    // YUYV sequence: Y0, U0, Y1, V0... (2 bytes per pixel, even bytes are Y)
-                    let mut image_data = Vec::with_capacity(width * height);
-                    unsafe {
-                        image_data.set_len(width * height);
-                        let mut j = 0;
-                        // Manual loop unrolling or just a tight loop
-                        for i in (0..data.len()).step_by(2) {
-                            if j < width * height {
-                                *image_data.get_unchecked_mut(j) = *data.get_unchecked(i);
-                                j += 1;
+                    let mut image_data;
+                    if frame.format() == FrameFormat::MJPEG {
+                        let mut decompressor = match turbojpeg::Decompressor::new() {
+                            Ok(d) => d,
+                            Err(_) => return,
+                        };
+                        let header = match decompressor.read_header(data) {
+                            Ok(h) => h,
+                            Err(_) => return,
+                        };
+                        width = header.width;
+                        height = header.height;
+                        image_data = vec![0u8; width * height];
+                        let image = turbojpeg::Image {
+                            pixels: image_data.as_mut_slice(),
+                            width,
+                            pitch: width,
+                            height,
+                            format: turbojpeg::PixelFormat::GRAY,
+                        };
+                        if decompressor.decompress(data, image).is_err() {
+                            return;
+                        }
+                    } else {
+                        // Highly optimized loop for 8-bit mono extraction (Y from YUYV)
+                        // YUYV sequence: Y0, U0, Y1, V0... (2 bytes per pixel, even bytes are Y)
+                        image_data = Vec::with_capacity(width * height);
+                        unsafe {
+                            image_data.set_len(width * height);
+                            let mut j = 0;
+                            // Manual loop unrolling or just a tight loop
+                            for i in (0..data.len()).step_by(2) {
+                                if j < width * height {
+                                    *image_data.get_unchecked_mut(j) = *data.get_unchecked(i);
+                                    j += 1;
+                                }
                             }
                         }
                     }
