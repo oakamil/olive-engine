@@ -27,6 +27,8 @@ pub struct UvcRanges {
 
 #[derive(Clone, Debug, Default)]
 pub struct UvcControls {
+    pub ae_mode: Option<u8>,
+    pub exposure_abs: Option<u32>,
     pub saturation: Option<i32>,
     pub contrast: Option<i32>,
     pub white_balance_temperature: Option<i32>,
@@ -334,13 +336,20 @@ impl Camera {
         }
 
         // Turn off auto-exposure and auto-white-balance
-        let _ = devh.set_ae_mode(AutoExposureMode::Manual);
+        let supported_ae_modes = devh.supported_ae_modes().unwrap_or(Vec::new());
+        let ae_mode = if supported_ae_modes.contains(&AutoExposureMode::ShutterPriority) && !supported_ae_modes.contains(&AutoExposureMode::Manual) {
+            AutoExposureMode::ShutterPriority
+        } else {
+            AutoExposureMode::Manual
+        };
+        let _ = devh.set_ae_mode(ae_mode);
         let _ = devh.set_white_balance_temperature_auto(false);
 
         let initial_gain = f32::from_bits(current_gain_atomic.load(Ordering::Relaxed));
         current_exposure_atomic.store((1_000_000 / stream_format.fps) as i32, Ordering::Relaxed);
 
         let _ = devh.set_gain(initial_gain as u16);
+        let _ = devh.set_exposure_abs(10000 / stream_format.fps);
 
         {
             let mut lock = config_store.lock().unwrap();
@@ -401,6 +410,27 @@ impl Camera {
                     let _ = devh.set_gain(gain as u16);
                 }
                 Ok(CaptureCommand::SetUvcControls(controls)) => {
+                    let mut current_ae_mode = AutoExposureMode::Manual;
+                    let supported_ae_modes = devh.supported_ae_modes().unwrap_or(Vec::new());
+                    if supported_ae_modes.contains(&AutoExposureMode::ShutterPriority) && !supported_ae_modes.contains(&AutoExposureMode::Manual) {
+                        current_ae_mode = AutoExposureMode::ShutterPriority;
+                    }
+                    if let Some(val) = controls.ae_mode {
+                        current_ae_mode = match val {
+                            1 => AutoExposureMode::Manual,
+                            2 => AutoExposureMode::Auto,
+                            4 => AutoExposureMode::ShutterPriority,
+                            8 => AutoExposureMode::AperturePriority,
+                            _ => AutoExposureMode::Manual,
+                        };
+                        // Enforce fallback if Manual isn't supported
+                        if current_ae_mode == AutoExposureMode::Manual && supported_ae_modes.contains(&AutoExposureMode::ShutterPriority) && !supported_ae_modes.contains(&AutoExposureMode::Manual) {
+                            current_ae_mode = AutoExposureMode::ShutterPriority;
+                        }
+                    }
+                    let _ = devh.set_ae_mode(current_ae_mode);
+                    let _ = devh.set_white_balance_temperature_auto(false);
+
                     if let Some(val) = controls.saturation {
                         let _ = devh.set_saturation(val.try_into().unwrap_or(0));
                     }
@@ -421,6 +451,12 @@ impl Camera {
                     }
                     if let Some(val) = controls.gain {
                         let _ = devh.set_gain(val.try_into().unwrap_or(0));
+                    }
+
+                    if let Some(val) = controls.exposure_abs {
+                        let _ = devh.set_exposure_abs(val);
+                    } else {
+                        let _ = devh.set_exposure_abs(10000 / stream_format.fps);
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}

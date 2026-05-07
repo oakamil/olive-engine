@@ -131,6 +131,8 @@ fn main() {
                     for &bright in &bright_choices {
                         for &gamma in &gamma_choices {
                             combinations.push(UvcControls {
+                                ae_mode: None,
+                                exposure_abs: None,
                                 saturation: sat,
                                 contrast: cont,
                                 white_balance_temperature: wbt,
