@@ -294,9 +294,19 @@ impl Camera {
         get_range!(gamma, gamma_range, gamma);
         get_range!(gain, gain_range, gain);
 
-        let mut streamh = devh
-            .get_stream_handle_with_format(stream_format)
-            .expect("Failed to get stream handle");
+        let mut retry_count = 0;
+        let mut streamh = loop {
+            match devh.get_stream_handle_with_format(stream_format) {
+                Ok(h) => break h,
+                Err(e) => {
+                    retry_count += 1;
+                    if retry_count >= 3 {
+                        panic!("Failed to get stream handle after 3 attempts: {:?}", e);
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            }
+        };
 
         // Per empirical results with an SC2210 camera, set the gamma to its minimum and the other settings to their defaults
         if let Some(range) = uvc_ranges.saturation {

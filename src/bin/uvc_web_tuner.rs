@@ -28,6 +28,7 @@ struct AppState {
     current_values: UvcValues,
     is_benchmarking: bool,
     benchmark_stats: BenchmarkStats,
+    camera_error: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -39,8 +40,9 @@ struct FormatInfo {
     fps: u32,
 }
 
-#[derive(Clone, Serialize, Default)]
+#[derive(Clone, Serialize)]
 struct UvcValues {
+    ae_mode: u8,
     gain: i32,
     contrast: i32,
     saturation: i32,
@@ -48,6 +50,23 @@ struct UvcValues {
     white_balance_temperature: i32,
     sharpness: i32,
     gamma: i32,
+    backlight_compensation: i32,
+}
+
+impl Default for UvcValues {
+    fn default() -> Self {
+        Self {
+            ae_mode: 1,
+            gain: 0,
+            contrast: 0,
+            saturation: 0,
+            brightness: 0,
+            white_balance_temperature: 0,
+            sharpness: 0,
+            gamma: 0,
+            backlight_compensation: 0,
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Default)]
@@ -59,6 +78,7 @@ struct UvcRanges {
     white_balance_temperature: Option<RangeDef>,
     sharpness: Option<RangeDef>,
     gamma: Option<RangeDef>,
+    backlight_compensation: Option<RangeDef>,
 }
 
 #[derive(Clone, Serialize)]
@@ -178,6 +198,15 @@ fn get_range(devh: &uvc::DeviceHandle, ctrl: &str) -> Option<uvc::Range<i32>> {
                 step: r.step as i32,
                 default: r.default as i32,
             }),
+        "backlight_compensation" => devh
+            .backlight_compensation_range()
+            .ok()
+            .map(|r| uvc::Range {
+                min: r.min as i32,
+                max: r.max as i32,
+                step: r.step as i32,
+                default: r.default as i32,
+            }),
         _ => None,
     }
 }
@@ -225,8 +254,10 @@ fn run_camera(
     ranges.white_balance_temperature = get_range(&devh, "white_balance_temperature").map(Into::into);
     ranges.sharpness = get_range(&devh, "sharpness").map(Into::into);
     ranges.gamma = get_range(&devh, "gamma").map(Into::into);
+    ranges.backlight_compensation = get_range(&devh, "backlight_compensation").map(Into::into);
 
     let mut current_values = UvcValues {
+        ae_mode: 1,
         gain: ranges.gain.as_ref().map(|r| r.default).unwrap_or(0),
         contrast: ranges.contrast.as_ref().map(|r| r.default).unwrap_or(0),
         saturation: ranges.saturation.as_ref().map(|r| r.default).unwrap_or(0),
@@ -238,7 +269,15 @@ fn run_camera(
             .unwrap_or(0),
         sharpness: ranges.sharpness.as_ref().map(|r| r.default).unwrap_or(0),
         gamma: ranges.gamma.as_ref().map(|r| r.default).unwrap_or(0),
+        backlight_compensation: ranges.backlight_compensation.as_ref().map(|r| r.default).unwrap_or(0),
     };
+
+    let supported_ae_modes = devh.supported_ae_modes().unwrap_or(Vec::new());
+    if supported_ae_modes.contains(&uvc::AutoExposureMode::ShutterPriority) && !supported_ae_modes.contains(&uvc::AutoExposureMode::Manual) {
+        let _ = devh.set_ae_mode(uvc::AutoExposureMode::ShutterPriority);
+    } else {
+        let _ = devh.set_ae_mode(uvc::AutoExposureMode::Manual);
+    }
 
     let format_infos: Vec<_> = formats
         .iter()
@@ -298,48 +337,29 @@ fn run_camera(
     loop {
         let stream_format = formats[current_format_id].clone();
         println!("Attempting to open stream with format ID {}: {:?} {}x{} @ {} fps", current_format_id, stream_format.format, stream_format.width, stream_format.height, stream_format.fps);
-        let mut streamh = match devh.get_stream_handle_with_format(stream_format) {
-            Ok(h) => {
-                println!("Successfully opened stream format ID {}", current_format_id);
-                // Apply controls only AFTER successfully getting the stream handle
-                let _ = devh.set_gain(current_values.gain as u16);
-                let _ = devh.set_contrast(current_values.contrast.try_into().unwrap_or(0));
-                let _ = devh.set_saturation(current_values.saturation.try_into().unwrap_or(0));
-                let _ = devh.set_brightness(current_values.brightness.try_into().unwrap_or(0));
-                let _ = devh.set_white_balance_temperature(
-                    current_values.white_balance_temperature.try_into().unwrap_or(0),
-                );
-                let _ = devh.set_sharpness(current_values.sharpness.try_into().unwrap_or(0));
-                let _ = devh.set_gamma(current_values.gamma.try_into().unwrap_or(0));
-                let _ = devh.set_ae_mode(uvc::AutoExposureMode::Manual);
-                let _ = devh.set_white_balance_temperature_auto(false);
-                h
-            },
-            Err(e) => {
-                eprintln!(
-                    "Failed to get stream handle for format ID {} ({:?} {}x{} @ {} fps): {:?}",
-                    current_format_id, stream_format.format, stream_format.width, stream_format.height, stream_format.fps, e
-                );
-                loop {
-                    match cmd_rx.recv() {
-                        Ok(CamCommand::SetFormat(id)) => {
-                            if id < formats.len() {
-                                current_format_id = id;
-                                state_mutex.lock().unwrap().current_format_id = id;
-                                break;
-                            }
-                        }
-                        Ok(_) => {} // Ignore controls when stream is inactive
-                        Err(_) => return,
-                    }
-                }
-                continue;
-            }
-        };
+        let mut stream_attempts = 0;
+        let mut format_changed = false;
 
-        let store_clone = store.clone();
-        let _stream = streamh
-            .start_stream(
+        loop {
+            stream_attempts += 1;
+            let store_clone = store.clone();
+            
+            let mut h = match devh.get_stream_handle_with_format(stream_format) {
+                Ok(h) => h,
+                Err(e) => {
+                    if stream_attempts >= 3 {
+                        let err_msg = format!("Failed to get stream handle after 3 attempts: {:?}", e);
+                        eprintln!("{}", err_msg);
+                        state_mutex.lock().unwrap().camera_error = Some(err_msg);
+                        break;
+                    }
+                    eprintln!("Attempt {} failed to get stream handle: {:?}. Retrying in 1s...", stream_attempts, e);
+                    std::thread::sleep(Duration::from_secs(1));
+                    continue;
+                }
+            };
+
+            let start_stream_res = h.start_stream(
                 move |frame, _| {
                     let width = frame.width() as usize;
                     let height = frame.height() as usize;
@@ -400,56 +420,122 @@ fn run_camera(
                     store_clone.cvar.notify_all();
                 },
                 (),
-            )
-            .expect("Failed to start stream");
+            );
 
-        loop {
-            match cmd_rx.recv() {
-                Ok(CamCommand::SetFormat(id)) => {
-                    if id < formats.len() {
-                        current_format_id = id;
-                        state_mutex.lock().unwrap().current_format_id = id;
+            let _stream = match start_stream_res {
+                Ok(s) => s,
+                Err(e) => {
+                    if stream_attempts >= 3 {
+                        let err_msg = format!("Failed to start stream after 3 attempts: {:?}", e);
+                        eprintln!("{}", err_msg);
+                        state_mutex.lock().unwrap().camera_error = Some(err_msg);
                         break;
                     }
+                    eprintln!("Attempt {} failed to start stream: {:?}. Retrying in 1s...", stream_attempts, e);
+                    std::thread::sleep(Duration::from_secs(1));
+                    continue;
                 }
-                Ok(CamCommand::SetControl(ctrl, val)) => {
-                    let mut changed = true;
-                    match ctrl.as_str() {
-                        "gain" => {
-                            let _ = devh.set_gain(val as u16);
-                            current_values.gain = val;
+            };
+
+            {
+                let mut st = state_mutex.lock().unwrap();
+                st.camera_error = None;
+            }
+            println!("Successfully opened stream format ID {}", current_format_id);
+
+            // Apply controls only AFTER successfully getting the stream handle
+            let ae_mode = match current_values.ae_mode {
+                1 => uvc::AutoExposureMode::Manual,
+                2 => uvc::AutoExposureMode::Auto,
+                4 => uvc::AutoExposureMode::ShutterPriority,
+                8 => uvc::AutoExposureMode::AperturePriority,
+                _ => uvc::AutoExposureMode::Manual,
+            };
+            let _ = devh.set_ae_mode(ae_mode);
+            let _ = devh.set_white_balance_temperature_auto(false);
+            let _ = devh.set_gain(current_values.gain as u16);
+            let _ = devh.set_contrast(current_values.contrast.try_into().unwrap_or(0));
+            let _ = devh.set_saturation(current_values.saturation.try_into().unwrap_or(0));
+            let _ = devh.set_brightness(current_values.brightness.try_into().unwrap_or(0));
+            let _ = devh.set_white_balance_temperature(
+                current_values.white_balance_temperature.try_into().unwrap_or(0),
+            );
+            let _ = devh.set_sharpness(current_values.sharpness.try_into().unwrap_or(0));
+            let _ = devh.set_gamma(current_values.gamma.try_into().unwrap_or(0));
+            let _ = devh.set_backlight_compensation(current_values.backlight_compensation.try_into().unwrap_or(0));
+            let _ = devh.set_exposure_abs(10000 / stream_format.fps);
+
+            loop {
+                match cmd_rx.recv() {
+                    Ok(CamCommand::SetFormat(id)) => {
+                        if id < formats.len() {
+                            current_format_id = id;
+                            {
+                                let mut st = state_mutex.lock().unwrap();
+                                st.current_format_id = id;
+                                st.camera_error = None;
+                            }
+                            format_changed = true;
+                            break;
                         }
-                        "contrast" => {
-                            let _ = devh.set_contrast(val.try_into().unwrap_or(0));
-                            current_values.contrast = val;
-                        }
-                        "saturation" => {
-                            let _ = devh.set_saturation(val.try_into().unwrap_or(0));
-                            current_values.saturation = val;
-                        }
-                        "brightness" => {
-                            let _ = devh.set_brightness(val.try_into().unwrap_or(0));
-                            current_values.brightness = val;
-                        }
-                        "white_balance_temperature" => {
-                            let _ = devh.set_white_balance_temperature(val.try_into().unwrap_or(0));
-                            current_values.white_balance_temperature = val;
-                        }
-                        "sharpness" => {
-                            let _ = devh.set_sharpness(val.try_into().unwrap_or(0));
-                            current_values.sharpness = val;
-                        }
-                        "gamma" => {
-                            let _ = devh.set_gamma(val.try_into().unwrap_or(0));
-                            current_values.gamma = val;
-                        }
-                        _ => changed = false,
                     }
-                    if changed {
-                        state_mutex.lock().unwrap().current_values = current_values.clone();
+                    Ok(CamCommand::SetControl(ctrl, val)) => {
+                        let mut changed = true;
+                        match ctrl.as_str() {
+                            "gain" => current_values.gain = val,
+                            "contrast" => current_values.contrast = val,
+                            "saturation" => current_values.saturation = val,
+                            "brightness" => current_values.brightness = val,
+                            "white_balance_temperature" => current_values.white_balance_temperature = val,
+                            "sharpness" => current_values.sharpness = val,
+                            "gamma" => current_values.gamma = val,
+                            "backlight_compensation" => current_values.backlight_compensation = val,
+                            _ => changed = false,
+                        }
+                        if changed {
+                            let _ = devh.set_ae_mode(ae_mode);
+                            let _ = devh.set_white_balance_temperature_auto(false);
+                            let _ = devh.set_gain(current_values.gain as u16);
+                            let _ = devh.set_contrast(current_values.contrast.try_into().unwrap_or(0));
+                            let _ = devh.set_saturation(current_values.saturation.try_into().unwrap_or(0));
+                            let _ = devh.set_brightness(current_values.brightness.try_into().unwrap_or(0));
+                            let _ = devh.set_white_balance_temperature(
+                                current_values.white_balance_temperature.try_into().unwrap_or(0),
+                            );
+                            let _ = devh.set_sharpness(current_values.sharpness.try_into().unwrap_or(0));
+                            let _ = devh.set_gamma(current_values.gamma.try_into().unwrap_or(0));
+                            let _ = devh.set_backlight_compensation(current_values.backlight_compensation.try_into().unwrap_or(0));
+                            let _ = devh.set_exposure_abs(10000 / stream_format.fps);
+
+                            state_mutex.lock().unwrap().current_values = current_values.clone();
+                        }
                     }
+                    Err(_) => return,
                 }
-                Err(_) => return,
+            }
+
+            if format_changed {
+                break;
+            }
+        }
+
+        if !format_changed {
+            loop {
+                match cmd_rx.recv() {
+                    Ok(CamCommand::SetFormat(id)) => {
+                        if id < formats.len() {
+                            current_format_id = id;
+                            {
+                                let mut st = state_mutex.lock().unwrap();
+                                st.current_format_id = id;
+                                st.camera_error = None;
+                            }
+                            break;
+                        }
+                    }
+                    Ok(_) => {} // Ignore controls when stream is inactive
+                    Err(_) => return,
+                }
             }
         }
     }
@@ -622,6 +708,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
     </div>
     <div id="viewer">
+      <div id="stream-error-msg" style="display: none; color: red; font-size: 2em; position: absolute; text-align: center; z-index: 10;">Failed to open stream</div>
       <img id="cam-image" alt="Camera Stream" draggable="false">
     </div>
   </div>
@@ -629,7 +716,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
   <script>
     let stateData = null;
     let cameraActive = false;
-    const controlsList = ['gain', 'contrast', 'saturation', 'brightness', 'white_balance_temperature', 'sharpness', 'gamma'];
+    const controlsList = ['gain', 'contrast', 'saturation', 'brightness', 'white_balance_temperature', 'sharpness', 'gamma', 'backlight_compensation'];
 
     function createSliders() {
       const slidersDiv = document.getElementById('sliders');
@@ -676,13 +763,22 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       cameraActive = !cameraActive;
       const btn = document.getElementById('camera-btn');
       const img = document.getElementById('cam-image');
+      const errDiv = document.getElementById('stream-error-msg');
       if (cameraActive) {
         btn.innerText = "Hide Live Camera";
-        img.style.display = 'block';
-        img.src = '/stream';
+        if (stateData && stateData.camera_error) {
+            img.style.display = 'none';
+            errDiv.style.display = 'block';
+            errDiv.innerText = stateData.camera_error;
+        } else {
+            img.style.display = 'block';
+            errDiv.style.display = 'none';
+            img.src = '/stream';
+        }
       } else {
         btn.innerText = "Show Live Camera";
         img.style.display = 'none';
+        errDiv.style.display = 'none';
         img.src = '';
       }
     }
@@ -713,6 +809,22 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         document.getElementById('bench-total').innerText = stateData.benchmark_stats.total;
         document.getElementById('bench-rate').innerText = stateData.benchmark_stats.solve_rate.toFixed(2);
         document.getElementById('bench-centroids').innerText = stateData.benchmark_stats.avg_centroids.toFixed(1);
+      }
+
+      const errDiv = document.getElementById('stream-error-msg');
+      const img = document.getElementById('cam-image');
+      if (cameraActive && stateData.camera_error) {
+        img.style.display = 'none';
+        errDiv.style.display = 'block';
+        errDiv.innerText = stateData.camera_error;
+      } else if (cameraActive && !stateData.camera_error) {
+        errDiv.style.display = 'none';
+        img.style.display = 'block';
+        if (!img.src.includes('/stream')) {
+            img.src = '/stream';
+        }
+      } else {
+          errDiv.style.display = 'none';
       }
 
       const fSelect = document.getElementById('format');

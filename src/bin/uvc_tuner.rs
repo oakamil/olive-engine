@@ -54,13 +54,22 @@ fn main() {
     println!("Initializing UVC Tuner with target {} fps...", target_fps);
     let mut camera = Camera::new(target_fps);
 
-    if let Err(e) = camera.start_capture() {
-        eprintln!("Failed to start capture: {}", e);
-        return;
+    let mut start_attempts = 0;
+    while let Err(e) = camera.start_capture() {
+        start_attempts += 1;
+        if start_attempts >= 3 {
+            eprintln!("Failed to start capture after 3 attempts: {}", e);
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(1));
     }
 
-    // Wait a bit for the camera thread to populate the ranges
-    std::thread::sleep(Duration::from_millis(500));
+    // Wait for the camera thread to populate the ranges, up to 3 attempts
+    let mut wait_attempts = 0;
+    while camera.get_config().is_none() && wait_attempts < 4 {
+        std::thread::sleep(Duration::from_secs(1));
+        wait_attempts += 1;
+    }
 
     if let Some(config) = camera.get_config() {
         println!(
