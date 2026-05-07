@@ -361,9 +361,26 @@ impl Camera {
             });
         }
 
+        let discard_frames = Arc::new(AtomicU32::new(stream_format.fps));
+        let discard_frames_clone = Arc::clone(&discard_frames);
+        let store_clone = Arc::clone(&store);
+
         let _stream = streamh
             .start_stream(
                 move |frame, _| {
+                    if discard_frames_clone
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
+                            if x > 0 {
+                                Some(x - 1)
+                            } else {
+                                None
+                            }
+                        })
+                        .is_ok()
+                    {
+                        return;
+                    }
+
                     let receive_time = std::time::Instant::now();
                     let timestamp = SystemTime::now();
 
@@ -387,7 +404,7 @@ impl Camera {
                     }
 
                     let post_process_time = receive_time.elapsed();
-                    let mut lock = store.image.lock().unwrap();
+                    let mut lock = store_clone.image.lock().unwrap();
                     *lock = Some(Arc::new(Image {
                         data: image_data,
                         width: width as u32,
@@ -396,7 +413,7 @@ impl Camera {
                         exposure_time_us: current_exposure_atomic.load(Ordering::Relaxed),
                         post_process_time,
                     }));
-                    store.cvar.notify_all();
+                    store_clone.cvar.notify_all();
                 },
                 (),
             )
@@ -408,6 +425,8 @@ impl Camera {
                 Ok(CaptureCommand::StopCaptureThread) => break,
                 Ok(CaptureCommand::SetGain(gain)) => {
                     let _ = devh.set_gain(gain as u16);
+                    discard_frames.store(stream_format.fps, Ordering::Relaxed);
+                    *store.image.lock().unwrap() = None;
                 }
                 Ok(CaptureCommand::SetUvcControls(controls)) => {
                     let mut current_ae_mode = AutoExposureMode::Manual;
@@ -458,6 +477,8 @@ impl Camera {
                     } else {
                         let _ = devh.set_exposure_abs(10000 / stream_format.fps);
                     }
+                    discard_frames.store(stream_format.fps, Ordering::Relaxed);
+                    *store.image.lock().unwrap() = None;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
