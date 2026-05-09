@@ -225,7 +225,12 @@ impl Camera {
         Self::with_fd(target_fps, mjpeg_enabled, target_res, None)
     }
 
-    pub fn with_fd(target_fps: u32, mjpeg_enabled: bool, target_res: Option<(u32, u32)>, fd: Option<i32>) -> Self {
+    pub fn with_fd(
+        target_fps: u32,
+        mjpeg_enabled: bool,
+        target_res: Option<(u32, u32)>,
+        fd: Option<i32>,
+    ) -> Self {
         let store = Arc::new(CaptureStore {
             image: Mutex::new(None),
             cvar: Condvar::new(),

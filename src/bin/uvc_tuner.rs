@@ -53,7 +53,7 @@ fn main() {
     let user_gain = args.gain;
 
     println!("Scanning for UVC devices and formats...");
-    
+
     let (selected_fps, selected_mjpeg, selected_res) = {
         let ctx = uvc::Context::new().expect("Failed to create UVC context");
         let dev = ctx
@@ -74,7 +74,7 @@ fn main() {
                         }
                         _ => uvc::FrameFormat::Any,
                     };
-                    
+
                     if format_type != uvc::FrameFormat::Any {
                         formats.push((
                             j.width() as u32,
@@ -86,10 +86,10 @@ fn main() {
                 }
             }
         }
-        
+
         formats.sort();
         formats.dedup();
-        
+
         if formats.is_empty() {
             println!("No supported formats found!");
             std::process::exit(1);
@@ -100,7 +100,7 @@ fn main() {
             let fmt_str = if f.3 { "MJPEG" } else { "Uncompressed" };
             println!("{:2}. {}x{} @ {} fps ({})", i + 1, f.0, f.1, f.2, fmt_str);
         }
-        
+
         use std::io::Write;
         loop {
             print!("Select a format (1-{}): ", formats.len());
@@ -118,7 +118,10 @@ fn main() {
         }
     };
 
-    println!("Initializing UVC Tuner with target {} fps (mjpeg: {})...", selected_fps, selected_mjpeg);
+    println!(
+        "Initializing UVC Tuner with target {} fps (mjpeg: {})...",
+        selected_fps, selected_mjpeg
+    );
     let mut camera = Camera::new(selected_fps, selected_mjpeg, selected_res);
 
     let mut start_attempts = 0;
