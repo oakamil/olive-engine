@@ -342,7 +342,12 @@ async fn stream_handler(State(state): State<Arc<ServerState>>) -> impl IntoRespo
         let mut last_ts = None;
         loop {
             // Block until next capture
-            let image_arc = camera.wait_for_next_capture(last_ts);
+            let image_opt =
+                camera.wait_for_next_capture(last_ts, Some(std::time::Duration::from_millis(500)));
+            let image_arc = match image_opt {
+                Some(img) => img,
+                None => continue,
+            };
             last_ts = Some(image_arc.timestamp);
 
             let config = if let Some(c) = camera.get_config() {

@@ -226,10 +226,15 @@ impl Engine {
                     break;
                 }
 
-                let img_arc = camera_ext.wait_for_next_capture(last_processed_timestamp);
+                let img_opt = camera_ext.wait_for_next_capture(
+                    last_processed_timestamp,
+                    Some(std::time::Duration::from_millis(1000)),
+                );
+                let img_arc = match img_opt {
+                    Some(img) => img,
+                    None => continue,
+                };
 
-                // If wait_for_next_capture returned an empty or invalid image indicating stop, handle it.
-                // But for now just proceed. The next wait might return if camera stops.
                 // We should also check is_running after waiting.
                 if !is_running_ext.load(std::sync::atomic::Ordering::Relaxed) {
                     log::info!("Engine loop stopping due to is_running flag after wait.");

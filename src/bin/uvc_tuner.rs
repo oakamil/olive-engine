@@ -253,7 +253,12 @@ fn main() {
         let mut last_timestamp = None;
 
         while total < FRAMES_PER_TEST {
-            let img_arc = camera.wait_for_next_capture(last_timestamp);
+            let img_opt = camera
+                .wait_for_next_capture(last_timestamp, Some(std::time::Duration::from_millis(750)));
+            let img_arc = match img_opt {
+                Some(img) => img,
+                None => continue,
+            };
             last_timestamp = Some(img_arc.timestamp);
             let img_data = &img_arc.data;
 

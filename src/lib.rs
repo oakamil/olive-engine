@@ -43,7 +43,11 @@ pub trait CameraTrait: Send + Sync {
     fn set_exposure(&self, exposure_us: i32);
     fn enable_hcg(&self);
     fn disable_hcg(&self);
-    fn wait_for_next_capture(&self, last_timestamp: Option<SystemTime>) -> Arc<Image>;
+    fn wait_for_next_capture(
+        &self,
+        last_timestamp: Option<SystemTime>,
+        timeout: Option<std::time::Duration>,
+    ) -> Option<Arc<Image>>;
     fn get_last_capture(&self) -> Option<Arc<Image>>;
 
     /// Adjusts the camera's sensitivity (light gathering) by the given factor.

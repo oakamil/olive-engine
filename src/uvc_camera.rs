@@ -162,34 +162,32 @@ impl CameraTrait for Camera {
         lock.clone()
     }
 
-    fn wait_for_next_capture(&self, last_timestamp: Option<SystemTime>) -> Arc<Image> {
+    fn wait_for_next_capture(
+        &self,
+        last_timestamp: Option<SystemTime>,
+        timeout: Option<Duration>,
+    ) -> Option<Arc<Image>> {
         let mut lock = self.store.image.lock().unwrap();
         loop {
             if let Some(img) = &*lock {
                 if last_timestamp.is_none() || Some(img.timestamp) != last_timestamp {
-                    return img.clone();
+                    return Some(img.clone());
                 }
             }
-            let (new_lock, result) = self
-                .store
-                .cvar
-                .wait_timeout(lock, Duration::from_millis(1250))
-                .unwrap();
-            lock = new_lock;
-            if result.timed_out() {
-                if let Some(img) = &*lock {
-                    return img.clone();
-                } else {
-                    // TODO: This needs to be handled better
-                    return Arc::new(Image {
-                        data: vec![],
-                        width: 1,
-                        height: 1,
-                        timestamp: SystemTime::now(),
-                        exposure_time_us: 0,
-                        post_process_time: Duration::default(),
-                    });
+            if let Some(duration) = timeout {
+                let (new_lock, result) = self.store.cvar.wait_timeout(lock, duration).unwrap();
+                lock = new_lock;
+                if result.timed_out() {
+                    // Check one last time before returning None
+                    if let Some(img) = &*lock {
+                        if last_timestamp.is_none() || Some(img.timestamp) != last_timestamp {
+                            return Some(img.clone());
+                        }
+                    }
+                    return None;
                 }
+            } else {
+                lock = self.store.cvar.wait(lock).unwrap();
             }
         }
     }

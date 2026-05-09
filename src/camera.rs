@@ -205,16 +205,34 @@ impl CameraTrait for Camera {
 
     /// Blocks until an image newer than `last_timestamp` is available, then returns it.
     /// Optimization: Returns an Arc to avoid copying the heap buffer.
-    fn wait_for_next_capture(&self, last_timestamp: Option<SystemTime>) -> Arc<Image> {
+    fn wait_for_next_capture(
+        &self,
+        last_timestamp: Option<SystemTime>,
+        timeout: Option<Duration>,
+    ) -> Option<Arc<Image>> {
         let mut lock = self.store.image.lock().unwrap();
         loop {
             if let Some(img) = &*lock {
                 if last_timestamp.is_none() || Some(img.timestamp) != last_timestamp {
-                    return img.clone();
+                    return Some(img.clone());
                 }
             }
             // Wait to be notified by the capture thread that a new image is ready
-            lock = self.store.cvar.wait(lock).unwrap();
+            if let Some(duration) = timeout {
+                let (new_lock, result) = self.store.cvar.wait_timeout(lock, duration).unwrap();
+                lock = new_lock;
+                if result.timed_out() {
+                    // Check one last time before returning None
+                    if let Some(img) = &*lock {
+                        if last_timestamp.is_none() || Some(img.timestamp) != last_timestamp {
+                            return Some(img.clone());
+                        }
+                    }
+                    return None;
+                }
+            } else {
+                lock = self.store.cvar.wait(lock).unwrap();
+            }
         }
     }
 
