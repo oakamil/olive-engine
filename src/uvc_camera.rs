@@ -285,44 +285,55 @@ impl Camera {
                 .expect("Failed to open UVC device")
         };
 
-        // Find highest resolution format (Uncompressed or MJPEG if enabled) that supports at least target_fps
-        let stream_format = devh
-            .get_preferred_format(move |f1, f2| {
-                let f1_is_ok = f1.format == FrameFormat::Uncompressed
-                    || (mjpeg_enabled && f1.format == FrameFormat::MJPEG);
-                let f2_is_ok = f2.format == FrameFormat::Uncompressed
-                    || (mjpeg_enabled && f2.format == FrameFormat::MJPEG);
+        // Find highest resolution format (format depends on the new mjpeg option) that exactly matches the frame rate given or quit with an error if none is found
+        let mut best_format = None;
+        let mut max_res = 0;
 
-                if f1_is_ok != f2_is_ok {
-                    return if f1_is_ok { f1 } else { f2 };
+        for format_desc in devh.supported_formats() {
+            for frame_desc in format_desc.supported_formats() {
+                let format_type = match frame_desc.subtype() {
+                    uvc::DescriptionSubtype::FormatMJPEG | uvc::DescriptionSubtype::FrameMJPEG => {
+                        FrameFormat::MJPEG
+                    }
+                    uvc::DescriptionSubtype::FormatUncompressed
+                    | uvc::DescriptionSubtype::FrameUncompressed => FrameFormat::Uncompressed,
+                    _ => FrameFormat::Any,
+                };
+
+                if format_type == FrameFormat::Any {
+                    continue;
                 }
 
-                let f1_fps_ok = f1.fps >= target_fps;
-                let f2_fps_ok = f2.fps >= target_fps;
-
-                if f1_fps_ok != f2_fps_ok {
-                    return if f1_fps_ok { f1 } else { f2 };
+                let is_mjpeg = format_type == FrameFormat::MJPEG;
+                if is_mjpeg != mjpeg_enabled {
+                    // Only match exactly the required mjpeg state
+                    continue;
                 }
 
-                let f1_res = f1.width * f1.height;
-                let f2_res = f2.width * f2.height;
-
-                if f1_res != f2_res {
-                    return if f1_res > f2_res { f1 } else { f2 };
+                for &interval in frame_desc.intervals() {
+                    let fps = 10_000_000 / interval;
+                    if fps == target_fps {
+                        let res = frame_desc.width() as u32 * frame_desc.height() as u32;
+                        if res > max_res {
+                            max_res = res;
+                            best_format = Some(uvc::StreamFormat {
+                                width: frame_desc.width() as u32,
+                                height: frame_desc.height() as u32,
+                                fps,
+                                format: format_type,
+                            });
+                        }
+                    }
                 }
+            }
+        }
 
-                // If resolutions are equal, prefer Uncompressed over MJPEG
-                if f1.format != f2.format {
-                    return if f1.format == FrameFormat::Uncompressed {
-                        f1
-                    } else {
-                        f2
-                    };
-                }
-
-                if f1.fps > f2.fps { f1 } else { f2 }
-            })
-            .expect("Failed to find suitable format");
+        let stream_format = best_format.unwrap_or_else(|| {
+            panic!(
+                "Error: No format found matching exactly the specified fps of {} and mjpeg enabled: {}",
+                target_fps, mjpeg_enabled
+            );
+        });
 
         info!("Selected UVC format: {:?}", stream_format);
 

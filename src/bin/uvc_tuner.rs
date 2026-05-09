@@ -1,12 +1,26 @@
+use clap::Parser;
 use ndarray::Array2;
 use olive_engine::CameraTrait;
 use olive_engine::uvc_camera::{Camera, UvcControls};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tetra3::{
     fast_extractor::{FastBgSubMode, FastDownsample, FastExtractOptions, FastExtractor},
     solver::{SolveOptions, SolveStatus},
     tetra3::Tetra3,
 };
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[arg(long, default_value_t = 10)]
+    fps: u32,
+
+    #[arg(long)]
+    gain: Option<f32>,
+
+    #[arg(long)]
+    mjpeg: bool,
+}
 
 #[derive(Clone, Debug)]
 struct TestResult {
@@ -18,17 +32,18 @@ struct TestResult {
 }
 
 const TUNE_SATURATION: bool = false;
-const TUNE_CONTRAST: bool = true;
+const TUNE_CONTRAST: bool = false;
 const TUNE_WHITE_BALANCE: bool = false;
 const TUNE_SHARPNESS: bool = false;
 const TUNE_BRIGHTNESS: bool = false;
 const TUNE_GAMMA: bool = true;
+const FRAMES_PER_TEST: usize = 1000;
 
 fn get_choices(range: &Option<uvc::Range<i32>>) -> Vec<Option<i32>> {
     match range {
         Some(r) => {
             let mut choices = vec![r.min, r.max];
-            if r.default >= r.min && r.default <= r.max {
+            if r.default > r.min && r.default < r.max {
                 choices.push(r.default);
             }
             choices.sort();
@@ -40,20 +55,12 @@ fn get_choices(range: &Option<uvc::Range<i32>>) -> Vec<Option<i32>> {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let target_fps: u32 = if args.len() > 1 {
-        args[1].parse().unwrap_or(10)
-    } else {
-        10
-    };
-    let user_gain: Option<f32> = if args.len() > 2 {
-        args[2].parse().ok()
-    } else {
-        None
-    };
+    let args = Args::parse();
+    let target_fps = args.fps;
+    let user_gain = args.gain;
 
-    println!("Initializing UVC Tuner with target {} fps...", target_fps);
-    let mut camera = Camera::new(target_fps, false);
+    println!("Initializing UVC Tuner with target {} fps (mjpeg: {})...", target_fps, args.mjpeg);
+    let mut camera = Camera::new(target_fps, args.mjpeg);
 
     let mut start_attempts = 0;
     while let Err(e) = camera.start_capture() {
@@ -178,13 +185,12 @@ fn main() {
         // Wait for settings to apply before reading frames
         std::thread::sleep(Duration::from_secs(1));
 
-        let start_time = Instant::now();
         let mut solves = 0;
         let mut total = 0;
         let mut total_centroids = 0;
         let mut last_timestamp = None;
 
-        while start_time.elapsed() < Duration::from_secs(3) {
+        while total < FRAMES_PER_TEST {
             let img_arc = camera.wait_for_next_capture(last_timestamp);
             last_timestamp = Some(img_arc.timestamp);
             let img_data = &img_arc.data;
