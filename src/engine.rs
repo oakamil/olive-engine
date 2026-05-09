@@ -227,7 +227,7 @@ impl Engine {
                 }
 
                 let img_arc = camera_ext.wait_for_next_capture(last_processed_timestamp);
-                
+
                 // If wait_for_next_capture returned an empty or invalid image indicating stop, handle it.
                 // But for now just proceed. The next wait might return if camera stops.
                 // We should also check is_running after waiting.

@@ -389,7 +389,7 @@ dependencies = [
  "bitflags 2.11.1",
  "cexpr",
  "clang-sys",
- "itertools 0.12.1",
+ "itertools 0.11.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -3098,7 +3098,7 @@ checksum = "22505a5c94da8e3b7c2996394d1c933236c4d743e81a410bcca4e6989fc066a4"
 dependencies = [
  "bytes",
  "heck 0.5.0",
- "itertools 0.12.1",
+ "itertools 0.11.0",
  "log",
  "multimap",
  "once_cell",
@@ -3118,7 +3118,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81bddcdb20abf9501610992b6759a4c888aef7d1a7247ef75e2404275ac24af1"
 dependencies = [
  "anyhow",
- "itertools 0.12.1",
+ "itertools 0.11.0",
  "proc-macro2",
  "quote",
  "syn",
@@ -4567,7 +4567,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 [[package]]
 name = "uvc"
 version = "0.3.0"
-source = "git+https://github.com/oakamil/libuvc-rs#fe078bddf5a359435722ff907c6906da8f4c3d76"
+source = "git+https://github.com/oakamil/libuvc-rs#6406e2ab4e583866da292e9902e1a9ec5d090264"
 dependencies = [
  "uvc-sys",
 ]
@@ -4575,7 +4575,7 @@ dependencies = [
 [[package]]
 name = "uvc-src"
 version = "0.3.0"
-source = "git+https://github.com/oakamil/libuvc-rs#fe078bddf5a359435722ff907c6906da8f4c3d76"
+source = "git+https://github.com/oakamil/libuvc-rs#6406e2ab4e583866da292e9902e1a9ec5d090264"
 dependencies = [
  "cc",
  "libusb1-sys",
@@ -4585,7 +4585,7 @@ dependencies = [
 [[package]]
 name = "uvc-sys"
 version = "0.3.0"
-source = "git+https://github.com/oakamil/libuvc-rs#fe078bddf5a359435722ff907c6906da8f4c3d76"
+source = "git+https://github.com/oakamil/libuvc-rs#6406e2ab4e583866da292e9902e1a9ec5d090264"
 dependencies = [
  "bindgen",
  "uvc-src",

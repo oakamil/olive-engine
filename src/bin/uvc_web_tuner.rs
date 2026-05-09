@@ -1,10 +1,10 @@
 use axum::{
+    Json, Router,
     body::Body,
     extract::State,
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
@@ -15,7 +15,7 @@ use tetra3::{
     solver::{SolveOptions, SolveStatus},
     tetra3::Tetra3,
 };
-use tokio::sync::{mpsc as tmpsc, Semaphore};
+use tokio::sync::{Semaphore, mpsc as tmpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 // --- Data Structures ---
@@ -135,69 +135,52 @@ struct ControlUpdate {
 
 fn get_range(devh: &uvc::DeviceHandle, ctrl: &str) -> Option<uvc::Range<i32>> {
     match ctrl {
-        "gain" => devh
-            .gain_range()
-            .ok()
-            .map(|r| uvc::Range {
-                min: r.min as i32,
-                max: r.max as i32,
-                step: r.step as i32,
-                default: r.default as i32,
-            }),
-        "contrast" => devh
-            .contrast_range()
-            .ok()
-            .map(|r| uvc::Range {
-                min: r.min as i32,
-                max: r.max as i32,
-                step: r.step as i32,
-                default: r.default as i32,
-            }),
-        "saturation" => devh
-            .saturation_range()
-            .ok()
-            .map(|r| uvc::Range {
-                min: r.min as i32,
-                max: r.max as i32,
-                step: r.step as i32,
-                default: r.default as i32,
-            }),
-        "brightness" => devh
-            .brightness_range()
-            .ok()
-            .map(|r| uvc::Range {
-                min: r.min as i32,
-                max: r.max as i32,
-                step: r.step as i32,
-                default: r.default as i32,
-            }),
-        "white_balance_temperature" => devh
-            .white_balance_temperature_range()
-            .ok()
-            .map(|r| uvc::Range {
-                min: r.min as i32,
-                max: r.max as i32,
-                step: r.step as i32,
-                default: r.default as i32,
-            }),
-        "sharpness" => devh
-            .sharpness_range()
-            .ok()
-            .map(|r| uvc::Range {
-                min: r.min as i32,
-                max: r.max as i32,
-                step: r.step as i32,
-                default: r.default as i32,
-            }),
-        "gamma" => devh
-            .gamma_range()
-            .ok()
-            .map(|r| uvc::Range {
-                min: r.min as i32,
-                max: r.max as i32,
-                step: r.step as i32,
-                default: r.default as i32,
-            }),
+        "gain" => devh.gain_range().ok().map(|r| uvc::Range {
+            min: r.min as i32,
+            max: r.max as i32,
+            step: r.step as i32,
+            default: r.default as i32,
+        }),
+        "contrast" => devh.contrast_range().ok().map(|r| uvc::Range {
+            min: r.min as i32,
+            max: r.max as i32,
+            step: r.step as i32,
+            default: r.default as i32,
+        }),
+        "saturation" => devh.saturation_range().ok().map(|r| uvc::Range {
+            min: r.min as i32,
+            max: r.max as i32,
+            step: r.step as i32,
+            default: r.default as i32,
+        }),
+        "brightness" => devh.brightness_range().ok().map(|r| uvc::Range {
+            min: r.min as i32,
+            max: r.max as i32,
+            step: r.step as i32,
+            default: r.default as i32,
+        }),
+        "white_balance_temperature" => {
+            devh.white_balance_temperature_range()
+                .ok()
+                .map(|r| uvc::Range {
+                    min: r.min as i32,
+                    max: r.max as i32,
+                    step: r.step as i32,
+                    default: r.default as i32,
+                })
+        }
+        "sharpness" => devh.sharpness_range().ok().map(|r| uvc::Range {
+            min: r.min as i32,
+            max: r.max as i32,
+            step: r.step as i32,
+            default: r.default as i32,
+        }),
+        "gamma" => devh.gamma_range().ok().map(|r| uvc::Range {
+            min: r.min as i32,
+            max: r.max as i32,
+            step: r.step as i32,
+            default: r.default as i32,
+        }),
         "backlight_compensation" => devh
             .backlight_compensation_range()
             .ok()
@@ -231,11 +214,12 @@ fn run_camera(
                     height: u32::from(j.height()),
                     fps: 10_000_000 / *k,
                     format: match j.subtype() {
-                        uvc::DescriptionSubtype::FormatMJPEG | uvc::DescriptionSubtype::FrameMJPEG => {
-                            uvc::FrameFormat::MJPEG
-                        }
+                        uvc::DescriptionSubtype::FormatMJPEG
+                        | uvc::DescriptionSubtype::FrameMJPEG => uvc::FrameFormat::MJPEG,
                         uvc::DescriptionSubtype::FormatUncompressed
-                        | uvc::DescriptionSubtype::FrameUncompressed => uvc::FrameFormat::Uncompressed,
+                        | uvc::DescriptionSubtype::FrameUncompressed => {
+                            uvc::FrameFormat::Uncompressed
+                        }
                         _ => uvc::FrameFormat::Any,
                     },
                 };
@@ -251,7 +235,8 @@ fn run_camera(
     ranges.contrast = get_range(&devh, "contrast").map(Into::into);
     ranges.saturation = get_range(&devh, "saturation").map(Into::into);
     ranges.brightness = get_range(&devh, "brightness").map(Into::into);
-    ranges.white_balance_temperature = get_range(&devh, "white_balance_temperature").map(Into::into);
+    ranges.white_balance_temperature =
+        get_range(&devh, "white_balance_temperature").map(Into::into);
     ranges.sharpness = get_range(&devh, "sharpness").map(Into::into);
     ranges.gamma = get_range(&devh, "gamma").map(Into::into);
     ranges.backlight_compensation = get_range(&devh, "backlight_compensation").map(Into::into);
@@ -269,11 +254,17 @@ fn run_camera(
             .unwrap_or(0),
         sharpness: ranges.sharpness.as_ref().map(|r| r.default).unwrap_or(0),
         gamma: ranges.gamma.as_ref().map(|r| r.default).unwrap_or(0),
-        backlight_compensation: ranges.backlight_compensation.as_ref().map(|r| r.default).unwrap_or(0),
+        backlight_compensation: ranges
+            .backlight_compensation
+            .as_ref()
+            .map(|r| r.default)
+            .unwrap_or(0),
     };
 
     let supported_ae_modes = devh.supported_ae_modes().unwrap_or(Vec::new());
-    if supported_ae_modes.contains(&uvc::AutoExposureMode::ShutterPriority) && !supported_ae_modes.contains(&uvc::AutoExposureMode::Manual) {
+    if supported_ae_modes.contains(&uvc::AutoExposureMode::ShutterPriority)
+        && !supported_ae_modes.contains(&uvc::AutoExposureMode::Manual)
+    {
         let _ = devh.set_ae_mode(uvc::AutoExposureMode::ShutterPriority);
     } else {
         let _ = devh.set_ae_mode(uvc::AutoExposureMode::Manual);
@@ -336,24 +327,35 @@ fn run_camera(
 
     loop {
         let stream_format = formats[current_format_id].clone();
-        println!("Attempting to open stream with format ID {}: {:?} {}x{} @ {} fps", current_format_id, stream_format.format, stream_format.width, stream_format.height, stream_format.fps);
+        println!(
+            "Attempting to open stream with format ID {}: {:?} {}x{} @ {} fps",
+            current_format_id,
+            stream_format.format,
+            stream_format.width,
+            stream_format.height,
+            stream_format.fps
+        );
         let mut stream_attempts = 0;
         let mut format_changed = false;
 
         loop {
             stream_attempts += 1;
             let store_clone = store.clone();
-            
+
             let mut h = match devh.get_stream_handle_with_format(stream_format) {
                 Ok(h) => h,
                 Err(e) => {
                     if stream_attempts >= 3 {
-                        let err_msg = format!("Failed to get stream handle after 3 attempts: {:?}", e);
+                        let err_msg =
+                            format!("Failed to get stream handle after 3 attempts: {:?}", e);
                         eprintln!("{}", err_msg);
                         state_mutex.lock().unwrap().camera_error = Some(err_msg);
                         break;
                     }
-                    eprintln!("Attempt {} failed to get stream handle: {:?}. Retrying in 1s...", stream_attempts, e);
+                    eprintln!(
+                        "Attempt {} failed to get stream handle: {:?}. Retrying in 1s...",
+                        stream_attempts, e
+                    );
                     std::thread::sleep(Duration::from_secs(1));
                     continue;
                 }
@@ -380,7 +382,7 @@ fn run_camera(
                         };
                         actual_width = header.width as u32;
                         actual_height = header.height as u32;
-                        
+
                         let mut pixels = vec![0u8; header.width * header.height];
                         let image = turbojpeg::Image {
                             pixels: pixels.as_mut_slice(),
@@ -431,7 +433,10 @@ fn run_camera(
                         state_mutex.lock().unwrap().camera_error = Some(err_msg);
                         break;
                     }
-                    eprintln!("Attempt {} failed to start stream: {:?}. Retrying in 1s...", stream_attempts, e);
+                    eprintln!(
+                        "Attempt {} failed to start stream: {:?}. Retrying in 1s...",
+                        stream_attempts, e
+                    );
                     std::thread::sleep(Duration::from_secs(1));
                     continue;
                 }
@@ -458,11 +463,19 @@ fn run_camera(
             let _ = devh.set_saturation(current_values.saturation.try_into().unwrap_or(0));
             let _ = devh.set_brightness(current_values.brightness.try_into().unwrap_or(0));
             let _ = devh.set_white_balance_temperature(
-                current_values.white_balance_temperature.try_into().unwrap_or(0),
+                current_values
+                    .white_balance_temperature
+                    .try_into()
+                    .unwrap_or(0),
             );
             let _ = devh.set_sharpness(current_values.sharpness.try_into().unwrap_or(0));
             let _ = devh.set_gamma(current_values.gamma.try_into().unwrap_or(0));
-            let _ = devh.set_backlight_compensation(current_values.backlight_compensation.try_into().unwrap_or(0));
+            let _ = devh.set_backlight_compensation(
+                current_values
+                    .backlight_compensation
+                    .try_into()
+                    .unwrap_or(0),
+            );
             let _ = devh.set_exposure_abs(10000 / stream_format.fps);
 
             loop {
@@ -486,7 +499,9 @@ fn run_camera(
                             "contrast" => current_values.contrast = val,
                             "saturation" => current_values.saturation = val,
                             "brightness" => current_values.brightness = val,
-                            "white_balance_temperature" => current_values.white_balance_temperature = val,
+                            "white_balance_temperature" => {
+                                current_values.white_balance_temperature = val
+                            }
                             "sharpness" => current_values.sharpness = val,
                             "gamma" => current_values.gamma = val,
                             "backlight_compensation" => current_values.backlight_compensation = val,
@@ -496,15 +511,27 @@ fn run_camera(
                             let _ = devh.set_ae_mode(ae_mode);
                             let _ = devh.set_white_balance_temperature_auto(false);
                             let _ = devh.set_gain(current_values.gain as u16);
-                            let _ = devh.set_contrast(current_values.contrast.try_into().unwrap_or(0));
-                            let _ = devh.set_saturation(current_values.saturation.try_into().unwrap_or(0));
-                            let _ = devh.set_brightness(current_values.brightness.try_into().unwrap_or(0));
+                            let _ =
+                                devh.set_contrast(current_values.contrast.try_into().unwrap_or(0));
+                            let _ = devh
+                                .set_saturation(current_values.saturation.try_into().unwrap_or(0));
+                            let _ = devh
+                                .set_brightness(current_values.brightness.try_into().unwrap_or(0));
                             let _ = devh.set_white_balance_temperature(
-                                current_values.white_balance_temperature.try_into().unwrap_or(0),
+                                current_values
+                                    .white_balance_temperature
+                                    .try_into()
+                                    .unwrap_or(0),
                             );
-                            let _ = devh.set_sharpness(current_values.sharpness.try_into().unwrap_or(0));
+                            let _ = devh
+                                .set_sharpness(current_values.sharpness.try_into().unwrap_or(0));
                             let _ = devh.set_gamma(current_values.gamma.try_into().unwrap_or(0));
-                            let _ = devh.set_backlight_compensation(current_values.backlight_compensation.try_into().unwrap_or(0));
+                            let _ = devh.set_backlight_compensation(
+                                current_values
+                                    .backlight_compensation
+                                    .try_into()
+                                    .unwrap_or(0),
+                            );
                             let _ = devh.set_exposure_abs(10000 / stream_format.fps);
 
                             state_mutex.lock().unwrap().current_values = current_values.clone();
@@ -563,7 +590,10 @@ fn run_benchmark(state_mutex: Arc<Mutex<AppState>>, store: Arc<SharedImageStore>
         let img = {
             let mut lock = store.image.lock().unwrap();
             loop {
-                let result = store.cvar.wait_timeout(lock, Duration::from_millis(200)).unwrap();
+                let result = store
+                    .cvar
+                    .wait_timeout(lock, Duration::from_millis(200))
+                    .unwrap();
                 lock = result.0;
 
                 if !state_mutex.lock().unwrap().is_benchmarking {
@@ -959,9 +989,13 @@ async fn post_control(
     }
 
     if update.control == "format" {
-        let _ = state.cam_tx.send(CamCommand::SetFormat(update.value as usize));
+        let _ = state
+            .cam_tx
+            .send(CamCommand::SetFormat(update.value as usize));
     } else {
-        let _ = state.cam_tx.send(CamCommand::SetControl(update.control, update.value));
+        let _ = state
+            .cam_tx
+            .send(CamCommand::SetControl(update.control, update.value));
     }
     StatusCode::OK
 }
@@ -1013,12 +1047,7 @@ async fn stream_handler(State(state): State<Arc<ServerState>>) -> impl IntoRespo
             let mut encoder =
                 image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_data, 75);
             if encoder
-                .encode(
-                    &img_arc.data,
-                    width,
-                    height,
-                    image::ExtendedColorType::L8,
-                )
+                .encode(&img_arc.data, width, height, image::ExtendedColorType::L8)
                 .is_err()
             {
                 break;

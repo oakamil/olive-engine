@@ -14,6 +14,7 @@ struct TestResult {
     solves: usize,
     total: usize,
     solve_rate: f64,
+    avg_centroids: f64,
 }
 
 const TUNE_SATURATION: bool = false;
@@ -79,6 +80,9 @@ fn main() {
     } else {
         println!("Warning: Could not fetch camera configuration.");
     }
+
+    println!("Waiting 3s for stream to stabilize before running benchmarks...");
+    std::thread::sleep(Duration::from_secs(3));
 
     let ranges = {
         let lock = camera.ranges.lock().unwrap();
@@ -171,12 +175,13 @@ fn main() {
         // Apply settings
         camera.set_uvc_controls(combo.clone());
 
-        // Wait for settings to apply
-        std::thread::sleep(Duration::from_millis(500));
+        // Wait for settings to apply before reading frames
+        std::thread::sleep(Duration::from_secs(1));
 
         let start_time = Instant::now();
         let mut solves = 0;
         let mut total = 0;
+        let mut total_centroids = 0;
         let mut last_timestamp = None;
 
         while start_time.elapsed() < Duration::from_secs(3) {
@@ -216,6 +221,8 @@ fn main() {
             let result = ext.extract_sequential(&array_img);
 
             let num_centroids = result.len();
+            total_centroids += num_centroids;
+
             let mut centroids_arr = Array2::<f64>::zeros((num_centroids, 2));
             for (i, c) in result.iter().enumerate() {
                 centroids_arr[[i, 0]] = c.y;
@@ -241,9 +248,15 @@ fn main() {
             0.0
         };
 
+        let avg_centroids = if total > 0 {
+            total_centroids as f64 / total as f64
+        } else {
+            0.0
+        };
+
         println!(
-            "Result: {} solves out of {} frames ({:.2}%)",
-            solves, total, solve_rate
+            "Result: {} solves out of {} frames ({:.2}%), avg centroids: {:.1}",
+            solves, total, solve_rate, avg_centroids
         );
 
         results.push(TestResult {
@@ -251,24 +264,31 @@ fn main() {
             solves,
             total,
             solve_rate,
+            avg_centroids,
         });
     }
 
-    // Rank results by solve rate descending
+    // Rank results by solve rate descending, then by avg centroids descending
     results.sort_by(|a, b| {
         b.solve_rate
             .partial_cmp(&a.solve_rate)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                b.avg_centroids
+                    .partial_cmp(&a.avg_centroids)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
 
     println!("\n=== TOP 20 COMBINATIONS ===");
     for (i, res) in results.iter().take(20).enumerate() {
         println!(
-            "{}. Solve Rate: {:.2}% ({}/{}) | Combo: {:?}",
+            "{}. Solve Rate: {:.2}% ({}/{}) | Avg Centroids: {:.1} | Combo: {:?}",
             i + 1,
             res.solve_rate,
             res.solves,
             res.total,
+            res.avg_centroids,
             res.combo
         );
     }
