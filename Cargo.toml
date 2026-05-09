@@ -23,7 +23,7 @@ nalgebra = "0.32"
 ndarray = "0.17"
 rppal = "0.22.1"
 rayon = "1.11.0"
-uvc = { git = "https://github.com/oakamil/libuvc-rs", features = ["vendor"] }
+uvc = { git = "https://github.com/oakamil/libuvc-rs", features = ["vendor", "wrap_fd"] }
 async-trait = "0.1"
 chrono = "0.4"
 memchr = "2.7"

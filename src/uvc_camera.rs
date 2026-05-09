@@ -66,6 +66,7 @@ pub struct Camera {
     pub ranges: Arc<Mutex<Option<UvcRanges>>>,
     target_fps: u32,
     mjpeg_enabled: bool,
+    fd: Option<i32>,
 }
 
 impl CameraTrait for Camera {
@@ -89,6 +90,7 @@ impl CameraTrait for Camera {
         let current_exposure = Arc::clone(&self.current_exposure);
         let target_fps = self.target_fps;
         let mjpeg_enabled = self.mjpeg_enabled;
+        let fd = self.fd;
 
         self.capture_thread = Some(thread::spawn(move || {
             Self::capture_loop(
@@ -100,6 +102,7 @@ impl CameraTrait for Camera {
                 current_exposure,
                 target_fps,
                 mjpeg_enabled,
+                fd,
             );
         }));
 
@@ -196,6 +199,10 @@ impl CameraTrait for Camera {
 impl Camera {
     /// Instantiates the camera module and sets initial cached state.
     pub fn new(target_fps: u32, mjpeg_enabled: bool) -> Self {
+        Self::with_fd(target_fps, mjpeg_enabled, None)
+    }
+
+    pub fn with_fd(target_fps: u32, mjpeg_enabled: bool, fd: Option<i32>) -> Self {
         let store = Arc::new(CaptureStore {
             image: Mutex::new(None),
             cvar: Condvar::new(),
@@ -216,6 +223,7 @@ impl Camera {
             ranges,
             target_fps,
             mjpeg_enabled,
+            fd,
         }
     }
 
@@ -238,18 +246,32 @@ impl Camera {
         current_exposure_atomic: Arc<AtomicI32>,
         target_fps: u32,
         mjpeg_enabled: bool,
+        fd: Option<i32>,
     ) {
         let ctx = uvc::Context::new().expect("Failed to create UVC context");
-        let dev = ctx
-            .find_device(None, None, None)
-            .expect("Failed to find UVC device");
-        let devh = dev.open().expect("Failed to open UVC device");
+
+        let mut _dev_keep_alive = None;
+        let devh = if let Some(fd) = fd {
+            ctx.wrap_fd(fd).expect("Failed to open UVC device with FD")
+        } else {
+            let dev = ctx
+                .find_device(None, None, None)
+                .expect("Failed to find UVC device");
+            _dev_keep_alive = Some(dev);
+            _dev_keep_alive
+                .as_ref()
+                .unwrap()
+                .open()
+                .expect("Failed to open UVC device")
+        };
 
         // Find highest resolution format (Uncompressed or MJPEG if enabled) that supports at least target_fps
         let stream_format = devh
             .get_preferred_format(move |f1, f2| {
-                let f1_is_ok = f1.format == FrameFormat::Uncompressed || (mjpeg_enabled && f1.format == FrameFormat::MJPEG);
-                let f2_is_ok = f2.format == FrameFormat::Uncompressed || (mjpeg_enabled && f2.format == FrameFormat::MJPEG);
+                let f1_is_ok = f1.format == FrameFormat::Uncompressed
+                    || (mjpeg_enabled && f1.format == FrameFormat::MJPEG);
+                let f2_is_ok = f2.format == FrameFormat::Uncompressed
+                    || (mjpeg_enabled && f2.format == FrameFormat::MJPEG);
 
                 if f1_is_ok != f2_is_ok {
                     return if f1_is_ok { f1 } else { f2 };
@@ -271,7 +293,11 @@ impl Camera {
 
                 // If resolutions are equal, prefer Uncompressed over MJPEG
                 if f1.format != f2.format {
-                    return if f1.format == FrameFormat::Uncompressed { f1 } else { f2 };
+                    return if f1.format == FrameFormat::Uncompressed {
+                        f1
+                    } else {
+                        f2
+                    };
                 }
 
                 if f1.fps > f2.fps { f1 } else { f2 }
@@ -348,7 +374,9 @@ impl Camera {
 
         // Turn off auto-exposure and auto-white-balance
         let supported_ae_modes = devh.supported_ae_modes().unwrap_or(Vec::new());
-        let ae_mode = if supported_ae_modes.contains(&AutoExposureMode::ShutterPriority) && !supported_ae_modes.contains(&AutoExposureMode::Manual) {
+        let ae_mode = if supported_ae_modes.contains(&AutoExposureMode::ShutterPriority)
+            && !supported_ae_modes.contains(&AutoExposureMode::Manual)
+        {
             AutoExposureMode::ShutterPriority
         } else {
             AutoExposureMode::Manual
@@ -381,11 +409,7 @@ impl Camera {
                 move |frame, _| {
                     if discard_frames_clone
                         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
-                            if x > 0 {
-                                Some(x - 1)
-                            } else {
-                                None
-                            }
+                            if x > 0 { Some(x - 1) } else { None }
                         })
                         .is_ok()
                     {
@@ -467,7 +491,9 @@ impl Camera {
                 Ok(CaptureCommand::SetUvcControls(controls)) => {
                     let mut current_ae_mode = AutoExposureMode::Manual;
                     let supported_ae_modes = devh.supported_ae_modes().unwrap_or(Vec::new());
-                    if supported_ae_modes.contains(&AutoExposureMode::ShutterPriority) && !supported_ae_modes.contains(&AutoExposureMode::Manual) {
+                    if supported_ae_modes.contains(&AutoExposureMode::ShutterPriority)
+                        && !supported_ae_modes.contains(&AutoExposureMode::Manual)
+                    {
                         current_ae_mode = AutoExposureMode::ShutterPriority;
                     }
                     if let Some(val) = controls.ae_mode {
@@ -479,7 +505,10 @@ impl Camera {
                             _ => AutoExposureMode::Manual,
                         };
                         // Enforce fallback if Manual isn't supported
-                        if current_ae_mode == AutoExposureMode::Manual && supported_ae_modes.contains(&AutoExposureMode::ShutterPriority) && !supported_ae_modes.contains(&AutoExposureMode::Manual) {
+                        if current_ae_mode == AutoExposureMode::Manual
+                            && supported_ae_modes.contains(&AutoExposureMode::ShutterPriority)
+                            && !supported_ae_modes.contains(&AutoExposureMode::Manual)
+                        {
                             current_ae_mode = AutoExposureMode::ShutterPriority;
                         }
                     }
