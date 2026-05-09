@@ -12,14 +12,8 @@ use tetra3::{
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    #[arg(long, default_value_t = 10)]
-    fps: u32,
-
     #[arg(long)]
     gain: Option<f32>,
-
-    #[arg(long)]
-    mjpeg: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -56,11 +50,76 @@ fn get_choices(range: &Option<uvc::Range<i32>>) -> Vec<Option<i32>> {
 
 fn main() {
     let args = Args::parse();
-    let target_fps = args.fps;
     let user_gain = args.gain;
 
-    println!("Initializing UVC Tuner with target {} fps (mjpeg: {})...", target_fps, args.mjpeg);
-    let mut camera = Camera::new(target_fps, args.mjpeg);
+    println!("Scanning for UVC devices and formats...");
+    
+    let (selected_fps, selected_mjpeg, selected_res) = {
+        let ctx = uvc::Context::new().expect("Failed to create UVC context");
+        let dev = ctx
+            .find_device(None, None, None)
+            .expect("Failed to find UVC device");
+        let devh = dev.open().expect("Failed to open UVC device");
+
+        let mut formats = Vec::new();
+        for i in devh.supported_formats() {
+            for j in i.supported_formats() {
+                for k in j.intervals() {
+                    let format_type = match j.subtype() {
+                        uvc::DescriptionSubtype::FormatMJPEG
+                        | uvc::DescriptionSubtype::FrameMJPEG => uvc::FrameFormat::MJPEG,
+                        uvc::DescriptionSubtype::FormatUncompressed
+                        | uvc::DescriptionSubtype::FrameUncompressed => {
+                            uvc::FrameFormat::Uncompressed
+                        }
+                        _ => uvc::FrameFormat::Any,
+                    };
+                    
+                    if format_type != uvc::FrameFormat::Any {
+                        formats.push((
+                            j.width() as u32,
+                            j.height() as u32,
+                            10_000_000 / *k,
+                            format_type == uvc::FrameFormat::MJPEG,
+                        ));
+                    }
+                }
+            }
+        }
+        
+        formats.sort();
+        formats.dedup();
+        
+        if formats.is_empty() {
+            println!("No supported formats found!");
+            std::process::exit(1);
+        }
+
+        println!("Available formats:");
+        for (i, f) in formats.iter().enumerate() {
+            let fmt_str = if f.3 { "MJPEG" } else { "Uncompressed" };
+            println!("{:2}. {}x{} @ {} fps ({})", i + 1, f.0, f.1, f.2, fmt_str);
+        }
+        
+        use std::io::Write;
+        loop {
+            print!("Select a format (1-{}): ", formats.len());
+            std::io::stdout().flush().unwrap();
+            let mut input = String::new();
+            if std::io::stdin().read_line(&mut input).is_ok() {
+                if let Ok(choice) = input.trim().parse::<usize>() {
+                    if choice > 0 && choice <= formats.len() {
+                        let f = formats[choice - 1];
+                        break (f.2, f.3, Some((f.0, f.1)));
+                    }
+                }
+            }
+            println!("Invalid selection. Please try again.");
+        }
+    };
+
+    println!("Initializing UVC Tuner with target {} fps (mjpeg: {})...", selected_fps, selected_mjpeg);
+    let mut camera = Camera::new(selected_fps, selected_mjpeg, selected_res);
 
     let mut start_attempts = 0;
     while let Err(e) = camera.start_capture() {

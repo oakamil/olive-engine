@@ -66,6 +66,7 @@ pub struct Camera {
     pub ranges: Arc<Mutex<Option<UvcRanges>>>,
     target_fps: u32,
     mjpeg_enabled: bool,
+    target_res: Option<(u32, u32)>,
     fd: Option<i32>,
 }
 
@@ -90,6 +91,7 @@ impl CameraTrait for Camera {
         let current_exposure = Arc::clone(&self.current_exposure);
         let target_fps = self.target_fps;
         let mjpeg_enabled = self.mjpeg_enabled;
+        let target_res = self.target_res;
         let fd = self.fd;
 
         self.capture_thread = Some(thread::spawn(move || {
@@ -102,6 +104,7 @@ impl CameraTrait for Camera {
                 current_exposure,
                 target_fps,
                 mjpeg_enabled,
+                target_res,
                 fd,
             );
         }));
@@ -218,11 +221,11 @@ impl CameraTrait for Camera {
 
 impl Camera {
     /// Instantiates the camera module and sets initial cached state.
-    pub fn new(target_fps: u32, mjpeg_enabled: bool) -> Self {
-        Self::with_fd(target_fps, mjpeg_enabled, None)
+    pub fn new(target_fps: u32, mjpeg_enabled: bool, target_res: Option<(u32, u32)>) -> Self {
+        Self::with_fd(target_fps, mjpeg_enabled, target_res, None)
     }
 
-    pub fn with_fd(target_fps: u32, mjpeg_enabled: bool, fd: Option<i32>) -> Self {
+    pub fn with_fd(target_fps: u32, mjpeg_enabled: bool, target_res: Option<(u32, u32)>, fd: Option<i32>) -> Self {
         let store = Arc::new(CaptureStore {
             image: Mutex::new(None),
             cvar: Condvar::new(),
@@ -243,6 +246,7 @@ impl Camera {
             ranges,
             target_fps,
             mjpeg_enabled,
+            target_res,
             fd,
         }
     }
@@ -266,6 +270,7 @@ impl Camera {
         current_exposure_atomic: Arc<AtomicI32>,
         target_fps: u32,
         mjpeg_enabled: bool,
+        target_res: Option<(u32, u32)>,
         fd: Option<i32>,
     ) {
         let ctx = uvc::Context::new().expect("Failed to create UVC context");
@@ -313,12 +318,20 @@ impl Camera {
                 for &interval in frame_desc.intervals() {
                     let fps = 10_000_000 / interval;
                     if fps == target_fps {
-                        let res = frame_desc.width() as u32 * frame_desc.height() as u32;
-                        if res > max_res {
+                        let width = frame_desc.width() as u32;
+                        let height = frame_desc.height() as u32;
+                        let res = width * height;
+
+                        let is_match = match target_res {
+                            Some((tw, th)) => width == tw && height == th,
+                            None => true, // If no exact res is requested, any matching fps/mjpeg is a candidate
+                        };
+
+                        if is_match && res > max_res {
                             max_res = res;
                             best_format = Some(uvc::StreamFormat {
-                                width: frame_desc.width() as u32,
-                                height: frame_desc.height() as u32,
+                                width,
+                                height,
                                 fps,
                                 format: format_type,
                             });

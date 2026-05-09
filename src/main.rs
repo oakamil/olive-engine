@@ -112,7 +112,7 @@ async fn main() {
 
     // Initialize and start the camera
     let camera: Arc<dyn CameraTrait> = if args.uvc {
-        let mut cam = UvcCamera::new(args.uvc_fps, args.uvc_mjpeg);
+        let mut cam = UvcCamera::new(args.uvc_fps, args.uvc_mjpeg, None);
         cam.start_capture().expect("Failed to start UVC camera");
         Arc::new(cam)
     } else {
