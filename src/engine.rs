@@ -127,6 +127,8 @@ pub struct Engine {
         std::sync::Mutex<Option<IntermediateResult>>,
         std::sync::Condvar,
     )>,
+    pub is_running: Arc<std::sync::atomic::AtomicBool>,
+    pub telescope_server_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Engine {
@@ -141,7 +143,7 @@ impl Engine {
         let shared_position = Arc::new(RwLock::new(SharedPosition::default()));
 
         let mut server = Lx200WifiTelescope::new(shared_position.clone());
-        tokio::spawn(async move {
+        let telescope_server_handle = tokio::spawn(async move {
             if let Err(e) = server.serve_requests().await {
                 error!("Telescope server error: {}", e);
             }
@@ -161,6 +163,8 @@ impl Engine {
             engine_state,
             solve_timestamps: std::collections::VecDeque::new(),
             shared_result: Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new())),
+            is_running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            telescope_server_handle: Some(telescope_server_handle),
         }
     }
 
@@ -210,13 +214,27 @@ impl Engine {
         let config_ext = self.config.clone();
         let shared_res_ext = self.shared_result.clone();
         let engine_state_ext = self.engine_state.clone();
+        let is_running_ext = self.is_running.clone();
 
         std::thread::spawn(move || {
             let mut extractor: Option<FastExtractor> = None;
             let mut last_processed_timestamp = None;
 
             loop {
+                if !is_running_ext.load(std::sync::atomic::Ordering::Relaxed) {
+                    log::info!("Engine loop stopping due to is_running flag.");
+                    break;
+                }
+
                 let img_arc = camera_ext.wait_for_next_capture(last_processed_timestamp);
+                
+                // If wait_for_next_capture returned an empty or invalid image indicating stop, handle it.
+                // But for now just proceed. The next wait might return if camera stops.
+                // We should also check is_running after waiting.
+                if !is_running_ext.load(std::sync::atomic::Ordering::Relaxed) {
+                    log::info!("Engine loop stopping due to is_running flag after wait.");
+                    break;
+                }
                 last_processed_timestamp = Some(img_arc.timestamp);
 
                 let mut do_capture = false;

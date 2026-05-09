@@ -434,7 +434,13 @@ pub async fn start_server(
         .route("/api/engine_state", get(get_engine_state))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
+    let listener = match tokio::net::TcpListener::bind("0.0.0.0:8080").await {
+        Ok(l) => l,
+        Err(e) => {
+            log::error!("Failed to bind Control Server port 8080: {}", e);
+            return;
+        }
+    };
     log::info!("Control server listening on http://0.0.0.0:8080");
 
     if let Err(e) = axum::serve(listener, app).await {

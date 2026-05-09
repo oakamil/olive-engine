@@ -167,7 +167,23 @@ impl CameraTrait for Camera {
                     return img.clone();
                 }
             }
-            lock = self.store.cvar.wait(lock).unwrap();
+            let (new_lock, result) = self.store.cvar.wait_timeout(lock, Duration::from_millis(1250)).unwrap();
+            lock = new_lock;
+            if result.timed_out() {
+                if let Some(img) = &*lock {
+                    return img.clone();
+                } else {
+                    // TODO: This needs to be handled better
+                    return Arc::new(Image {
+                        data: vec![],
+                        width: 1,
+                        height: 1,
+                        timestamp: SystemTime::now(),
+                        exposure_time_us: 0,
+                        post_process_time: Duration::default(),
+                    });
+                }
+            }
         }
     }
 
