@@ -295,12 +295,21 @@ impl Camera {
                 .expect("Failed to open UVC device")
         };
 
-        // Find highest resolution format (format depends on the new mjpeg option) that exactly matches the frame rate given or quit with an error if none is found
+        // Find highest resolution format (format depends on the new mjpeg option) that exactly
+        // matches the frame rate given or quit with an error if none is found
         let mut best_format = None;
         let mut max_res = 0;
+        let mut camera_max_res = 0;
 
         for format_desc in devh.supported_formats() {
             for frame_desc in format_desc.supported_formats() {
+                let width = frame_desc.width() as u32;
+                let height = frame_desc.height() as u32;
+                let res = width * height;
+                if res > camera_max_res {
+                    camera_max_res = res;
+                }
+
                 let format_type = match frame_desc.subtype() {
                     uvc::DescriptionSubtype::FormatMJPEG | uvc::DescriptionSubtype::FrameMJPEG => {
                         FrameFormat::MJPEG
@@ -396,7 +405,7 @@ impl Camera {
             }
         };
 
-        // Per empirical results with an SC2210 camera, set the gamma to its minimum and the other settings to their defaults
+        // Per empirical results with an SC2210 camera, set most values to their defaults
         if let Some(range) = uvc_ranges.saturation {
             let _ = devh.set_saturation(range.default.try_into().unwrap());
         }
@@ -413,7 +422,16 @@ impl Camera {
             let _ = devh.set_brightness(range.default.try_into().unwrap());
         }
         if let Some(range) = uvc_ranges.gamma {
-            let _ = devh.set_gamma(range.min.try_into().unwrap());
+            // On the SC2210 a gamma of 100 (typically a linear curve) works best with the
+            // camera's full resolution. The default value seems to be a bit better at
+            // scaled down resolutions.
+            let is_max_res = stream_format.width * stream_format.height == camera_max_res;
+            let val = if is_max_res && 100 >= range.min && 100 <= range.max {
+                100
+            } else {
+                range.default
+            };
+            let _ = devh.set_gamma(val.try_into().unwrap());
         }
 
         {
