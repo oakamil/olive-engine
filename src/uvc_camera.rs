@@ -192,18 +192,10 @@ impl CameraTrait for Camera {
         }
     }
 
-    // --- Abstracted Tuning ---
-
-    fn adjust_sensitivity(&self, factor: f64) -> bool {
-        let current = self.get_gain();
-        let next = (current * factor as f32).clamp(self.get_min_gain(), self.get_max_gain());
-
-        if (next - current).abs() > 0.1 {
-            self.set_gain(next);
-            true
-        } else {
-            false
-        }
+    fn adjust_sensitivity(&self, _factor: f64) -> bool {
+        // Exposure can't be easily adjusted. In the future we can select a slower frame rate
+        // if supported, if we need to increase sensitivity.
+        return false;
     }
 
     fn save_state(&self) {
@@ -403,7 +395,7 @@ impl Camera {
             }
         };
 
-        // Per empirical results with an SC2210 camera, set most values to their defaults
+        // Per empirical results with an SC2210 camera, set all values to their defaults
         if let Some(range) = uvc_ranges.saturation {
             let _ = devh.set_saturation(range.default.try_into().unwrap());
         }
@@ -420,16 +412,7 @@ impl Camera {
             let _ = devh.set_brightness(range.default.try_into().unwrap());
         }
         if let Some(range) = uvc_ranges.gamma {
-            // On the SC2210 a gamma of 100 (typically a linear curve) works best with the
-            // camera's full resolution. The default value seems to be a bit better at
-            // scaled down resolutions.
-            let is_max_res = stream_format.width * stream_format.height == camera_max_res;
-            let val = if is_max_res && 100 >= range.min && 100 <= range.max {
-                100
-            } else {
-                range.default
-            };
-            let _ = devh.set_gamma(val.try_into().unwrap());
+            let _ = devh.set_gamma(range.default.try_into().unwrap());
         }
 
         {

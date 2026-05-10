@@ -916,7 +916,7 @@ impl Engine {
                 let size = (height, width);
 
                 let mut solve_options = SolveOptions::default();
-                solve_options.solve_timeout_ms = Some(15.0);
+                solve_options.solve_timeout_ms = Some(30.0);
                 if let Some(fov) = self.fov {
                     solve_options.fov_estimate = Some(fov);
                     solve_options.fov_max_error = Some(0.5); // Provide a reasonable constraint based on FOV
