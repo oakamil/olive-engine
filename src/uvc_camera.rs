@@ -2,7 +2,7 @@
 // See LICENSE file in root directory for license terms.
 
 use crate::{CameraConfig, CameraTrait, Image};
-use log::info;
+use log::{info, warn};
 use std::sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicI32, AtomicU32, Ordering},
@@ -421,15 +421,22 @@ impl Camera {
         }
 
         // Turn off auto-exposure and auto-white-balance
-        let supported_ae_modes = devh.supported_ae_modes().unwrap_or(Vec::new());
-        let ae_mode = if supported_ae_modes.contains(&AutoExposureMode::ShutterPriority)
-            && !supported_ae_modes.contains(&AutoExposureMode::Manual)
-        {
-            AutoExposureMode::ShutterPriority
-        } else {
-            AutoExposureMode::Manual
+        match devh.set_ae_mode(AutoExposureMode::Manual) {
+            Err(_) => {
+                // Fall back to ShutterPriority if supported
+                info!("Failed to set auto-exposure mode to manual");
+                let supported_ae_modes = devh.supported_ae_modes().unwrap_or(Vec::new());
+                if supported_ae_modes.contains(&AutoExposureMode::ShutterPriority) {
+                    match devh.set_ae_mode(AutoExposureMode::ShutterPriority) {
+                        Err(_) => warn!("Failed to set shutter priority mode"),
+                        _ => {}
+                    };
+                } else {
+                    warn!("Shutter priority not supported!");
+                }
+            }
+            _ => {}
         };
-        let _ = devh.set_ae_mode(ae_mode);
         let _ = devh.set_white_balance_temperature_auto(false);
 
         let initial_gain = f32::from_bits(current_gain_atomic.load(Ordering::Relaxed));
