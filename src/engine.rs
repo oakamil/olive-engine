@@ -1,12 +1,15 @@
 // Required Notice: Copyright (c) 2026 Omair Kamil
 // See LICENSE file in root directory for license terms.
 
-use chrono::{Datelike, Timelike};
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::{
+    cmp::min,
+    sync::{Arc, RwLock},
+    time::{Duration, Instant, SystemTime},
+};
 
+use chrono::{Datelike, Timelike};
 use log::{error, info, warn};
-use ndarray::Array2;
+use ndarray::{Array2, s};
 use serde::{Deserialize, Serialize};
 
 use crate::CameraTrait;
@@ -592,7 +595,7 @@ impl Engine {
 
                     if let Some(arr) = &last_centroids_arr {
                         let solve_start = Instant::now();
-                        let solution = self.solver.solve_from_centroids(arr, size, SolveOptions::default())
+                        let solution = self.solver.solve_from_centroids(&arr.slice(s![..min(40, arr.nrows()), ..]).to_owned(), size, SolveOptions::default())
                             .expect("Critical Error: solver failed to execute during calibration. Is the database path valid?");
                         let solve_time = solve_start.elapsed();
 
@@ -704,7 +707,11 @@ impl Engine {
                         if let Some(arr) = &last_centroids_arr {
                             let solution = self
                                 .solver
-                                .solve_from_centroids(arr, size, SolveOptions::default())
+                                .solve_from_centroids(
+                                    &arr.slice(s![..min(40, arr.nrows()), ..]).to_owned(),
+                                    size,
+                                    SolveOptions::default(),
+                                )
                                 .expect(
                                     "Critical Error: solver failed to execute during calibration.",
                                 );
@@ -755,7 +762,7 @@ impl Engine {
                             let camera_config = self.camera.get_config().unwrap();
                             let size = (camera_config.height as f64, camera_config.width as f64);
                             if let Ok(solution) = self.solver.solve_from_centroids(
-                                &arr,
+                                &arr.slice(s![..min(40, arr.nrows()), ..]).to_owned(),
                                 size,
                                 SolveOptions::default(),
                             ) {
@@ -944,7 +951,7 @@ impl Engine {
                         Some(Array2::from_shape_vec((1, 2), vec![t_ra, t_dec]).unwrap());
                 }
 
-                let solution = self.solver.solve_from_centroids(&centroids_arr, size, solve_options)
+                let solution = self.solver.solve_from_centroids(&centroids_arr.slice(s![..min(40, centroids_arr.nrows()), ..]).to_owned(), size, solve_options)
                     .expect("Critical Error: solver failed to execute during solving loop. Is the database accessible?");
 
                 let solve_time = solve_start.elapsed();
