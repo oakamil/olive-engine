@@ -311,7 +311,9 @@ impl Engine {
                         };
 
                         if extractor.is_none() {
-                            let downsample = if width * height > 1_000_000 {
+                            let downsample = if width * height > 2_000_000 {
+                                FastDownsample::X4
+                            } else if width * height > 1_000_000 {
                                 FastDownsample::X2
                             } else {
                                 FastDownsample::None
@@ -364,7 +366,7 @@ impl Engine {
                                 noise_estimate,
                                 8.0,                                            // sigma
                                 true,                                           // normalize_rows
-                                if width * height > 1_000_000 { 2 } else { 1 }, // binning
+                                if width * height > 2_000_000 { 4 } else if width * height > 1_000_000 { 2 } else { 1 }, // binning
                                 false,                                          // detect_hot_pixels
                                 false, // return_binned_image
                             );

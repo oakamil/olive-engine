@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-libcamera = "0.7.0"
+clap = { version = "4.4", features = ["derive"] }
 log = "0.4"
 libc = "0.2"
 axum = "0.7"
@@ -13,15 +13,11 @@ tokio-stream = "0.1"
 futures-util = "0.3"
 tower-http = { version = "0.5", features = ["fs", "cors"] }
 base64 = "0.22"
-clap = { version = "4.4", features = ["derive"] }
 image = "0.25"
-env_logger = "0.11"
-#tetra3 = { git = "https://github.com/oakamil/olive-solve" }
 tetra3 = { path = "../olive-solve/tetra3" }
 starfield = "0.10.2"
 nalgebra = "0.32"
 ndarray = "0.17"
-rppal = "0.22.1"
 rayon = "1.11.0"
 uvc = { git = "https://github.com/oakamil/libuvc-rs", features = ["vendor", "wrap_fd"] }
 async-trait = "0.1"
@@ -29,12 +25,17 @@ chrono = "0.4"
 memchr = "2.7"
 futures = "0.3.32"
 serde = { version = "1.0.228", features = ["derive"] }
-pyo3 = { version = "0.21.2" }
 cedar_detect = { git = "https://github.com/oakamil/cedar-detect" }
+turbojpeg = "1.4.0"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+libcamera = "0.7.0"
+rppal = "0.22.1"
+pyo3 = { version = "0.21.2" }
 bno080 = { git = "https://github.com/oakamil/bno080.git", branch = "arvr" }
 bmi160 = "1.1.0"
 linux-embedded-hal = "0.4.0"
-turbojpeg = "1.4.0"
+env_logger = "0.11"
 
 [features]
 extension-module = ["pyo3/extension-module"]
