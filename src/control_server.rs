@@ -68,7 +68,6 @@ const INDEX_HTML: &str = r#"
 </style>
 </head>
 <body>
-  <!-- Home View -->
   <div id="home" class="view active">
     <h1>Olive Engine Status</h1>
     <p>Status: <span id="status">-</span></p>
@@ -84,11 +83,15 @@ const INDEX_HTML: &str = r#"
     <button onclick="captureImage()" style="margin-top: 10px;">Capture Image</button>
   </div>
 
-  <!-- Camera Mode View -->
   <div id="camera-mode" class="view">
     <div id="controls">
       <button onclick="goHome()" style="margin-bottom: 20px;">Back</button>
       <h3>Camera Controls</h3>
+      
+      <div style="margin-bottom: 15px; padding: 10px; border: 1px dashed #f00;">
+         <strong>Focus Metric (HFR):</strong> <span id="hfr-val" class="value">0.00</span>
+      </div>
+      
       <label>Gain <span id="gain-val" class="value">0</span></label>
       <input type="range" id="gain" step="0.1">
       
@@ -133,24 +136,28 @@ const INDEX_HTML: &str = r#"
 
     // Engine Polling
     async function pollEngine() {
-      if (document.getElementById('home').classList.contains('active')) {
-        try {
-          const r = await fetch('/api/engine_state');
-          if (r.ok) {
-            const data = await r.json();
-            document.getElementById('status').innerText = data.status;
-            document.getElementById('ra').innerText = data.ra !== null ? data.ra.toFixed(6) : 'N/A';
-            document.getElementById('dec').innerText = data.dec !== null ? data.dec.toFixed(6) : 'N/A';
-            document.getElementById('roll').innerText = data.roll !== null ? data.roll.toFixed(2) : 'N/A';
-            document.getElementById('exposure_time').innerText = (data.exposure_us / 1000).toFixed(2);
-            document.getElementById('post_process').innerText = data.post_process_ms.toFixed(2);
-            document.getElementById('extract').innerText = data.extract_ms.toFixed(2);
-            document.getElementById('solve').innerText = data.solve_ms.toFixed(2);
-            document.getElementById('solve_rate').innerText = data.solve_rate_hz.toFixed(2);
+      try {
+        const r = await fetch('/api/engine_state');
+        if (r.ok) {
+          const data = await r.json();
+          // Status Screen Sync
+          document.getElementById('status').innerText = data.status;
+          document.getElementById('ra').innerText = data.ra !== null ? data.ra.toFixed(6) : 'N/A';
+          document.getElementById('dec').innerText = data.dec !== null ? data.dec.toFixed(6) : 'N/A';
+          document.getElementById('roll').innerText = data.roll !== null ? data.roll.toFixed(2) : 'N/A';
+          document.getElementById('exposure_time').innerText = (data.exposure_us / 1000).toFixed(2);
+          document.getElementById('post_process').innerText = data.post_process_ms.toFixed(2);
+          document.getElementById('extract').innerText = data.extract_ms.toFixed(2);
+          document.getElementById('solve').innerText = data.solve_ms.toFixed(2);
+          document.getElementById('solve_rate').innerText = data.solve_rate_hz.toFixed(2);
+          
+          // Auxiliary Control Sync (Only populates during active Camera Mode)
+          if(document.getElementById('hfr-val')) {
+              document.getElementById('hfr-val').innerText = data.hfr.toFixed(2);
           }
-        } catch (e) {
-          document.getElementById('status').innerText = 'Disconnected';
         }
+      } catch (e) {
+        document.getElementById('status').innerText = 'Disconnected';
       }
     }
     

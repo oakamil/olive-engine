@@ -90,6 +90,7 @@ pub struct EngineStateData {
     pub solve_ms: f64,
     pub solve_rate_hz: f64,
     pub capture_requested: bool,
+    pub hfr: f64, // Added focus metric
 }
 
 impl Default for EngineStateData {
@@ -108,6 +109,7 @@ impl Default for EngineStateData {
             solve_ms: 0.0,
             solve_rate_hz: 0.0,
             capture_requested: false,
+            hfr: 0.0,
         }
     }
 }
@@ -218,6 +220,7 @@ impl Engine {
         let shared_res_ext = self.shared_result.clone();
         let engine_state_ext = self.engine_state.clone();
         let is_running_ext = self.is_running.clone();
+        let client_connected_ext = self.client_connected.clone();
 
         std::thread::spawn(move || {
             let mut extractor: Option<FastExtractor> = None;
@@ -302,13 +305,14 @@ impl Engine {
 
                 match config_ext.extractor_type {
                     Extractor::Sequential | Extractor::Fast => {
-                        let array_img = match Array2::from_shape_vec((height, width), img_data) {
-                            Ok(arr) => arr,
-                            Err(e) => {
-                                error!("Failed to create Array2 from image data: {}", e);
-                                continue;
-                            }
-                        };
+                        let array_img =
+                            match Array2::from_shape_vec((height, width), img_data.clone()) {
+                                Ok(arr) => arr,
+                                Err(e) => {
+                                    error!("Failed to create Array2 from image data: {}", e);
+                                    continue;
+                                }
+                            };
 
                         if extractor.is_none() {
                             let downsample = if width * height > 2_000_000 {
@@ -356,18 +360,26 @@ impl Engine {
                         }
                     }
                     Extractor::Cedar => {
-                        if let Some(gray_img) =
-                            image::ImageBuffer::from_raw(width as u32, height as u32, img_data)
-                        {
+                        if let Some(gray_img) = image::ImageBuffer::from_raw(
+                            width as u32,
+                            height as u32,
+                            img_data.clone(),
+                        ) {
                             let noise_estimate =
                                 cedar_detect::algorithm::estimate_noise_from_image(&gray_img);
                             let (stars, _, _, _) = cedar_detect::algorithm::get_stars_from_image(
                                 &gray_img,
                                 noise_estimate,
-                                8.0,                                            // sigma
-                                true,                                           // normalize_rows
-                                if width * height > 2_000_000 { 4 } else if width * height > 1_000_000 { 2 } else { 1 }, // binning
-                                false,                                          // detect_hot_pixels
+                                8.0,  // sigma
+                                true, // normalize_rows
+                                if width * height > 2_000_000 {
+                                    4
+                                } else if width * height > 1_000_000 {
+                                    2
+                                } else {
+                                    1
+                                }, // binning
+                                false, // detect_hot_pixels
                                 false, // return_binned_image
                             );
 
@@ -385,6 +397,19 @@ impl Engine {
                 }
 
                 let extract_time = extract_start.elapsed();
+
+                // Calculate focus metric only when camera mode is active (manual focus).
+                // This prevents wasting CPU cycles during active plate solving.
+                let hfr = if client_connected_ext.load(std::sync::atomic::Ordering::Relaxed) {
+                    calculate_hfr(&img_data, width, height, &centroids_arr, 30)
+                } else {
+                    0.0
+                };
+
+                {
+                    let mut state = engine_state_ext.write().unwrap();
+                    state.hfr = hfr;
+                }
 
                 let intermediate = IntermediateResult {
                     count: num_centroids,
@@ -1171,6 +1196,135 @@ impl Engine {
             }
         }
     }
+}
+
+/// Standalone focus evaluation routine for external callers (e.g., Android autofocus).
+/// Bypasses the core engine's background loops and forces a high-resolution 1x extraction
+/// specifically optimized for accurate Half-Flux Radius calculation.
+pub fn evaluate_focus(img_data: &[u8], width: usize, height: usize) -> f64 {
+    let array_img = match Array2::from_shape_vec((height, width), img_data.to_vec()) {
+        Ok(arr) => arr,
+        Err(e) => {
+            log::error!("Failed to create Array2 for autofocus: {}", e);
+            return 0.0;
+        }
+    };
+
+    // Use strict parameters optimized for finding round stars without downsampling
+    let options = FastExtractOptions {
+        sigma: 3.5,
+        downsample: FastDownsample::None, // Full resolution is required for precise HFR
+        bg_sub_mode: Some(FastBgSubMode::GlobalMedian),
+        binary_open: false,
+        min_area: Some(2), // Ignore hot pixels
+        max_area: Some(50),
+        max_returned: Some(30),
+        ..FastExtractOptions::default()
+    };
+
+    let mut extractor = FastExtractor::new(width, height, options);
+    let result = extractor.extract(&array_img);
+
+    let num_centroids = result.len();
+    if num_centroids == 0 {
+        return 0.0;
+    }
+
+    let mut centroids_arr = Array2::<f64>::zeros((num_centroids, 2));
+    for (i, c) in result.iter().enumerate() {
+        centroids_arr[[i, 0]] = c.y;
+        centroids_arr[[i, 1]] = c.x;
+    }
+
+    calculate_hfr(img_data, width, height, &centroids_arr, 30)
+}
+
+/// Calculates the median Half-Flux Radius (HFR) for a given set of centroids
+pub fn calculate_hfr(
+    image: &[u8],
+    width: usize,
+    height: usize,
+    centroids: &Array2<f64>,
+    max_stars: usize,
+) -> f64 {
+    let num_stars = std::cmp::min(centroids.nrows(), max_stars);
+    if num_stars == 0 {
+        return 0.0;
+    }
+
+    let mut hfrs = Vec::with_capacity(num_stars);
+    let radius = 10isize;
+    let bg_radius = 15isize;
+
+    for i in 0..num_stars {
+        let cy = centroids[[i, 0]];
+        let cx = centroids[[i, 1]];
+
+        let min_x = (cx.floor() as isize - bg_radius).max(0) as usize;
+        let max_x = (cx.ceil() as isize + bg_radius).min(width as isize - 1) as usize;
+        let min_y = (cy.floor() as isize - bg_radius).max(0) as usize;
+        let max_y = (cy.ceil() as isize + bg_radius).min(height as isize - 1) as usize;
+
+        let mut pixels = Vec::with_capacity(400);
+        let mut bg_sum = 0.0;
+        let mut bg_count = 0;
+
+        // Iterate pixel window, sort strictly into star area or background annulus
+        for y in min_y..=max_y {
+            let row_offset = y * width;
+            for x in min_x..=max_x {
+                let val = image[row_offset + x] as f64;
+                let dx = x as f64 - cx;
+                let dy = y as f64 - cy;
+                let dist_sq = dx * dx + dy * dy;
+
+                if dist_sq <= (radius as f64 * radius as f64) {
+                    pixels.push((dist_sq, val));
+                } else if dist_sq <= (bg_radius as f64 * bg_radius as f64) {
+                    bg_sum += val;
+                    bg_count += 1;
+                }
+            }
+        }
+
+        let bg = if bg_count > 0 {
+            bg_sum / bg_count as f64
+        } else {
+            0.0
+        };
+
+        let mut total_flux = 0.0;
+        for p in &mut pixels {
+            p.1 = (p.1 - bg).max(0.0);
+            total_flux += p.1;
+        }
+
+        if total_flux <= 0.0 {
+            continue;
+        }
+
+        pixels.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+        let target_flux = total_flux / 2.0;
+        let mut running_sum = 0.0;
+
+        // Find the distance at which we cross the 50% flux threshold
+        for (dist_sq, flux) in pixels {
+            running_sum += flux;
+            if running_sum >= target_flux {
+                hfrs.push(dist_sq.sqrt());
+                break;
+            }
+        }
+    }
+
+    if hfrs.is_empty() {
+        return 0.0;
+    }
+
+    // Return the median HFR out of valid samples to protect against jitter outliers
+    hfrs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    hfrs[hfrs.len() / 2]
 }
 
 // Meeus algorithms for RA/Dec <-> Alt/Az conversions and Parallactic Angle
