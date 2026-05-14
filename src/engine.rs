@@ -1218,7 +1218,6 @@ pub fn evaluate_focus(img_data: &[u8], width: usize, height: usize) -> f64 {
         binary_open: false,
         min_area: Some(2), // Ignore hot pixels
         max_area: Some(50),
-        max_returned: Some(30),
         ..FastExtractOptions::default()
     };
 
