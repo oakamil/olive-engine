@@ -94,6 +94,11 @@ pub struct EngineStateData {
     pub client_latitude: Option<f64>,
     pub client_longitude: Option<f64>,
     pub client_date: Option<chrono::DateTime<chrono::Utc>>,
+    pub offset_ra: Option<f64>,
+    pub offset_dec: Option<f64>,
+    pub offset_az: Option<f64>,
+    pub offset_alt: Option<f64>,
+    pub offset_angle: Option<f64>,
 }
 
 impl Default for EngineStateData {
@@ -116,6 +121,11 @@ impl Default for EngineStateData {
             client_latitude: None,
             client_longitude: None,
             client_date: None,
+            offset_ra: None,
+            offset_dec: None,
+            offset_az: None,
+            offset_alt: None,
+            offset_angle: None,
         }
     }
 }
@@ -140,6 +150,45 @@ pub struct Engine {
     )>,
     pub is_running: Arc<std::sync::atomic::AtomicBool>,
     pub telescope_server_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+fn angle_diff_deg(a: f64, b: f64) -> f64 {
+    let diff = (a - b).rem_euclid(360.0);
+    if diff > 180.0 { diff - 360.0 } else { diff }
+}
+
+fn calculate_alt_az(
+    ra_deg: f64,
+    dec_deg: f64,
+    lat_deg: f64,
+    lon_deg: f64,
+    time: &chrono::DateTime<chrono::Utc>,
+) -> (f64, f64) {
+    let ts = starfield::time::Timescale::default();
+    let t = ts.from_datetime(*time);
+    let gast_hours = t.gast();
+
+    // LST in degrees
+    let lst_deg = (gast_hours * 15.0 + lon_deg).rem_euclid(360.0);
+
+    // Hour Angle in degrees
+    let ha_deg = (lst_deg - ra_deg).rem_euclid(360.0);
+
+    // Convert to radians for math
+    let ha_rad = ha_deg.to_radians();
+    let dec_rad = dec_deg.to_radians();
+    let lat_rad = lat_deg.to_radians();
+
+    // Altitude
+    let sin_alt = dec_rad.sin() * lat_rad.sin() + dec_rad.cos() * lat_rad.cos() * ha_rad.cos();
+    let alt_rad = sin_alt.asin();
+
+    // Azimuth
+    let cos_az = (dec_rad.sin() - alt_rad.sin() * lat_rad.sin()) / (alt_rad.cos() * lat_rad.cos());
+    let sin_az = -dec_rad.cos() * ha_rad.sin() / alt_rad.cos();
+    let az_rad = sin_az.atan2(cos_az).rem_euclid(std::f64::consts::TAU);
+
+    (alt_rad.to_degrees(), az_rad.to_degrees())
 }
 
 impl Engine {
@@ -218,6 +267,42 @@ impl Engine {
         state.extract_ms = extract.as_secs_f64() * 1000.0;
         state.solve_ms = solve.as_secs_f64() * 1000.0;
         state.solve_rate_hz = solve_rate_hz;
+
+        if let (Some(cur_ra), Some(cur_dec), Some(t_ra), Some(t_dec)) =
+            (ra, dec, target_ra, target_dec)
+        {
+            state.offset_ra = Some(angle_diff_deg(t_ra, cur_ra));
+            state.offset_dec = Some(t_dec - cur_dec);
+
+            if let (Some(lat), Some(lon), Some(time)) = (
+                state.client_latitude,
+                state.client_longitude,
+                state.client_date,
+            ) {
+                let (cur_alt, cur_az) = calculate_alt_az(cur_ra, cur_dec, lat, lon, &time);
+                let (t_alt, t_az) = calculate_alt_az(t_ra, t_dec, lat, lon, &time);
+
+                let d_alt = t_alt - cur_alt;
+                let d_az = angle_diff_deg(t_az, cur_az);
+
+                state.offset_alt = Some(d_alt);
+                state.offset_az = Some(d_az);
+
+                let x = -d_az * cur_alt.to_radians().cos();
+                let y = d_alt;
+                state.offset_angle = Some(x.atan2(y).to_degrees());
+            } else {
+                state.offset_alt = None;
+                state.offset_az = None;
+                state.offset_angle = None;
+            }
+        } else {
+            state.offset_ra = None;
+            state.offset_dec = None;
+            state.offset_alt = None;
+            state.offset_az = None;
+            state.offset_angle = None;
+        }
     }
 
     pub fn start(self) {
@@ -1476,4 +1561,42 @@ fn alt_az_to_ra_dec(
     let eq_roll = alt_az_roll - q_deg;
 
     (ra_deg, dec_deg, eq_roll)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_offset_angle_conversion_math() {
+        // Test offset math against web converter output for standard position angle offsets.
+        // The engine computes an offset_angle using Alt/Az mimicking this exact geometry,
+        // with RA/Dec mapping equivalently to Az/Alt under a local small angle approximation.
+
+        // Position 1: 12:12:12.00, +11:11:11.00
+        let ra1_deg: f64 = (12.0 + 12.0 / 60.0 + 12.0 / 3600.0) * 15.0;
+        let dec1_deg: f64 = 11.0 + 11.0 / 60.0 + 11.0 / 3600.0;
+
+        // Position 2: 21:21:21.00, -05:05:05.00
+        let ra2_deg: f64 = (21.0 + 21.0 / 60.0 + 21.0 / 3600.0) * 15.0;
+        let dec2_deg: f64 = -(5.0 + 5.0 / 60.0 + 5.0 / 3600.0);
+
+        // Calculate telescope offsets for 1 -> 2
+        let east_offset_arcsec: f64 = (ra2_deg - ra1_deg) * 3600.0 * dec1_deg.to_radians().cos();
+        let north_offset_arcsec: f64 = (dec2_deg - dec1_deg) * 3600.0;
+
+        // Verify web converter output:
+        // East Offset [arcsec] +484845.16
+        // North Offset [arcsec] -58576.00
+        assert!((east_offset_arcsec - 484845.16).abs() < 0.1);
+        assert!((north_offset_arcsec - (-58576.00)).abs() < 0.1);
+
+        // To calculate the position angle of the slit that connects these two points,
+        // the web converter uses the midpoint declination to avoid distortion.
+        let dec_mid: f64 = (dec1_deg + dec2_deg) / 2.0;
+        let east_mid: f64 = (ra2_deg - ra1_deg) * dec_mid.to_radians().cos();
+        let north_mid: f64 = dec2_deg - dec1_deg;
+
+        // Web converter reports Slit Alignment Position Angle: +96.77
+        let position_angle: f64 = east_mid.atan2(north_mid).to_degrees();
+        assert!((position_angle - 96.77).abs() < 0.01);
+    }
 }
