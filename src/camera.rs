@@ -121,6 +121,7 @@ impl CameraTrait for Camera {
             width: c.width,
             height: c.height,
             fps: 0,
+            crop: None,
         })
     }
 

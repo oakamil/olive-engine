@@ -34,6 +34,7 @@ pub struct CameraConfig {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    pub crop: Option<(u32, u32)>,
 }
 
 pub trait CameraTrait: Send + Sync {
@@ -47,6 +48,8 @@ pub trait CameraTrait: Send + Sync {
     fn set_exposure(&self, exposure_us: i32);
     fn enable_hcg(&self);
     fn disable_hcg(&self);
+    fn set_focus(&self, _distance: f32) {}
+    fn set_noise_reduction(&self, _mode: u8) {}
     fn wait_for_next_capture(
         &self,
         last_timestamp: Option<SystemTime>,

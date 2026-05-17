@@ -48,6 +48,7 @@ struct CaptureStore {
 /// Commands sent from the main thread to the capture thread.
 enum CaptureCommand {
     SetGain(f32),
+    SetExposure(i32),
     SetUvcControls(UvcControls),
     StopCaptureThread,
 }
@@ -151,13 +152,17 @@ impl CameraTrait for Camera {
         self.current_exposure.load(Ordering::Relaxed)
     }
 
-    fn set_exposure(&self, _exposure_us: i32) {}
+    fn set_exposure(&self, exposure_us: i32) {
+        self.current_exposure.store(exposure_us, Ordering::Relaxed);
+        self.send_command(CaptureCommand::SetExposure(exposure_us));
+    }
 
     fn enable_hcg(&self) {}
 
     fn disable_hcg(&self) {}
 
     fn get_last_capture(&self) -> Option<Arc<Image>> {
+        log::info!("get_last_capture called");
         let lock = self.store.image.lock().unwrap();
         lock.clone()
     }
@@ -345,7 +350,53 @@ impl Camera {
             }
         }
 
-        let stream_format = best_format.unwrap_or_else(|| {
+        
+        if best_format.is_none() {
+            warn!("Strict MJPEG/FPS match failed. Trying FPS match only...");
+            for format_desc in devh.supported_formats() {
+                for frame_desc in format_desc.supported_formats() {
+                    for &interval in frame_desc.intervals() {
+                        let fps = 10_000_000 / interval;
+                        if fps == target_fps {
+                            best_format = Some(uvc::StreamFormat {
+                                width: frame_desc.width() as u32,
+                                height: frame_desc.height() as u32,
+                                fps,
+                                format: match frame_desc.subtype() {
+                                    uvc::DescriptionSubtype::FormatMJPEG | uvc::DescriptionSubtype::FrameMJPEG => FrameFormat::MJPEG,
+                                    _ => FrameFormat::Uncompressed,
+                                },
+                            });
+                            break;
+                        }
+                    }
+                    if best_format.is_some() { break; }
+                }
+                if best_format.is_some() { break; }
+            }
+        }
+
+        if best_format.is_none() {
+            warn!("FPS match failed. Picking largest resolution...");
+            for format_desc in devh.supported_formats() {
+                for frame_desc in format_desc.supported_formats() {
+                    let width = frame_desc.width() as u32;
+                    let height = frame_desc.height() as u32;
+                    if width * height > max_res {
+                        max_res = width * height;
+                        let fps = 10_000_000 / frame_desc.intervals()[0];
+                        best_format = Some(uvc::StreamFormat {
+                            width, height, fps, 
+                            format: match frame_desc.subtype() {
+                                uvc::DescriptionSubtype::FormatMJPEG | uvc::DescriptionSubtype::FrameMJPEG => FrameFormat::MJPEG,
+                                _ => FrameFormat::Uncompressed,
+                            },
+                        });
+                    }
+                }
+            }
+        }
+let stream_format = best_format.unwrap_or_else(|| {
             panic!(
                 "Error: No format found matching exactly the specified fps of {} and mjpeg enabled: {}",
                 target_fps, mjpeg_enabled
@@ -452,16 +503,18 @@ impl Camera {
                 width: stream_format.width,
                 height: stream_format.height,
                 fps: stream_format.fps,
+                crop: None,
             });
         }
 
-        let discard_frames = Arc::new(AtomicU32::new(stream_format.fps * 2));
+        let discard_frames = Arc::new(AtomicU32::new(stream_format.fps / 2));
         let discard_frames_clone = Arc::clone(&discard_frames);
         let store_clone = Arc::clone(&store);
 
-        let _stream = streamh
-            .start_stream(
-                move |frame, _| {
+        log::info!("Starting UVC stream...");
+          let _stream = streamh
+              .start_stream(
+                  move |frame, _| {
                     if discard_frames_clone
                         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
                             if x > 0 { Some(x - 1) } else { None }
@@ -475,8 +528,9 @@ impl Camera {
                     let timestamp = SystemTime::now();
 
                     let mut width = frame.width() as usize;
-                    let mut height = frame.height() as usize;
-                    let data = frame.to_bytes();
+                      let mut height = frame.height() as usize;
+                      let data = frame.to_bytes();
+                      log::info!("UVC frame arrived: {}x{}, format={:?}", width, height, frame.format());
 
                     let mut image_data;
                     if frame.format() == FrameFormat::MJPEG {
@@ -485,9 +539,12 @@ impl Camera {
                             Err(_) => return,
                         };
                         let header = match decompressor.read_header(data) {
-                            Ok(h) => h,
-                            Err(_) => return,
-                        };
+                              Ok(h) => h,
+                              Err(e) => {
+                                  log::error!("MJPEG header read failed: {:?}", e);
+                                  return;
+                              }
+                          };
                         width = header.width;
                         height = header.height;
                         image_data = vec![0u8; width * height];
@@ -498,9 +555,10 @@ impl Camera {
                             height,
                             format: turbojpeg::PixelFormat::GRAY,
                         };
-                        if decompressor.decompress(data, image).is_err() {
-                            return;
-                        }
+                        if let Err(e) = decompressor.decompress(data, image) {
+                              log::error!("MJPEG decompression failed: {:?}", e);
+                              return;
+                          }
                     } else {
                         // Highly optimized loop for 8-bit mono extraction (Y from YUYV)
                         // YUYV sequence: Y0, U0, Y1, V0... (2 bytes per pixel, even bytes are Y)
@@ -533,6 +591,7 @@ impl Camera {
                 (),
             )
             .expect("Failed to start stream");
+          log::info!("UVC stream started successfully");
 
         loop {
             // Handle commands
@@ -543,6 +602,11 @@ impl Camera {
                     let _ = discard_frames.fetch_add(10, Ordering::Relaxed);
                     *store.image.lock().unwrap() = None;
                 }
+                  Ok(CaptureCommand::SetExposure(exposure)) => {
+                      let _ = devh.set_exposure_abs((exposure / 100) as u32);
+                      let _ = discard_frames.fetch_add(5, Ordering::Relaxed);
+                      *store.image.lock().unwrap() = None;
+                  }
                 Ok(CaptureCommand::SetUvcControls(controls)) => {
                     let mut current_ae_mode = AutoExposureMode::Manual;
                     let supported_ae_modes = devh.supported_ae_modes().unwrap_or(Vec::new());

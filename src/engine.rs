@@ -32,6 +32,7 @@ pub struct EngineConfig {
     pub isp: bool,
     pub bg_mode: BgMode,
     pub extractor_type: Extractor,
+    pub crop: Option<(usize, usize)>,
 }
 
 impl Default for EngineConfig {
@@ -46,6 +47,7 @@ impl Default for EngineConfig {
             isp: false,
             bg_mode: BgMode::Line,
             extractor_type: Extractor::Sequential,
+            crop: None,
         }
     }
 }
@@ -90,6 +92,7 @@ pub struct EngineStateData {
     pub solve_ms: f64,
     pub solve_rate_hz: f64,
     pub capture_requested: bool,
+    pub paused: bool,
     pub hfr: f64, // Added focus metric
 }
 
@@ -109,6 +112,7 @@ impl Default for EngineStateData {
             solve_ms: 0.0,
             solve_rate_hz: 0.0,
             capture_requested: false,
+            paused: false,
             hfr: 0.0,
         }
     }
@@ -227,6 +231,14 @@ impl Engine {
             let mut last_processed_timestamp = None;
 
             loop {
+                if engine_state_ext.read().unwrap().paused {
+                    {
+                        let mut state = engine_state_ext.write().unwrap();
+                        state.status = "Camera Mode".to_string();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    continue;
+                }
                 if !is_running_ext.load(std::sync::atomic::Ordering::Relaxed) {
                     log::info!("Engine loop stopping due to is_running flag.");
                     break;
@@ -315,13 +327,19 @@ impl Engine {
                             };
 
                         if extractor.is_none() {
-                            let downsample = if width * height > 2_000_000 {
-                                FastDownsample::X4
-                            } else if width * height > 1_000_000 {
-                                FastDownsample::X2
-                            } else {
-                                FastDownsample::None
-                            };
+                              let final_crop = config_ext.crop.or(cam_config.crop.map(|(w, h)| (w as usize, h as usize)));
+                              let (proc_width, proc_height) = match final_crop {
+                                  Some((cw, ch)) => (cw.min(width), ch.min(height)),
+                                  None => (width, height),
+                              };
+
+                              let downsample = if proc_width * proc_height > 2_000_000 {
+                                  FastDownsample::X4
+                              } else if proc_width * proc_height > 1_000_000 {
+                                  FastDownsample::X2
+                              } else {
+                                  FastDownsample::None
+                              };
 
                             let bg_sub_mode = match config_ext.bg_mode {
                                 BgMode::Global => Some(FastBgSubMode::GlobalMedian),
@@ -336,8 +354,9 @@ impl Engine {
                                 downsample,
                                 bg_sub_mode,
                                 binary_open: false,
-                                min_area: Some(1),
+                                min_area: Some(2),
                                 max_area: Some(20),
+                                crop: final_crop,
                                 //centroid_window: Some(3),
                                 ..FastExtractOptions::default()
                             };
@@ -430,6 +449,10 @@ impl Engine {
         std::thread::spawn(move || {
             let mut engine = self;
             loop {
+                if engine.engine_state.read().unwrap().paused {
+                      std::thread::sleep(std::time::Duration::from_millis(500));
+                      continue;
+                  }
                 engine.run_calibration_loop();
                 engine.run_solving_loop();
             }
@@ -482,6 +505,11 @@ impl Engine {
         let mut was_connected = false;
 
         loop {
+            if self.engine_state.read().unwrap().paused {
+                self.update_status("Camera Mode");
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                continue;
+            }
             if self
                 .client_connected
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -915,6 +943,11 @@ impl Engine {
         let mut was_connected = false;
 
         loop {
+            if self.engine_state.read().unwrap().paused {
+                self.update_status("Camera Mode");
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                continue;
+            }
             if self
                 .client_connected
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -1216,7 +1249,7 @@ pub fn evaluate_focus(img_data: &[u8], width: usize, height: usize) -> f64 {
         downsample: FastDownsample::None, // Full resolution is required for precise HFR
         bg_sub_mode: Some(FastBgSubMode::GlobalMedian),
         binary_open: false,
-        min_area: Some(2), // Ignore hot pixels
+        min_area: Some(1), // Ignore hot pixels
         max_area: Some(50),
         ..FastExtractOptions::default()
     };
