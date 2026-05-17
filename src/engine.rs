@@ -91,6 +91,9 @@ pub struct EngineStateData {
     pub solve_rate_hz: f64,
     pub capture_requested: bool,
     pub hfr: f64, // Added focus metric
+    pub client_latitude: Option<f64>,
+    pub client_longitude: Option<f64>,
+    pub client_date: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl Default for EngineStateData {
@@ -110,6 +113,9 @@ impl Default for EngineStateData {
             solve_rate_hz: 0.0,
             capture_requested: false,
             hfr: 0.0,
+            client_latitude: None,
+            client_longitude: None,
+            client_date: None,
         }
     }
 }
@@ -1047,13 +1053,17 @@ impl Engine {
 
                         locked.telescope_ra = ra;
                         locked.telescope_dec = dec;
-                        let lat_opt = locked.site_latitude;
-                        let lon_opt = locked.site_longitude;
+                        let engine_state = self.engine_state.read().unwrap();
+                        let lat_opt = engine_state.client_latitude.or(locked.site_latitude);
+                        let lon_opt = engine_state.client_longitude.or(locked.site_longitude);
+                        let client_date = engine_state.client_date;
+                        drop(engine_state);
                         drop(locked);
 
                         if let Some(imu) = &self.imu {
                             if let (Some(lat), Some(lon)) = (lat_opt, lon_opt) {
-                                let dt: chrono::DateTime<chrono::Utc> = img_timestamp.into();
+                                let dt: chrono::DateTime<chrono::Utc> =
+                                    client_date.unwrap_or_else(|| img_timestamp.into());
                                 let (alt, az, alt_az_roll) =
                                     ra_dec_to_alt_az(ra, dec, solution.roll.unwrap(), lat, lon, dt);
                                 let mount_coords = crate::imu::MountCoordinates {
@@ -1087,8 +1097,11 @@ impl Engine {
                         let mut est_roll = None;
 
                         let locked = self.shared_position.read().unwrap();
-                        let lat_opt = locked.site_latitude;
-                        let lon_opt = locked.site_longitude;
+                        let engine_state = self.engine_state.read().unwrap();
+                        let lat_opt = engine_state.client_latitude.or(locked.site_latitude);
+                        let lon_opt = engine_state.client_longitude.or(locked.site_longitude);
+                        let client_date = engine_state.client_date;
+                        drop(engine_state);
                         drop(locked);
 
                         if let Some(imu) = &self.imu {
@@ -1096,7 +1109,7 @@ impl Engine {
                                 if let Ok(est) = futures::executor::block_on(
                                     imu.get_estimated_pointing(&SystemTime::now()),
                                 ) {
-                                    let dt = chrono::Utc::now();
+                                    let dt = client_date.unwrap_or_else(chrono::Utc::now);
                                     let (ra, dec, eq_roll) = alt_az_to_ra_dec(
                                         est.pitch, est.yaw, est.roll, lat, lon, dt,
                                     );
