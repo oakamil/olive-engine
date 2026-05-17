@@ -425,6 +425,34 @@ async fn post_capture(State(state): State<Arc<ServerState>>) -> StatusCode {
     StatusCode::OK
 }
 
+#[derive(serde::Deserialize)]
+pub struct LocationTimeData {
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub timestamp_ms: Option<u64>,
+}
+
+async fn post_location_time(
+    State(state): State<Arc<ServerState>>,
+    Json(payload): Json<LocationTimeData>,
+) -> StatusCode {
+    let mut engine_state = state.engine_state.write().unwrap();
+    if let Some(lat) = payload.latitude {
+        engine_state.client_latitude = Some(lat);
+    }
+    if let Some(lon) = payload.longitude {
+        engine_state.client_longitude = Some(lon);
+    }
+    if let Some(ms) = payload.timestamp_ms {
+        if let Some(dt) =
+            chrono::DateTime::from_timestamp((ms / 1000) as i64, ((ms % 1000) * 1_000_000) as u32)
+        {
+            engine_state.client_date = Some(dt);
+        }
+    }
+    StatusCode::OK
+}
+
 pub async fn start_server(
     camera: Arc<dyn CameraTrait>,
     client_connected: Arc<AtomicBool>,
@@ -444,6 +472,7 @@ pub async fn start_server(
         .route("/api/controls", get(get_controls).post(post_controls))
         .route("/api/capture", post(post_capture))
         .route("/api/engine_state", get(get_engine_state))
+        .route("/api/location_time", post(post_location_time))
         .with_state(state);
 
     let listener = match tokio::net::TcpListener::bind("0.0.0.0:8080").await {
