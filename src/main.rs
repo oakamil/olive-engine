@@ -57,6 +57,14 @@ struct Args {
     /// IMU to use (none, bno085, bmi160)
     #[arg(long, default_value = "none")]
     imu: String,
+
+    /// Disable automatic image downsampling
+    #[arg(long)]
+    no_downsample: bool,
+
+    /// Bypass automatic calibration and start solving immediately
+    #[arg(long)]
+    bypass_calibration: bool,
 }
 
 #[tokio::main]
@@ -106,6 +114,9 @@ async fn main() {
         isp: if args.uvc { false } else { args.isp },
         bg_mode: args.bg_mode,
         extractor_type: args.extractor_type,
+        downsample: !args.no_downsample,
+        bypass_calibration: args.bypass_calibration,
+        ..Default::default()
     };
 
     info!("Starting Olive Engine with configuration: {:?}", config);

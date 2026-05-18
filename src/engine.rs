@@ -33,6 +33,8 @@ pub struct EngineConfig {
     pub bg_mode: BgMode,
     pub extractor_type: Extractor,
     pub crop: Option<(usize, usize)>,
+    pub downsample: bool,
+    pub bypass_calibration: bool,
 }
 
 impl Default for EngineConfig {
@@ -48,6 +50,8 @@ impl Default for EngineConfig {
             bg_mode: BgMode::Line,
             extractor_type: Extractor::Sequential,
             crop: None,
+            downsample: true,
+            bypass_calibration: false,
         }
     }
 }
@@ -426,10 +430,14 @@ impl Engine {
                                 None => (width, height),
                             };
 
-                            let downsample = if proc_width * proc_height > 2_000_000 {
-                                FastDownsample::X4
-                            } else if proc_width * proc_height > 1_000_000 {
-                                FastDownsample::X2
+                            let downsample = if config_ext.downsample {
+                                if proc_width * proc_height > 2_000_000 {
+                                    FastDownsample::X4
+                                } else if proc_width * proc_height > 1_000_000 {
+                                    FastDownsample::X2
+                                } else {
+                                    FastDownsample::None
+                                }
                             } else {
                                 FastDownsample::None
                             };
@@ -510,10 +518,14 @@ impl Engine {
                                 noise_estimate,
                                 8.0,  // sigma
                                 true, // normalize_rows
-                                if crop_w * crop_h > 2_000_000 {
-                                    4
-                                } else if crop_w * crop_h > 1_000_000 {
-                                    2
+                                if config_ext.downsample {
+                                    if crop_w * crop_h > 2_000_000 {
+                                        4
+                                    } else if crop_w * crop_h > 1_000_000 {
+                                        2
+                                    } else {
+                                        1
+                                    }
                                 } else {
                                     1
                                 }, // binning
@@ -615,6 +627,11 @@ impl Engine {
         info!("Setting base hardware settings...");
         self.camera.set_gain(gain);
         self.camera.enable_hcg();
+
+        if self.config.bypass_calibration {
+            info!("Bypassing calibration loop based on configuration.");
+            return;
+        }
 
         let target_min = self.config.target_centroids;
         let target_max = (self.config.target_centroids as f64 * 1.25).round() as usize;
