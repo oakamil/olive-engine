@@ -350,7 +350,6 @@ impl Camera {
             }
         }
 
-        
         if best_format.is_none() {
             warn!("Strict MJPEG/FPS match failed. Trying FPS match only...");
             for format_desc in devh.supported_formats() {
@@ -363,16 +362,21 @@ impl Camera {
                                 height: frame_desc.height() as u32,
                                 fps,
                                 format: match frame_desc.subtype() {
-                                    uvc::DescriptionSubtype::FormatMJPEG | uvc::DescriptionSubtype::FrameMJPEG => FrameFormat::MJPEG,
+                                    uvc::DescriptionSubtype::FormatMJPEG
+                                    | uvc::DescriptionSubtype::FrameMJPEG => FrameFormat::MJPEG,
                                     _ => FrameFormat::Uncompressed,
                                 },
                             });
                             break;
                         }
                     }
-                    if best_format.is_some() { break; }
+                    if best_format.is_some() {
+                        break;
+                    }
                 }
-                if best_format.is_some() { break; }
+                if best_format.is_some() {
+                    break;
+                }
             }
         }
 
@@ -386,9 +390,12 @@ impl Camera {
                         max_res = width * height;
                         let fps = 10_000_000 / frame_desc.intervals()[0];
                         best_format = Some(uvc::StreamFormat {
-                            width, height, fps, 
+                            width,
+                            height,
+                            fps,
                             format: match frame_desc.subtype() {
-                                uvc::DescriptionSubtype::FormatMJPEG | uvc::DescriptionSubtype::FrameMJPEG => FrameFormat::MJPEG,
+                                uvc::DescriptionSubtype::FormatMJPEG
+                                | uvc::DescriptionSubtype::FrameMJPEG => FrameFormat::MJPEG,
                                 _ => FrameFormat::Uncompressed,
                             },
                         });
@@ -396,7 +403,7 @@ impl Camera {
                 }
             }
         }
-let stream_format = best_format.unwrap_or_else(|| {
+        let stream_format = best_format.unwrap_or_else(|| {
             panic!(
                 "Error: No format found matching exactly the specified fps of {} and mjpeg enabled: {}",
                 target_fps, mjpeg_enabled
@@ -512,9 +519,9 @@ let stream_format = best_format.unwrap_or_else(|| {
         let store_clone = Arc::clone(&store);
 
         log::info!("Starting UVC stream...");
-          let _stream = streamh
-              .start_stream(
-                  move |frame, _| {
+        let _stream = streamh
+            .start_stream(
+                move |frame, _| {
                     if discard_frames_clone
                         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
                             if x > 0 { Some(x - 1) } else { None }
@@ -528,9 +535,14 @@ let stream_format = best_format.unwrap_or_else(|| {
                     let timestamp = SystemTime::now();
 
                     let mut width = frame.width() as usize;
-                      let mut height = frame.height() as usize;
-                      let data = frame.to_bytes();
-                      log::info!("UVC frame arrived: {}x{}, format={:?}", width, height, frame.format());
+                    let mut height = frame.height() as usize;
+                    let data = frame.to_bytes();
+                    log::info!(
+                        "UVC frame arrived: {}x{}, format={:?}",
+                        width,
+                        height,
+                        frame.format()
+                    );
 
                     let mut image_data;
                     if frame.format() == FrameFormat::MJPEG {
@@ -539,12 +551,12 @@ let stream_format = best_format.unwrap_or_else(|| {
                             Err(_) => return,
                         };
                         let header = match decompressor.read_header(data) {
-                              Ok(h) => h,
-                              Err(e) => {
-                                  log::error!("MJPEG header read failed: {:?}", e);
-                                  return;
-                              }
-                          };
+                            Ok(h) => h,
+                            Err(e) => {
+                                log::error!("MJPEG header read failed: {:?}", e);
+                                return;
+                            }
+                        };
                         width = header.width;
                         height = header.height;
                         image_data = vec![0u8; width * height];
@@ -556,9 +568,9 @@ let stream_format = best_format.unwrap_or_else(|| {
                             format: turbojpeg::PixelFormat::GRAY,
                         };
                         if let Err(e) = decompressor.decompress(data, image) {
-                              log::error!("MJPEG decompression failed: {:?}", e);
-                              return;
-                          }
+                            log::error!("MJPEG decompression failed: {:?}", e);
+                            return;
+                        }
                     } else {
                         // Highly optimized loop for 8-bit mono extraction (Y from YUYV)
                         // YUYV sequence: Y0, U0, Y1, V0... (2 bytes per pixel, even bytes are Y)
@@ -591,7 +603,7 @@ let stream_format = best_format.unwrap_or_else(|| {
                 (),
             )
             .expect("Failed to start stream");
-          log::info!("UVC stream started successfully");
+        log::info!("UVC stream started successfully");
 
         loop {
             // Handle commands
@@ -602,11 +614,11 @@ let stream_format = best_format.unwrap_or_else(|| {
                     let _ = discard_frames.fetch_add(10, Ordering::Relaxed);
                     *store.image.lock().unwrap() = None;
                 }
-                  Ok(CaptureCommand::SetExposure(exposure)) => {
-                      let _ = devh.set_exposure_abs((exposure / 100) as u32);
-                      let _ = discard_frames.fetch_add(5, Ordering::Relaxed);
-                      *store.image.lock().unwrap() = None;
-                  }
+                Ok(CaptureCommand::SetExposure(exposure)) => {
+                    let _ = devh.set_exposure_abs((exposure / 100) as u32);
+                    let _ = discard_frames.fetch_add(5, Ordering::Relaxed);
+                    *store.image.lock().unwrap() = None;
+                }
                 Ok(CaptureCommand::SetUvcControls(controls)) => {
                     let mut current_ae_mode = AutoExposureMode::Manual;
                     let supported_ae_modes = devh.supported_ae_modes().unwrap_or(Vec::new());
@@ -674,6 +686,7 @@ let stream_format = best_format.unwrap_or_else(|| {
 impl Drop for Camera {
     fn drop(&mut self) {
         self.send_command(CaptureCommand::StopCaptureThread);
+        self.store.cvar.notify_all();
         if let Some(handle) = self.capture_thread.take() {
             let _ = handle.join();
         }

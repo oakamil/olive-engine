@@ -40,6 +40,7 @@ pub struct CameraConfig {
 pub trait CameraTrait: Send + Sync {
     fn get_config(&self) -> Option<CameraConfig>;
     fn start_capture(&mut self) -> Result<(), String>;
+    fn stop_capture(&self) {}
     fn get_gain(&self) -> f32;
     fn get_min_gain(&self) -> f32;
     fn get_max_gain(&self) -> f32;

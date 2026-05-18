@@ -418,19 +418,21 @@ impl Engine {
                             };
 
                         if extractor.is_none() {
-                              let final_crop = config_ext.crop.or(cam_config.crop.map(|(w, h)| (w as usize, h as usize)));
-                              let (proc_width, proc_height) = match final_crop {
-                                  Some((cw, ch)) => (cw.min(width), ch.min(height)),
-                                  None => (width, height),
-                              };
+                            let final_crop = config_ext
+                                .crop
+                                .or(cam_config.crop.map(|(w, h)| (w as usize, h as usize)));
+                            let (proc_width, proc_height) = match final_crop {
+                                Some((cw, ch)) => (cw.min(width), ch.min(height)),
+                                None => (width, height),
+                            };
 
-                              let downsample = if proc_width * proc_height > 2_000_000 {
-                                  FastDownsample::X4
-                              } else if proc_width * proc_height > 1_000_000 {
-                                  FastDownsample::X2
-                              } else {
-                                  FastDownsample::None
-                              };
+                            let downsample = if proc_width * proc_height > 2_000_000 {
+                                FastDownsample::X4
+                            } else if proc_width * proc_height > 1_000_000 {
+                                FastDownsample::X2
+                            } else {
+                                FastDownsample::None
+                            };
 
                             let bg_sub_mode = match config_ext.bg_mode {
                                 BgMode::Global => Some(FastBgSubMode::GlobalMedian),
@@ -470,10 +472,36 @@ impl Engine {
                         }
                     }
                     Extractor::Cedar => {
+                        let final_crop = config_ext
+                            .crop
+                            .or(cam_config.crop.map(|(w, h)| (w as usize, h as usize)));
+                        let (crop_w, crop_h, crop_x, crop_y) = match final_crop {
+                            Some((cw, ch)) => {
+                                let cw = cw.min(width);
+                                let ch = ch.min(height);
+                                let cx = (width - cw) / 2;
+                                let cy = (height - ch) / 2;
+                                (cw, ch, cx, cy)
+                            }
+                            None => (width, height, 0, 0),
+                        };
+
+                        let cropped_img_data = if final_crop.is_some() {
+                            let mut cropped = Vec::with_capacity(crop_w * crop_h);
+                            for y in crop_y..(crop_y + crop_h) {
+                                let start = y * width + crop_x;
+                                let end = start + crop_w;
+                                cropped.extend_from_slice(&img_data[start..end]);
+                            }
+                            cropped
+                        } else {
+                            img_data.clone()
+                        };
+
                         if let Some(gray_img) = image::ImageBuffer::from_raw(
-                            width as u32,
-                            height as u32,
-                            img_data.clone(),
+                            crop_w as u32,
+                            crop_h as u32,
+                            cropped_img_data,
                         ) {
                             let noise_estimate =
                                 cedar_detect::algorithm::estimate_noise_from_image(&gray_img);
@@ -482,9 +510,9 @@ impl Engine {
                                 noise_estimate,
                                 8.0,  // sigma
                                 true, // normalize_rows
-                                if width * height > 2_000_000 {
+                                if crop_w * crop_h > 2_000_000 {
                                     4
-                                } else if width * height > 1_000_000 {
+                                } else if crop_w * crop_h > 1_000_000 {
                                     2
                                 } else {
                                     1
@@ -496,8 +524,8 @@ impl Engine {
                             num_centroids = stars.len();
                             centroids_arr = Array2::<f64>::zeros((num_centroids, 2));
                             for (i, c) in stars.iter().enumerate() {
-                                centroids_arr[[i, 0]] = c.centroid_y;
-                                centroids_arr[[i, 1]] = c.centroid_x;
+                                centroids_arr[[i, 0]] = c.centroid_y + crop_y as f64;
+                                centroids_arr[[i, 1]] = c.centroid_x + crop_x as f64;
                             }
                         } else {
                             error!("Failed to create ImageBuffer from image data");
@@ -541,9 +569,9 @@ impl Engine {
             let mut engine = self;
             loop {
                 if engine.engine_state.read().unwrap().paused {
-                      std::thread::sleep(std::time::Duration::from_millis(500));
-                      continue;
-                  }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    continue;
+                }
                 engine.run_calibration_loop();
                 engine.run_solving_loop();
             }
