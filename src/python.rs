@@ -57,6 +57,7 @@ fn start_engine(
         isp,
         bg_mode: bg_sub_mode,
         extractor_type: ext_type,
+        ..Default::default()
     };
 
     log::info!(
