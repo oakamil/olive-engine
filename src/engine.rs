@@ -1316,54 +1316,58 @@ impl Engine {
                 }
 
                 // Continuous exposure/gain adjustment
-                let actual_exp = exp_time.as_micros() as i32;
-                // Tighter 1% tolerance prevents overlapping with our 5% adjustment steps (stops ratcheting)
-                let tolerance = (self.camera.get_exposure() as f32 * 0.01).max(500.0) as i32;
+                if !self.config.bypass_calibration {
+                    let actual_exp = exp_time.as_micros() as i32;
+                    // Tighter 1% tolerance prevents overlapping with our 5% adjustment steps (stops ratcheting)
+                    let tolerance = (self.camera.get_exposure() as f32 * 0.01).max(500.0) as i32;
 
-                // For UVC, actual_exp will match get_exposure() immediately since it is static, passing naturally.
-                let matches_current = (actual_exp - self.camera.get_exposure()).abs() <= tolerance;
+                    // For UVC, actual_exp will match get_exposure() immediately since it is static, passing naturally.
+                    let matches_current =
+                        (actual_exp - self.camera.get_exposure()).abs() <= tolerance;
 
-                if matches_current {
-                    if recent_centroids.len() >= 5 {
-                        recent_centroids.remove(0);
-                    }
-                    recent_centroids.push(count);
+                    if matches_current {
+                        if recent_centroids.len() >= 5 {
+                            recent_centroids.remove(0);
+                        }
+                        recent_centroids.push(count);
 
-                    // Strict requirement: Buffer must be full to trigger a downward adjustment.
-                    let buffer_full = recent_centroids.len() >= 5;
-                    // Use floating point math to prevent integer truncation
-                    let avg_count = (recent_centroids.iter().sum::<usize>() as f64
-                        / recent_centroids.len() as f64)
-                        .round() as usize;
+                        // Strict requirement: Buffer must be full to trigger a downward adjustment.
+                        let buffer_full = recent_centroids.len() >= 5;
+                        // Use floating point math to prevent integer truncation
+                        let avg_count = (recent_centroids.iter().sum::<usize>() as f64
+                            / recent_centroids.len() as f64)
+                            .round() as usize;
 
-                    // Only trigger a downward adjustment if the buffer is full and we exceed the ceiling (125% of target)
-                    let needs_downward = buffer_full && avg_count > target_max;
-                    // Only trigger an upward adjustment if we repeatedly fail to solve (regardless of buffer fullness)
-                    let needs_upward = consecutive_failures >= MAX_FAILURES;
+                        // Only trigger a downward adjustment if the buffer is full and we exceed the ceiling (125% of target)
+                        let needs_downward = buffer_full && avg_count > target_max;
+                        // Only trigger an upward adjustment if we repeatedly fail to solve (regardless of buffer fullness)
+                        let needs_upward = consecutive_failures >= MAX_FAILURES;
 
-                    if needs_downward || needs_upward {
-                        let safe_count = avg_count.max(1);
-                        let raw_factor = self.config.target_centroids as f64 / safe_count as f64;
+                        if needs_downward || needs_upward {
+                            let safe_count = avg_count.max(1);
+                            let raw_factor =
+                                self.config.target_centroids as f64 / safe_count as f64;
 
-                        let factor = if needs_downward {
-                            // Needs less exposure. Drop quickly (max 50% per frame)
-                            1.0 + (raw_factor - 1.0).max(-0.5) * 0.8
-                        } else if needs_upward && avg_count < target_max {
-                            // Failed to solve and we are below 150% limit. Increase exposure by a small amount (5%)
-                            1.05
-                        } else {
-                            // Star count is already very high. Don't blindly increase exposure further.
-                            1.0
-                        };
+                            let factor = if needs_downward {
+                                // Needs less exposure. Drop quickly (max 50% per frame)
+                                1.0 + (raw_factor - 1.0).max(-0.5) * 0.8
+                            } else if needs_upward && avg_count < target_max {
+                                // Failed to solve and we are below 150% limit. Increase exposure by a small amount (5%)
+                                1.05
+                            } else {
+                                // Star count is already very high. Don't blindly increase exposure further.
+                                1.0
+                            };
 
-                        let applied = self.camera.adjust_sensitivity(factor);
-                        if applied {
-                            // Flush the history so we evaluate the new exposure fresh, stopping the ratchet
-                            recent_centroids.clear();
-                            consecutive_failures = 0;
-                        } else if needs_upward {
-                            // Prevent spamming failure adjustments if we hit the hardware max limit
-                            consecutive_failures = 0;
+                            let applied = self.camera.adjust_sensitivity(factor);
+                            if applied {
+                                // Flush the history so we evaluate the new exposure fresh, stopping the ratchet
+                                recent_centroids.clear();
+                                consecutive_failures = 0;
+                            } else if needs_upward {
+                                // Prevent spamming failure adjustments if we hit the hardware max limit
+                                consecutive_failures = 0;
+                            }
                         }
                     }
                 }
