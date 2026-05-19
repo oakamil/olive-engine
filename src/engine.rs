@@ -377,6 +377,11 @@ impl Engine {
                 let width = cam_config.width as usize;
                 let height = cam_config.height as usize;
 
+                {
+                    let mut state = engine_state_ext.write().unwrap();
+                    state.exposure_us = exposure_us;
+                }
+
                 if do_capture {
                     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
                     let captures_dir = format!("{}/captures", home);
@@ -1107,6 +1112,19 @@ impl Engine {
                     warn!(
                         "Discarding frame: {} centroids (< {} min). Telescope might be moving.",
                         count, MIN_CENTROIDS
+                    );
+                    self.update_solve_stats(
+                        false,
+                        None,
+                        None,
+                        None,
+                        count,
+                        None,
+                        None,
+                        exp_time.as_micros() as i32,
+                        Duration::ZERO,
+                        extract_time,
+                        Duration::ZERO,
                     );
                     continue;
                 }
