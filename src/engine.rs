@@ -35,6 +35,7 @@ pub struct EngineConfig {
     pub crop: Option<(usize, usize)>,
     pub downsample: bool,
     pub bypass_calibration: bool,
+    pub noise_filter: bool,
 }
 
 impl Default for EngineConfig {
@@ -52,6 +53,7 @@ impl Default for EngineConfig {
             crop: None,
             downsample: true,
             bypass_calibration: false,
+            noise_filter: false,
         }
     }
 }
@@ -279,14 +281,13 @@ impl Engine {
         if let (Some(cur_ra), Some(cur_dec), Some(t_ra), Some(t_dec)) =
             (ra, dec, target_ra, target_dec)
         {
-            state.offset_ra = Some(angle_diff_deg(t_ra, cur_ra));
-            state.offset_dec = Some(t_dec - cur_dec);
+            let d_ra = angle_diff_deg(t_ra, cur_ra);
+            let d_dec = t_dec - cur_dec;
+            state.offset_ra = Some(d_ra);
+            state.offset_dec = Some(d_dec);
 
-            if let (Some(lat), Some(lon), Some(time)) = (
-                state.client_latitude,
-                state.client_longitude,
-                state.client_date,
-            ) {
+            if let (Some(lat), Some(lon)) = (state.client_latitude, state.client_longitude) {
+                let time = chrono::Utc::now();
                 let (cur_alt, cur_az) = calculate_alt_az(cur_ra, cur_dec, lat, lon, &time);
                 let (t_alt, t_az) = calculate_alt_az(t_ra, t_dec, lat, lon, &time);
 
@@ -459,7 +460,7 @@ impl Engine {
                                 sigma: 3.5,
                                 downsample,
                                 bg_sub_mode,
-                                binary_open: false,
+                                binary_open: config_ext.noise_filter,
                                 min_area: Some(2),
                                 max_area: Some(20),
                                 crop: final_crop,
@@ -534,7 +535,7 @@ impl Engine {
                                 } else {
                                     1
                                 }, // binning
-                                false, // detect_hot_pixels
+                                config_ext.noise_filter, // detect_hot_pixels
                                 false, // return_binned_image
                             );
 
@@ -585,6 +586,10 @@ impl Engine {
         std::thread::spawn(move || {
             let mut engine = self;
             loop {
+                if !engine.is_running.load(std::sync::atomic::Ordering::Relaxed) {
+                    log::info!("Main engine thread stopping.");
+                    return;
+                }
                 if engine.engine_state.read().unwrap().paused {
                     std::thread::sleep(std::time::Duration::from_millis(500));
                     continue;
@@ -625,7 +630,11 @@ impl Engine {
         self.update_status("Calibration");
 
         info!("Waiting for stream initialization...");
-        while self.wait_for_extraction().is_none() {} // this already blocks for 100ms
+        while self.wait_for_extraction().is_none() {
+            if !self.is_running.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+        }
 
         // Apply static hardware settings ONCE at startup
         let gain = self.config.gain.unwrap_or(self.camera.get_max_gain());
@@ -646,6 +655,9 @@ impl Engine {
         let mut was_connected = false;
 
         loop {
+            if !self.is_running.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
             if self.engine_state.read().unwrap().paused {
                 self.update_status("Camera Mode");
                 std::thread::sleep(std::time::Duration::from_millis(500));
@@ -715,6 +727,9 @@ impl Engine {
 
                 // Fetch frames until we verify the hardware has applied our new setting, then collect 5
                 while valid_samples < 5 {
+                    if !self.is_running.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
                     if self
                         .client_connected
                         .load(std::sync::atomic::Ordering::Relaxed)
@@ -1047,6 +1062,9 @@ impl Engine {
             // Responsive wait that checks for connections
             let wait_start = Instant::now();
             while wait_start.elapsed() < CALIBRATION_INTERVAL {
+                if !self.is_running.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
                 if self
                     .client_connected
                     .load(std::sync::atomic::Ordering::Relaxed)
@@ -1084,6 +1102,9 @@ impl Engine {
         let mut was_connected = false;
 
         loop {
+            if !self.is_running.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
             if self.engine_state.read().unwrap().paused {
                 self.update_status("Camera Mode");
                 std::thread::sleep(std::time::Duration::from_millis(500));
@@ -1141,18 +1162,21 @@ impl Engine {
                 if let Some(fov) = self.fov {
                     solve_options.fov_estimate = Some(fov);
                     solve_options.fov_max_error = Some(0.5); // Provide a reasonable constraint based on FOV
-                }
-
-                // Check for pending sync to include in the solve
+                } // Check for pending sync or slew
                 let mut pending_sync = None;
+
                 {
-                    let locked = self.shared_position.read().unwrap();
-                    if locked.target_op == Some(TargetOp::Sync)
-                        && locked.target_ra.is_some()
-                        && locked.target_dec.is_some()
-                    {
-                        pending_sync =
-                            Some((locked.target_ra.unwrap(), locked.target_dec.unwrap()));
+                    let mut locked = self.shared_position.write().unwrap();
+                    if locked.target_ra.is_some() && locked.target_dec.is_some() {
+                        let t_ra = locked.target_ra.unwrap();
+                        let t_dec = locked.target_dec.unwrap();
+                        if locked.target_op == Some(TargetOp::Sync) {
+                            pending_sync = Some((t_ra, t_dec));
+                        } else if locked.target_op == Some(TargetOp::Slew) {
+                            self.target_ra = Some(t_ra);
+                            self.target_dec = Some(t_dec);
+                            locked.target_op = None;
+                        }
                     }
                 }
 
