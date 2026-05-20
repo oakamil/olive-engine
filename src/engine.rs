@@ -711,7 +711,6 @@ impl Engine {
                 let mut total_centroids = 0;
                 let mut last_centroids_arr = None;
                 let mut valid_samples = 0;
-                let mut found_new_exposure = false;
 
                 // Fetch frames until we verify the hardware has applied our new setting, then collect 5
                 while valid_samples < 5 {
@@ -745,13 +744,9 @@ impl Engine {
                         let tolerance =
                             (self.camera.get_exposure() as f32 * 0.05).max(100.0) as i32;
 
-                        if !found_new_exposure {
-                            if (actual_exp - self.camera.get_exposure()).abs() > tolerance {
-                                // Frame is from the old exposure pipeline. Skip it without spamming the logs.
-                                continue;
-                            } else {
-                                found_new_exposure = true;
-                            }
+                        if (actual_exp - self.camera.get_exposure()).abs() > tolerance {
+                            // Frame is from the old exposure pipeline. Skip it without spamming the logs.
+                            continue;
                         }
 
                         total_centroids += count;
@@ -1326,23 +1321,22 @@ impl Engine {
                     }
                 }
 
+                let actual_exp = exp_time.as_micros() as i32;
+                // Tighter 1% tolerance prevents overlapping with our 5% adjustment steps (stops ratcheting)
+                let tolerance = (self.camera.get_exposure() as f32 * 0.01).max(500.0) as i32;
+
+                // For UVC, actual_exp will match get_exposure() immediately since it is static, passing naturally.
+                let matches_current = (actual_exp - self.camera.get_exposure()).abs() <= tolerance;
+
                 // Update our continuous failure tracker
                 if solved {
                     consecutive_failures = 0;
-                } else {
+                } else if matches_current {
                     consecutive_failures += 1;
                 }
 
                 // Continuous exposure/gain adjustment
                 if !self.config.bypass_calibration {
-                    let actual_exp = exp_time.as_micros() as i32;
-                    // Tighter 1% tolerance prevents overlapping with our 5% adjustment steps (stops ratcheting)
-                    let tolerance = (self.camera.get_exposure() as f32 * 0.01).max(500.0) as i32;
-
-                    // For UVC, actual_exp will match get_exposure() immediately since it is static, passing naturally.
-                    let matches_current =
-                        (actual_exp - self.camera.get_exposure()).abs() <= tolerance;
-
                     if matches_current {
                         if recent_centroids.len() >= 5 {
                             recent_centroids.remove(0);
