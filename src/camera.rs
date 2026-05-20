@@ -1230,24 +1230,16 @@ impl Camera {
                         .unwrap_or_else(SystemTime::now)
                 };
 
-                if exposure_time_us == target_exposure {
-                    if let Some(mapped_buffer) =
-                        latest_req.buffer::<MemoryMappedFrameBuffer<FrameBuffer>>(&stream)
-                    {
-                        Self::store_as_8bit(
-                            &store,
-                            &cam_config,
-                            &mapped_buffer.data()[0],
-                            exposure_time_us,
-                            capture_sys_time,
-                            receive_time,
-                        );
-                    }
-                } else {
-                    log::debug!(
-                        "Discarding frame with exposure {} us (requested: {} us)",
+                if let Some(mapped_buffer) =
+                    latest_req.buffer::<MemoryMappedFrameBuffer<FrameBuffer>>(&stream)
+                {
+                    Self::store_as_8bit(
+                        &store,
+                        &cam_config,
+                        &mapped_buffer.data()[0],
                         exposure_time_us,
-                        target_exposure
+                        capture_sys_time,
+                        receive_time,
                     );
                 }
 
