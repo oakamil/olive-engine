@@ -147,8 +147,8 @@ async fn main() {
     });
 
     // Initialize the engine
-    let engine = Engine::new(camera, config, client_connected, engine_state, imu);
-    engine.start();
+    let engine = Engine::new(camera, config, client_connected, engine_state, imu, None);
+    let _ = engine.start();
 
     // Trap Ctrl-C to handle graceful shutdown
     tokio::signal::ctrl_c()

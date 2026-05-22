@@ -7,6 +7,7 @@
 //    https://skymtn.com/mapug-astronomy/ragreiner/LX200Commands.html
 //
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{error::Error, f64::consts::TAU, sync::Arc, sync::OnceLock, sync::RwLock};
 
 use async_trait::async_trait;
@@ -59,7 +60,7 @@ pub enum TargetOp {
     Slew,
 }
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct SharedPosition {
     pub target_ra: Option<f64>,
     pub target_dec: Option<f64>,
@@ -69,8 +70,23 @@ pub struct SharedPosition {
     pub target_op: Option<TargetOp>,
 
     // For reporting back to the client
-    pub telescope_ra: f64,
-    pub telescope_dec: f64,
+    pub telescope_ra: AtomicU64,
+    pub telescope_dec: AtomicU64,
+}
+
+impl Default for SharedPosition {
+    fn default() -> Self {
+        SharedPosition {
+            target_ra: None,
+            target_dec: None,
+            site_date: None,
+            site_latitude: None,
+            site_longitude: None,
+            target_op: None,
+            telescope_ra: AtomicU64::new(0f64.to_bits()),
+            telescope_dec: AtomicU64::new(0f64.to_bits()),
+        }
+    }
 }
 
 #[async_trait]
@@ -95,6 +111,7 @@ impl Lx200Telescope for Lx200WifiTelescope {
             match listener.accept().await {
                 Ok((stream, _)) => {
                     debug!("WiFi LX200 connection opened");
+                    let _ = stream.set_nodelay(true);
                     let (reader, writer) = stream.into_split();
                     let controller = self.controller.clone();
                     tokio::spawn(async move {
@@ -211,18 +228,28 @@ impl Lx200Controller {
     }
 
     fn get_ra(&self) -> String {
-        let locked_position = self.shared_position.read().unwrap();
-        let (ra, _) =
-            self.convert_to_jnow(locked_position.telescope_ra, locked_position.telescope_dec);
+        let (tel_ra, tel_dec) = {
+            let locked = self.shared_position.read().unwrap();
+            (
+                f64::from_bits(locked.telescope_ra.load(Ordering::Relaxed)),
+                f64::from_bits(locked.telescope_dec.load(Ordering::Relaxed)),
+            )
+        };
+        let (ra, _) = self.convert_to_jnow(tel_ra, tel_dec);
         let (h, m, s) = Self::to_hms((ra / 15.0).rem_euclid(24.0));
         format!("{h:02}:{m:02}:{s:02}#")
     }
 
     fn get_dec(&self) -> String {
-        let locked_position = self.shared_position.read().unwrap();
+        let (tel_ra, tel_dec) = {
+            let locked = self.shared_position.read().unwrap();
+            (
+                f64::from_bits(locked.telescope_ra.load(Ordering::Relaxed)),
+                f64::from_bits(locked.telescope_dec.load(Ordering::Relaxed)),
+            )
+        };
         let dec = {
-            let (_, dec) =
-                self.convert_to_jnow(locked_position.telescope_ra, locked_position.telescope_dec);
+            let (_, dec) = self.convert_to_jnow(tel_ra, tel_dec);
             dec
         };
 
@@ -244,9 +271,7 @@ impl Lx200Controller {
         let hours = Self::parse_coordinates(&cmd[3..5], &cmd[6..8], &cmd[9..11]);
         match hours {
             Some(n) => {
-                let ra = n * 15.0;
-                debug!("Set target ra to {}", ra);
-                self.target_ra = Some(ra);
+                self.target_ra = Some(n * 15.0);
                 Self::get_success()
             }
             None => Self::get_failure(),
@@ -254,14 +279,13 @@ impl Lx200Controller {
     }
 
     fn set_target_dec(&mut self, cmd: &str) -> String {
-        if cmd.len() < 12 {
+        if cmd.len() < 11 {
             warn!("Unexpected dec length, cmd: {}", cmd);
             return Self::get_failure();
         }
         let degrees = Self::parse_coordinates(&cmd[3..6], &cmd[7..9], &cmd[10..12]);
         match degrees {
             Some(n) => {
-                debug!("Set target dec to {}", n);
                 self.target_dec = Some(n);
                 Self::get_success()
             }
@@ -508,24 +532,14 @@ impl Lx200Controller {
             buffer.clear();
 
             loop {
-                let (found, consumed) = match buf_reader.fill_buf().await {
-                    Ok(chunk) => {
-                        if chunk.is_empty() {
-                            debug!("Client closed connection");
-                            return;
-                        }
-                        match memchr(HASH, chunk) {
-                            Some(i) => {
-                                buffer.extend_from_slice(&chunk[..=i]);
-                                (true, i + 1)
-                            }
-                            None => {
-                                buffer.extend_from_slice(chunk);
-                                (false, chunk.len())
-                            }
-                        }
-                    }
-                    Err(e) => {
+                let chunk = match tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    buf_reader.fill_buf(),
+                )
+                .await
+                {
+                    Ok(Ok(c)) => c,
+                    Ok(Err(e)) => {
                         match e.kind() {
                             std::io::ErrorKind::ConnectionReset
                             | std::io::ErrorKind::BrokenPipe
@@ -538,23 +552,61 @@ impl Lx200Controller {
                         }
                         return;
                     }
+                    Err(_) => {
+                        debug!("Connection timed out waiting for data");
+                        return;
+                    }
+                };
+
+                if chunk.is_empty() {
+                    debug!("Client closed connection");
+                    return;
+                }
+
+                if buffer.is_empty() {
+                    if chunk[0] == ACK_CMD[0] {
+                        buf_reader.consume(1);
+                        debug!("Received ack command");
+                        controller.write().unwrap().is_stellarium = true;
+                        if let Err(e) = Self::process_output(&mut writer, "A".to_string()).await {
+                            warn!("Failed to send ack response: {:?}", e);
+                            return;
+                        }
+                        continue;
+                    }
+                    if chunk.len() >= 3 && &chunk[0..3] == SKY_SAFARI_INIT {
+                        buf_reader.consume(3);
+                        debug!("Received 35092$");
+                        continue;
+                    }
+                }
+
+                let (found, consumed) = match memchr(HASH, chunk) {
+                    Some(i) => {
+                        buffer.extend_from_slice(&chunk[..=i]);
+                        (true, i + 1)
+                    }
+                    None => {
+                        buffer.extend_from_slice(chunk);
+                        (false, chunk.len())
+                    }
                 };
 
                 buf_reader.consume(consumed);
                 if found {
                     break;
                 }
+
                 if buffer == ACK_CMD {
                     debug!("Received ack command");
                     buffer.clear();
                     controller.write().unwrap().is_stellarium = true;
-
                     if let Err(e) = Self::process_output(&mut writer, "A".to_string()).await {
                         warn!("Failed to send ack response: {:?}", e);
                         return;
                     }
                 } else if buffer == SKY_SAFARI_INIT {
-                    debug!("Received $$$");
+                    debug!("Received 35092$");
                     buffer.clear();
                 }
             }
@@ -731,11 +783,11 @@ mod tests {
         (controller, shared_position)
     }
 
+    // --- Utility Function Tests ---
+
     fn assert_approx_eq(x: f64, y: f64) {
         assert_abs_diff_eq!(x, y, epsilon = 0.0001);
     }
-
-    // --- Utility Function Tests ---
 
     #[test]
     fn test_extract_command() {
@@ -769,7 +821,7 @@ mod tests {
         assert_eq!(Lx200Controller::to_hms(23.99972), (23, 59, 59));
         // Floating point math is hard
         assert_eq!(Lx200Controller::to_hms(10.1), (10, 6, 0));
-        // Make sure we don't end up with 60 minutes or seconds
+        // Make sure we dont end up with 60 minutes or seconds
         assert_eq!(Lx200Controller::to_hms(23.999859), (23, 59, 59));
         // Checking 2 possible values due to floating point imprecision
         let v = Lx200Controller::to_hms(23.999861);
@@ -823,8 +875,12 @@ mod tests {
         // Set position in a block to release the lock at the end
         {
             let mut locked_position = position_arc.write().unwrap();
-            locked_position.telescope_ra = ra_j2000;
-            locked_position.telescope_dec = dec_j2000;
+            locked_position
+                .telescope_ra
+                .store(ra_j2000.to_bits(), Ordering::Relaxed);
+            locked_position
+                .telescope_dec
+                .store(dec_j2000.to_bits(), Ordering::Relaxed);
         }
 
         let result_ra = controller.process_input(b":GR#");
@@ -839,6 +895,7 @@ mod tests {
     #[tokio::test]
     async fn test_set_ra_dec_slew_abort() {
         let (mut controller, position_arc) = setup_controller().await;
+        // Set epoch to J2000 for no change
         controller.jnow_epoch = 2000.0;
 
         let set_ra = controller.process_input(b":Sr10:30:00#");
@@ -877,6 +934,7 @@ mod tests {
     #[tokio::test]
     async fn test_set_ra_dec_sync() {
         let (mut controller, position_arc) = setup_controller().await;
+        // Set epoch to J2000 for no change
         controller.jnow_epoch = 2000.0;
 
         // Even with no target we should still return canned result
@@ -889,7 +947,6 @@ mod tests {
         sync = controller.process_input(b":CM#");
         assert_eq!(sync.as_deref(), Some(" M31 EX GAL MAG 3.5 SZ178.0'#"));
 
-        // Check shared position state
         let locked_position = position_arc.read().unwrap();
         assert_approx_eq(locked_position.target_ra.unwrap(), 15.0);
         assert_approx_eq(locked_position.target_dec.unwrap(), 20.0);
@@ -954,14 +1011,14 @@ mod tests {
         assert!(controller.timezone.is_none());
         assert!(controller.time.is_none());
 
-        // Check the controller's time
+        // Check the controllers time
         let expected_dt = FixedOffset::west_opt(8 * 3600)
             .unwrap()
             .with_ymd_and_hms(2025, 11, 15, 10, 30, 0)
             .unwrap();
         assert_eq!(controller.datetime, expected_dt);
 
-        // Check the SharedPosition's time
+        // Check the SharedPositions time
         {
             let locked_position = position_arc.read().unwrap();
             assert_eq!(
@@ -987,12 +1044,11 @@ mod tests {
     #[tokio::test]
     async fn test_canned_get_commands() {
         let (mut controller, _) = setup_controller().await;
-
         // Firmware date should be something like "Nov 14 2025#"
         assert_eq!(controller.process_input(b":GVD#").unwrap().len(), 12);
         // Firmware version should be something like "01.0#"
         assert_eq!(controller.process_input(b":GVN#").unwrap().len(), 5);
-        // Model shouldn't change
+        // Model shouldnt change
         assert_eq!(
             controller.process_input(b":GVP#").as_deref(),
             Some("Lx200Server#")
@@ -1004,24 +1060,26 @@ mod tests {
         assert_eq!(controller.process_input(b":GW#").as_deref(), Some("AT1"));
     }
 
+    // --- Special Case Tests ---
+
     #[tokio::test]
     async fn test_get_distance_bars() {
         let (mut controller, position_arc) = setup_controller().await;
 
+        // Set position in a block to release the lock at the end
         {
             let mut locked_position = position_arc.write().unwrap();
             locked_position.target_op = None;
         }
         assert_eq!(controller.process_input(b":D#").as_deref(), Some("#"));
 
+        // Set position in a block to release the lock at the end
         {
             let mut locked_position = position_arc.write().unwrap();
             locked_position.target_op = Some(TargetOp::Slew);
         }
         assert_eq!(controller.process_input(b":D#").as_deref(), Some("\x7f#"));
     }
-
-    // --- Special Case Tests ---
 
     #[tokio::test]
     async fn test_handle_connection_ack() {
@@ -1039,7 +1097,6 @@ mod tests {
             controller_arc
         });
 
-        // Ack command is unterminated, should result in A for Alt-Az mode
         client_write.write_all(b"\x06").await.unwrap();
 
         let mut buf = [0; 64];
@@ -1058,6 +1115,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (mut controller, _) = setup_controller().await;
+        // Set epoch to J2000 for no change
         controller.jnow_epoch = 2000.0;
         let controller_arc = Arc::new(RwLock::new(controller));
 
@@ -1085,6 +1143,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (mut controller, _) = setup_controller().await;
+        // Set epoch to J2000 for no change
         controller.jnow_epoch = 2000.0;
         let controller_arc = Arc::new(RwLock::new(controller));
 
@@ -1126,13 +1185,19 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (mut controller, position_arc) = setup_controller().await;
+        // Set epoch to J2000 for no change
         controller.jnow_epoch = 2000.0;
         let controller_arc = Arc::new(RwLock::new(controller));
 
+        // Set position in a block to release the lock at the end
         {
             let mut locked_position = position_arc.write().unwrap();
-            locked_position.telescope_ra = 0.0;
-            locked_position.telescope_dec = 0.0;
+            locked_position
+                .telescope_ra
+                .store(0.0f64.to_bits(), Ordering::Relaxed);
+            locked_position
+                .telescope_dec
+                .store(0.0f64.to_bits(), Ordering::Relaxed);
         }
 
         let (client, server) = tokio::io::duplex(1024);
@@ -1168,10 +1233,15 @@ mod tests {
         // Use 10h RA (150 degrees) and +45d Dec
         let internal_ra = 150.0;
         let internal_dec = 45.0;
+        // Set position in a block to release the lock at the end
         {
             let mut locked_position = position_arc.write().unwrap();
-            locked_position.telescope_ra = internal_ra;
-            locked_position.telescope_dec = internal_dec;
+            locked_position
+                .telescope_ra
+                .store(internal_ra.to_bits(), Ordering::Relaxed);
+            locked_position
+                .telescope_dec
+                .store(internal_dec.to_bits(), Ordering::Relaxed);
         }
 
         // Ensure no precessing for telescope position
@@ -1188,6 +1258,7 @@ mod tests {
         let slew_res = controller.process_input(b":MS#");
         assert_eq!(slew_res.as_deref(), Some("0"));
 
+        // Check the SharedPositions time
         // Ensure no precessing for target
         {
             let locked_position = position_arc.read().unwrap();

@@ -1,6 +1,7 @@
 // Required Notice: Copyright (c) 2026 Omair Kamil
 // See LICENSE file in root directory for license terms.
 
+use std::sync::atomic::Ordering;
 use std::{
     cmp::min,
     sync::{Arc, RwLock},
@@ -36,6 +37,8 @@ pub struct EngineConfig {
     pub downsample: bool,
     pub bypass_calibration: bool,
     pub noise_filter: bool,
+    pub sigma: Option<f32>,
+    pub initial_fov: Option<f32>,
 }
 
 impl Default for EngineConfig {
@@ -54,6 +57,8 @@ impl Default for EngineConfig {
             downsample: true,
             bypass_calibration: false,
             noise_filter: false,
+            sigma: None,
+            initial_fov: None,
         }
     }
 }
@@ -140,6 +145,7 @@ impl Default for EngineStateData {
     }
 }
 
+#[allow(dead_code)]
 pub struct Engine {
     camera: Arc<dyn CameraTrait>,
     config: EngineConfig,
@@ -148,6 +154,8 @@ pub struct Engine {
     imu: Option<Arc<crate::imu::Imu>>,
 
     shared_position: Arc<std::sync::RwLock<SharedPosition>>,
+    pub telescope_server_handle: Option<tokio::task::JoinHandle<()>>,
+    pub rt_handle: Option<tokio::runtime::Handle>,
     target_ra: Option<f64>,
     target_dec: Option<f64>,
     target_pixel: Option<(f64, f64)>,
@@ -159,7 +167,6 @@ pub struct Engine {
         std::sync::Condvar,
     )>,
     pub is_running: Arc<std::sync::atomic::AtomicBool>,
-    pub telescope_server_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 fn angle_diff_deg(a: f64, b: f64) -> f64 {
@@ -208,22 +215,32 @@ impl Engine {
         client_connected: Arc<std::sync::atomic::AtomicBool>,
         engine_state: Arc<RwLock<EngineStateData>>,
         imu: Option<Arc<crate::imu::Imu>>,
+        rt_handle: Option<tokio::runtime::Handle>,
     ) -> Self {
         let solver = Tetra3::new(&config.database_path);
-        let shared_position = Arc::new(RwLock::new(SharedPosition::default()));
+        let config_fov = config.initial_fov.map(|f| f as f64);
+        let shared_position = Arc::new(std::sync::RwLock::new(SharedPosition::default()));
 
         let mut server = Lx200WifiTelescope::new(shared_position.clone());
-        let telescope_server_handle = tokio::spawn(async move {
-            if let Err(e) = server.serve_requests().await {
-                error!("Telescope server error: {}", e);
-            }
-        });
+        let telescope_server_handle = if let Some(ref h) = rt_handle {
+            h.spawn(async move {
+                if let Err(e) = server.serve_requests().await {
+                    error!("Telescope server error: {}", e);
+                }
+            })
+        } else {
+            tokio::spawn(async move {
+                if let Err(e) = server.serve_requests().await {
+                    error!("Telescope server error: {}", e);
+                }
+            })
+        };
 
         Self {
             camera,
             config,
             solver,
-            fov: None,
+            fov: config_fov,
             imu,
             shared_position,
             target_ra: None,
@@ -235,6 +252,7 @@ impl Engine {
             shared_result: Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new())),
             is_running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             telescope_server_handle: Some(telescope_server_handle),
+            rt_handle,
         }
     }
 
@@ -314,7 +332,7 @@ impl Engine {
         }
     }
 
-    pub fn start(self) {
+    pub fn start(self) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
         let camera_ext = self.camera.clone();
         let config_ext = self.config.clone();
         let shared_res_ext = self.shared_result.clone();
@@ -322,11 +340,15 @@ impl Engine {
         let is_running_ext = self.is_running.clone();
         let client_connected_ext = self.client_connected.clone();
 
-        std::thread::spawn(move || {
+        let t1 = std::thread::spawn(move || {
             let mut extractor: Option<FastExtractor> = None;
             let mut last_processed_timestamp = None;
 
             loop {
+                if !is_running_ext.load(std::sync::atomic::Ordering::Relaxed) {
+                    log::info!("Engine thread stopping.");
+                    break;
+                }
                 if engine_state_ext.read().unwrap().paused {
                     {
                         let mut state = engine_state_ext.write().unwrap();
@@ -334,10 +356,6 @@ impl Engine {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(500));
                     continue;
-                }
-                if !is_running_ext.load(std::sync::atomic::Ordering::Relaxed) {
-                    log::info!("Engine loop stopping due to is_running flag.");
-                    break;
                 }
 
                 let img_opt = camera_ext.wait_for_next_capture(
@@ -522,8 +540,8 @@ impl Engine {
                             let (stars, _, _, _) = cedar_detect::algorithm::get_stars_from_image(
                                 &gray_img,
                                 noise_estimate,
-                                8.0,  // sigma
-                                true, // normalize_rows
+                                config_ext.sigma.unwrap_or(8.0) as f64, // sigma
+                                true,                                   // normalize_rows
                                 if config_ext.downsample {
                                     if crop_w * crop_h > 2_000_000 {
                                         4
@@ -535,8 +553,8 @@ impl Engine {
                                 } else {
                                     1
                                 }, // binning
-                                config_ext.noise_filter, // detect_hot_pixels
-                                false, // return_binned_image
+                                config_ext.noise_filter,                // detect_hot_pixels
+                                false,                                  // return_binned_image
                             );
 
                             num_centroids = stars.len();
@@ -583,7 +601,7 @@ impl Engine {
             }
         });
 
-        std::thread::spawn(move || {
+        let t2 = std::thread::spawn(move || {
             let mut engine = self;
             loop {
                 if !engine.is_running.load(std::sync::atomic::Ordering::Relaxed) {
@@ -598,6 +616,7 @@ impl Engine {
                 engine.run_solving_loop();
             }
         });
+        (t1, t2)
     }
 
     fn wait_for_extraction(
@@ -723,9 +742,14 @@ impl Engine {
                 let mut total_centroids = 0;
                 let mut last_centroids_arr = None;
                 let mut valid_samples = 0;
+                let required_samples = if self.camera.get_exposure() < 500_000 {
+                    3
+                } else {
+                    1
+                };
 
-                // Fetch frames until we verify the hardware has applied our new setting, then collect 5
-                while valid_samples < 5 {
+                // Fetch frames until we verify the hardware has applied our new setting
+                while valid_samples < required_samples {
                     if !self.is_running.load(std::sync::atomic::Ordering::Relaxed) {
                         return;
                     }
@@ -1060,6 +1084,9 @@ impl Engine {
                 if !self.is_running.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
                 }
+                if !self.is_running.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
                 if self
                     .client_connected
                     .load(std::sync::atomic::Ordering::Relaxed)
@@ -1251,8 +1278,8 @@ impl Engine {
                         }
                         solved = true;
 
-                        locked.telescope_ra = ra;
-                        locked.telescope_dec = dec;
+                        locked.telescope_ra.store(ra.to_bits(), Ordering::Relaxed);
+                        locked.telescope_dec.store(dec.to_bits(), Ordering::Relaxed);
                         let engine_state = self.engine_state.read().unwrap();
                         let lat_opt = engine_state.client_latitude.or(locked.site_latitude);
                         let lon_opt = engine_state.client_longitude.or(locked.site_longitude);
@@ -1319,8 +1346,8 @@ impl Engine {
                                     est_roll = Some(eq_roll);
 
                                     let mut locked = self.shared_position.write().unwrap();
-                                    locked.telescope_ra = ra;
-                                    locked.telescope_dec = dec;
+                                    locked.telescope_ra.store(ra.to_bits(), Ordering::Relaxed);
+                                    locked.telescope_dec.store(dec.to_bits(), Ordering::Relaxed);
                                 }
                             }
                         }
@@ -1716,5 +1743,13 @@ mod tests {
         // Web converter reports Slit Alignment Position Angle: +96.77
         let position_angle: f64 = east_mid.atan2(north_mid).to_degrees();
         assert!((position_angle - 96.77).abs() < 0.01);
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        if let Some(handle) = self.telescope_server_handle.take() {
+            handle.abort();
+        }
     }
 }

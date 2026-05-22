@@ -112,6 +112,10 @@ impl CameraTrait for Camera {
 
         Ok(())
     }
+    fn stop_capture(&self) {
+        self.send_command(CaptureCommand::StopCaptureThread);
+        self.store.cvar.notify_all();
+    }
 
     // --- Configuration Getters & Setters ---
 
@@ -226,6 +230,13 @@ impl Camera {
         target_res: Option<(u32, u32)>,
         fd: Option<i32>,
     ) -> Self {
+        log::info!(
+            "Initializing UvcCamera with_fd: target_fps={}, mjpeg={}, fd={:?}",
+            target_fps,
+            mjpeg_enabled,
+            fd
+        );
+
         let store = Arc::new(CaptureStore {
             image: Mutex::new(None),
             cvar: Condvar::new(),
@@ -479,6 +490,7 @@ impl Camera {
         }
 
         // Turn off auto-exposure and auto-white-balance
+        // Turn off auto-exposure and auto-white-balance
         match devh.set_ae_mode(AutoExposureMode::Manual) {
             Err(_) => {
                 // Fall back to ShutterPriority if supported
@@ -501,7 +513,9 @@ impl Camera {
         current_exposure_atomic.store((1_000_000 / stream_format.fps) as i32, Ordering::Relaxed);
 
         let _ = devh.set_gain(initial_gain as u16);
-        let _ = devh.set_exposure_abs(10000 / stream_format.fps);
+        if let Err(e) = devh.set_exposure_abs(10000 / stream_format.fps) {
+            log::warn!("Failed to set initial UVC exposure: {:?}", e);
+        }
 
         {
             let mut lock = config_store.lock().unwrap();
@@ -511,25 +525,25 @@ impl Camera {
                 height: stream_format.height,
                 fps: stream_format.fps,
                 crop: None,
+                initial_fov: None,
             });
         }
 
-        let discard_frames = Arc::new(AtomicU32::new(stream_format.fps / 2));
-        let discard_frames_clone = Arc::clone(&discard_frames);
         let store_clone = Arc::clone(&store);
 
-        log::info!("Starting UVC stream...");
-        let _stream = streamh
+        let _stream_handle = streamh
             .start_stream(
                 move |frame, _| {
-                    if discard_frames_clone
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
-                            if x > 0 { Some(x - 1) } else { None }
-                        })
-                        .is_ok()
-                    {
-                        return;
-                    }
+                    log::info!(
+                        "UVC callback fired! format={:?}, len={}",
+                        frame.format(),
+                        frame.to_bytes().len()
+                    );
+                    log::info!(
+                        "Callback fired! Format={:?}, len={}",
+                        frame.format(),
+                        frame.to_bytes().len()
+                    );
 
                     let receive_time = std::time::Instant::now();
                     let timestamp = SystemTime::now();
@@ -548,7 +562,10 @@ impl Camera {
                     if frame.format() == FrameFormat::MJPEG {
                         let mut decompressor = match turbojpeg::Decompressor::new() {
                             Ok(d) => d,
-                            Err(_) => return,
+                            Err(e) => {
+                                log::error!("Failed to create turbojpeg decompressor: {:?}", e);
+                                return;
+                            }
                         };
                         let header = match decompressor.read_header(data) {
                             Ok(h) => h,
@@ -589,7 +606,9 @@ impl Camera {
                     }
 
                     let post_process_time = receive_time.elapsed();
+                    log::info!("UVC locking image store");
                     let mut lock = store_clone.image.lock().unwrap();
+                    log::info!("UVC frame processed! {}x{}", width, height);
                     *lock = Some(Arc::new(Image {
                         data: image_data,
                         width: width as u32,
@@ -598,6 +617,7 @@ impl Camera {
                         exposure_time_us: current_exposure_atomic.load(Ordering::Relaxed),
                         post_process_time,
                     }));
+                    log::info!("UVC notifying cvar");
                     store_clone.cvar.notify_all();
                 },
                 (),
@@ -605,18 +625,20 @@ impl Camera {
             .expect("Failed to start stream");
         log::info!("UVC stream started successfully");
 
+        // Keep stream_handle alive for the duration of the loop
+
         loop {
             // Handle commands
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(CaptureCommand::StopCaptureThread) => break,
                 Ok(CaptureCommand::SetGain(gain)) => {
                     let _ = devh.set_gain(gain as u16);
-                    let _ = discard_frames.fetch_add(10, Ordering::Relaxed);
+
                     *store.image.lock().unwrap() = None;
                 }
                 Ok(CaptureCommand::SetExposure(exposure)) => {
                     let _ = devh.set_exposure_abs((exposure / 100) as u32);
-                    let _ = discard_frames.fetch_add(5, Ordering::Relaxed);
+
                     *store.image.lock().unwrap() = None;
                 }
                 Ok(CaptureCommand::SetUvcControls(controls)) => {
@@ -671,15 +693,15 @@ impl Camera {
                     if let Some(val) = controls.exposure_abs {
                         let _ = devh.set_exposure_abs(val);
                     } else {
-                        let _ = devh.set_exposure_abs(10000 / stream_format.fps);
                     }
-                    discard_frames.store(stream_format.fps, Ordering::Relaxed);
+
                     *store.image.lock().unwrap() = None;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
+        log::info!("UVC capture loop exiting cleanly...");
     }
 }
 

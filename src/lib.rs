@@ -35,6 +35,7 @@ pub struct CameraConfig {
     pub height: u32,
     pub fps: u32,
     pub crop: Option<(u32, u32)>,
+    pub initial_fov: Option<f32>,
 }
 
 pub trait CameraTrait: Send + Sync {

@@ -88,8 +88,15 @@ fn start_engine(
             .await;
     });
 
-    let engine = Engine::new(camera, config, client_connected, engine_state.clone(), None);
-    engine.start();
+    let engine = Engine::new(
+        camera,
+        config,
+        client_connected,
+        engine_state.clone(),
+        None,
+        None,
+    );
+    let _ = engine.start();
 
     loop {
         py.check_signals()?;
