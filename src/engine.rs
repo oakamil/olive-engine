@@ -343,19 +343,26 @@ impl Engine {
         let t1 = std::thread::spawn(move || {
             let mut extractor: Option<FastExtractor> = None;
             let mut last_processed_timestamp = None;
+            let mut hfr_history: std::collections::VecDeque<(std::time::SystemTime, f64)> =
+                std::collections::VecDeque::new();
 
             loop {
                 if !is_running_ext.load(std::sync::atomic::Ordering::Relaxed) {
                     log::info!("Engine thread stopping.");
                     break;
                 }
-                if engine_state_ext.read().unwrap().paused {
+                {
+                    let mut needs_update = false;
                     {
+                        let state = engine_state_ext.read().unwrap();
+                        if state.paused && state.status != "Camera Mode" {
+                            needs_update = true;
+                        }
+                    }
+                    if needs_update {
                         let mut state = engine_state_ext.write().unwrap();
                         state.status = "Camera Mode".to_string();
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                    continue;
                 }
 
                 let img_opt = camera_ext.wait_for_next_capture(
@@ -574,15 +581,44 @@ impl Engine {
 
                 // Calculate focus metric only when camera mode is active (manual focus).
                 // This prevents wasting CPU cycles during active plate solving.
-                let hfr = if client_connected_ext.load(std::sync::atomic::Ordering::Relaxed) {
+                let is_paused = engine_state_ext.read().unwrap().paused;
+                let mut hfr = if client_connected_ext.load(std::sync::atomic::Ordering::Relaxed)
+                    || is_paused
+                {
                     calculate_hfr(&img_data, width, height, &centroids_arr, 30)
                 } else {
                     0.0
                 };
 
+                // Rolling average over 1 second
+                if hfr > 0.0 {
+                    let now = std::time::SystemTime::now();
+                    hfr_history.push_back((now, hfr));
+                    // remove old elements
+                    while let Some(&(t, _)) = hfr_history.front() {
+                        if now
+                            .duration_since(t)
+                            .unwrap_or(std::time::Duration::ZERO)
+                            .as_millis()
+                            > 1000
+                        {
+                            hfr_history.pop_front();
+                        } else {
+                            break;
+                        }
+                    }
+                    if !hfr_history.is_empty() {
+                        let sum: f64 = hfr_history.iter().map(|&(_, v)| v).sum();
+                        hfr = sum / hfr_history.len() as f64;
+                    }
+                } else {
+                    hfr_history.clear();
+                }
+
                 {
                     let mut state = engine_state_ext.write().unwrap();
                     state.hfr = hfr;
+                    state.centroids = num_centroids;
                 }
 
                 let intermediate = IntermediateResult {
@@ -1345,7 +1381,7 @@ impl Engine {
                                     est_dec = Some(dec);
                                     est_roll = Some(eq_roll);
 
-                                    let mut locked = self.shared_position.write().unwrap();
+                                    let locked = self.shared_position.write().unwrap();
                                     locked.telescope_ra.store(ra.to_bits(), Ordering::Relaxed);
                                     locked.telescope_dec.store(dec.to_bits(), Ordering::Relaxed);
                                 }

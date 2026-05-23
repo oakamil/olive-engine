@@ -5,7 +5,7 @@ use crate::{CameraConfig, CameraTrait, Image};
 use log::{info, warn};
 use std::sync::{
     Arc, Condvar, Mutex,
-    atomic::{AtomicI32, AtomicU32, Ordering},
+    atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering},
     mpsc,
 };
 use std::thread::{self, JoinHandle};
@@ -62,6 +62,8 @@ pub struct Camera {
     current_gain: Arc<AtomicU32>, // f32 stored as u32 bits for atomic operations
     current_exposure: Arc<AtomicI32>,
     saved_gain: Arc<AtomicU32>,
+    stack_count_config: Arc<AtomicUsize>,
+    allow_stacking: bool,
 
     config: Arc<Mutex<Option<CameraConfig>>>,
     pub ranges: Arc<Mutex<Option<UvcRanges>>>,
@@ -90,6 +92,7 @@ impl CameraTrait for Camera {
         let ranges_clone = Arc::clone(&self.ranges);
         let current_gain = Arc::clone(&self.current_gain);
         let current_exposure = Arc::clone(&self.current_exposure);
+        let stack_count_config = Arc::clone(&self.stack_count_config);
         let target_fps = self.target_fps;
         let mjpeg_enabled = self.mjpeg_enabled;
         let target_res = self.target_res;
@@ -107,6 +110,7 @@ impl CameraTrait for Camera {
                 mjpeg_enabled,
                 target_res,
                 fd,
+                stack_count_config,
             );
         }));
 
@@ -166,7 +170,6 @@ impl CameraTrait for Camera {
     fn disable_hcg(&self) {}
 
     fn get_last_capture(&self) -> Option<Arc<Image>> {
-        log::info!("get_last_capture called");
         let lock = self.store.image.lock().unwrap();
         lock.clone()
     }
@@ -201,10 +204,28 @@ impl CameraTrait for Camera {
         }
     }
 
-    fn adjust_sensitivity(&self, _factor: f64) -> bool {
-        // Exposure can't be easily adjusted. In the future we can select a slower frame rate
-        // if supported, if we need to increase sensitivity.
-        return false;
+    fn adjust_sensitivity(&self, factor: f64) -> bool {
+        if !self.allow_stacking {
+            return false;
+        }
+        let current = self.stack_count_config.load(Ordering::Relaxed);
+        let new_count = if factor > 1.0 {
+            (current + 1).min(5)
+        } else if factor < 1.0 {
+            (current.saturating_sub(1)).max(1)
+        } else {
+            current
+        };
+        if new_count != current {
+            log::info!(
+                "Adjusting sensitivity via stacking. Stack count changed from {} to {}",
+                current,
+                new_count
+            );
+            self.stack_count_config.store(new_count, Ordering::Relaxed);
+            return true;
+        }
+        false
     }
 
     fn save_state(&self) {
@@ -220,8 +241,13 @@ impl CameraTrait for Camera {
 
 impl Camera {
     /// Instantiates the camera module and sets initial cached state.
-    pub fn new(target_fps: u32, mjpeg_enabled: bool, target_res: Option<(u32, u32)>) -> Self {
-        Self::with_fd(target_fps, mjpeg_enabled, target_res, None)
+    pub fn new(
+        target_fps: u32,
+        mjpeg_enabled: bool,
+        target_res: Option<(u32, u32)>,
+        allow_stacking: bool,
+    ) -> Self {
+        Self::with_fd(target_fps, mjpeg_enabled, target_res, None, allow_stacking)
     }
 
     pub fn with_fd(
@@ -229,12 +255,14 @@ impl Camera {
         mjpeg_enabled: bool,
         target_res: Option<(u32, u32)>,
         fd: Option<i32>,
+        allow_stacking: bool,
     ) -> Self {
         log::info!(
-            "Initializing UvcCamera with_fd: target_fps={}, mjpeg={}, fd={:?}",
+            "Initializing UvcCamera with_fd: target_fps={}, mjpeg={}, fd={:?}, allow_stacking={}",
             target_fps,
             mjpeg_enabled,
-            fd
+            fd,
+            allow_stacking
         );
 
         let store = Arc::new(CaptureStore {
@@ -253,6 +281,8 @@ impl Camera {
             current_gain: Arc::new(AtomicU32::new(0.0f32.to_bits())),
             current_exposure,
             saved_gain: Arc::new(AtomicU32::new(0.0f32.to_bits())),
+            stack_count_config: Arc::new(AtomicUsize::new(1)),
+            allow_stacking,
             config,
             ranges,
             target_fps,
@@ -283,6 +313,7 @@ impl Camera {
         mjpeg_enabled: bool,
         target_res: Option<(u32, u32)>,
         fd: Option<i32>,
+        stack_count_config: Arc<AtomicUsize>,
     ) {
         let ctx = uvc::Context::new().expect("Failed to create UVC context");
 
@@ -530,10 +561,21 @@ impl Camera {
         }
 
         let store_clone = Arc::clone(&store);
+        let stack_count_config_clone = Arc::clone(&stack_count_config);
+
+        struct StreamContext {
+            stacked_count: usize,
+            accumulator: Vec<u8>,
+        }
+
+        let stream_context = StreamContext {
+            stacked_count: 0,
+            accumulator: Vec::new(),
+        };
 
         let _stream_handle = streamh
             .start_stream(
-                move |frame, _| {
+                move |frame, ctx: &mut StreamContext| {
                     log::info!(
                         "UVC callback fired! format={:?}, len={}",
                         frame.format(),
@@ -558,7 +600,10 @@ impl Camera {
                         frame.format()
                     );
 
-                    let mut image_data;
+                    let mut image_data = Vec::new();
+                    let mut direct_accumulate = false;
+                    let target_stack = stack_count_config_clone.load(Ordering::Relaxed);
+
                     if frame.format() == FrameFormat::MJPEG {
                         let mut decompressor = match turbojpeg::Decompressor::new() {
                             Ok(d) => d,
@@ -591,36 +636,77 @@ impl Camera {
                     } else {
                         // Highly optimized loop for 8-bit mono extraction (Y from YUYV)
                         // YUYV sequence: Y0, U0, Y1, V0... (2 bytes per pixel, even bytes are Y)
-                        image_data = Vec::with_capacity(width * height);
-                        unsafe {
-                            image_data.set_len(width * height);
-                            let mut j = 0;
-                            // Manual loop unrolling or just a tight loop
-                            for i in (0..data.len()).step_by(2) {
-                                if j < width * height {
-                                    *image_data.get_unchecked_mut(j) = *data.get_unchecked(i);
-                                    j += 1;
+                        if target_stack > 1
+                            && ctx.stacked_count > 0
+                            && ctx.accumulator.len() == width * height
+                        {
+                            direct_accumulate = true;
+                            unsafe {
+                                let mut j = 0;
+                                for i in (0..data.len()).step_by(2) {
+                                    if j < width * height {
+                                        let a = ctx.accumulator.get_unchecked_mut(j);
+                                        *a = a.saturating_add(*data.get_unchecked(i));
+                                        j += 1;
+                                    }
+                                }
+                            }
+                        } else {
+                            image_data = Vec::with_capacity(width * height);
+                            unsafe {
+                                image_data.set_len(width * height);
+                                let mut j = 0;
+                                // Manual loop unrolling or just a tight loop
+                                for i in (0..data.len()).step_by(2) {
+                                    if j < width * height {
+                                        *image_data.get_unchecked_mut(j) = *data.get_unchecked(i);
+                                        j += 1;
+                                    }
                                 }
                             }
                         }
                     }
 
-                    let post_process_time = receive_time.elapsed();
-                    log::info!("UVC locking image store");
-                    let mut lock = store_clone.image.lock().unwrap();
-                    log::info!("UVC frame processed! {}x{}", width, height);
-                    *lock = Some(Arc::new(Image {
-                        data: image_data,
-                        width: width as u32,
-                        height: height as u32,
-                        timestamp,
-                        exposure_time_us: current_exposure_atomic.load(Ordering::Relaxed),
-                        post_process_time,
-                    }));
-                    log::info!("UVC notifying cvar");
-                    store_clone.cvar.notify_all();
+                    let mut is_ready = false;
+
+                    if target_stack <= 1 {
+                        ctx.accumulator = image_data;
+                        is_ready = true;
+                        ctx.stacked_count = 0;
+                    } else {
+                        if !direct_accumulate {
+                            if ctx.stacked_count == 0 || ctx.accumulator.len() != width * height {
+                                ctx.accumulator = image_data;
+                            } else {
+                                for (a, b) in ctx.accumulator.iter_mut().zip(image_data.iter()) {
+                                    *a = a.saturating_add(*b);
+                                }
+                            }
+                        }
+                        ctx.stacked_count += 1;
+                        if ctx.stacked_count >= target_stack {
+                            is_ready = true;
+                            ctx.stacked_count = 0;
+                        }
+                    }
+
+                    if is_ready {
+                        let final_data = ctx.accumulator.clone();
+                        let post_process_time = receive_time.elapsed();
+                        let mut lock = store_clone.image.lock().unwrap();
+                        *lock = Some(Arc::new(Image {
+                            data: final_data,
+                            width: width as u32,
+                            height: height as u32,
+                            timestamp,
+                            exposure_time_us: current_exposure_atomic.load(Ordering::Relaxed)
+                                * (target_stack.max(1) as i32),
+                            post_process_time,
+                        }));
+                        store_clone.cvar.notify_all();
+                    }
                 },
-                (),
+                stream_context,
             )
             .expect("Failed to start stream");
         log::info!("UVC stream started successfully");
