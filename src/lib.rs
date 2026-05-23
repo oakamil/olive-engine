@@ -52,6 +52,10 @@ pub trait CameraTrait: Send + Sync {
     fn disable_hcg(&self);
     fn set_focus(&self, _distance: f32) {}
     fn set_noise_reduction(&self, _mode: u8) {}
+    fn get_brightness_range(&self) -> Option<(i32, i32, i32)> {
+        None
+    }
+    fn set_brightness(&self, _brightness: i32) {}
     fn wait_for_next_capture(
         &self,
         last_timestamp: Option<SystemTime>,

@@ -61,6 +61,7 @@ pub struct Camera {
     // Cached atomic values for lock-free getter access
     current_gain: Arc<AtomicU32>, // f32 stored as u32 bits for atomic operations
     current_exposure: Arc<AtomicI32>,
+    current_brightness: Arc<AtomicI32>,
     saved_gain: Arc<AtomicU32>,
     stack_count_config: Arc<AtomicUsize>,
     allow_stacking: bool,
@@ -92,6 +93,7 @@ impl CameraTrait for Camera {
         let ranges_clone = Arc::clone(&self.ranges);
         let current_gain = Arc::clone(&self.current_gain);
         let current_exposure = Arc::clone(&self.current_exposure);
+        let current_brightness = Arc::clone(&self.current_brightness);
         let stack_count_config = Arc::clone(&self.stack_count_config);
         let target_fps = self.target_fps;
         let mjpeg_enabled = self.mjpeg_enabled;
@@ -106,6 +108,7 @@ impl CameraTrait for Camera {
                 ranges_clone,
                 current_gain,
                 current_exposure,
+                current_brightness,
                 target_fps,
                 mjpeg_enabled,
                 target_res,
@@ -173,6 +176,27 @@ impl CameraTrait for Camera {
     fn get_last_capture(&self) -> Option<Arc<Image>> {
         let lock = self.store.image.lock().unwrap();
         lock.clone()
+    }
+
+    fn get_brightness_range(&self) -> Option<(i32, i32, i32)> {
+        let ranges = self.ranges.lock().unwrap();
+        if let Some(r) = ranges.as_ref() {
+            if let Some(b) = r.brightness {
+                return Some((
+                    b.min,
+                    b.max,
+                    self.current_brightness.load(Ordering::Relaxed),
+                ));
+            }
+        }
+        None
+    }
+
+    fn set_brightness(&self, brightness: i32) {
+        let mut controls = UvcControls::default();
+        controls.brightness = Some(brightness);
+        self.send_command(CaptureCommand::SetUvcControls(controls));
+        self.current_brightness.store(brightness, Ordering::Relaxed);
     }
 
     fn wait_for_next_capture(
@@ -271,7 +295,7 @@ impl Camera {
             cvar: Condvar::new(),
         });
 
-        let current_exposure = Arc::new(AtomicI32::new(50000));
+        let current_exposure = Arc::new(AtomicI32::new(16670));
         let config = Arc::new(Mutex::new(None));
         let ranges = Arc::new(Mutex::new(None));
 
@@ -279,9 +303,10 @@ impl Camera {
             command_tx: None,
             store,
             capture_thread: None,
-            current_gain: Arc::new(AtomicU32::new(0.0f32.to_bits())),
+            current_gain: Arc::new(AtomicU32::new(1f32.to_bits())),
             current_exposure,
-            saved_gain: Arc::new(AtomicU32::new(0.0f32.to_bits())),
+            current_brightness: Arc::new(AtomicI32::new(0)),
+            saved_gain: Arc::new(AtomicU32::new(1f32.to_bits())),
             stack_count_config: Arc::new(AtomicUsize::new(1)),
             allow_stacking,
             config,
@@ -310,6 +335,7 @@ impl Camera {
         ranges_store: Arc<Mutex<Option<UvcRanges>>>,
         current_gain_atomic: Arc<AtomicU32>,
         current_exposure_atomic: Arc<AtomicI32>,
+        current_brightness_atomic: Arc<AtomicI32>,
         target_fps: u32,
         mjpeg_enabled: bool,
         target_res: Option<(u32, u32)>,
@@ -460,6 +486,13 @@ impl Camera {
         macro_rules! get_range {
             ($getter:ident, $range_getter:ident, $field:ident) => {
                 if let Ok(range) = devh.$range_getter() {
+                    info!(
+                        "UVC Range for {}: min={}, max={}, default={}",
+                        stringify!($field),
+                        range.min,
+                        range.max,
+                        range.default
+                    );
                     uvc_ranges.$field = Some(uvc::Range {
                         min: range.min as i32,
                         max: range.max as i32,
@@ -510,7 +543,9 @@ impl Camera {
             let _ = devh.set_sharpness(range.default.try_into().unwrap());
         }
         if let Some(range) = uvc_ranges.brightness {
-            let _ = devh.set_brightness(range.default.try_into().unwrap());
+            let def: i16 = range.default.try_into().unwrap();
+            let _ = devh.set_brightness(def);
+            current_brightness_atomic.store(range.default, Ordering::Relaxed);
         }
         if let Some(range) = uvc_ranges.gamma {
             let _ = devh.set_gamma(range.default.try_into().unwrap());
