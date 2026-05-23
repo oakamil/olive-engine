@@ -158,6 +158,7 @@ impl CameraTrait for Camera {
 
     fn get_exposure(&self) -> i32 {
         self.current_exposure.load(Ordering::Relaxed)
+            * (self.stack_count_config.load(Ordering::Relaxed).max(1) as i32)
     }
 
     fn set_exposure(&self, exposure_us: i32) {
