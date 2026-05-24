@@ -130,29 +130,18 @@ impl CameraTrait for Camera {
         f32::from_bits(self.current_gain.load(Ordering::Relaxed))
     }
 
-    fn get_min_gain(&self) -> f32 {
-        self.ranges
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|r| r.gain.as_ref())
-            .map(|g| g.min as f32)
-            .unwrap_or(0.0)
-    }
-
-    fn get_max_gain(&self) -> f32 {
-        self.ranges
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|r| r.gain.as_ref())
-            .map(|g| g.max as f32)
-            .unwrap_or(100.0)
+    fn get_gain_range(&self) -> (f32, f32) {
+        let lock = self.ranges.lock().unwrap();
+        if let Some(r) = lock.as_ref() {
+            if let Some(g) = r.gain.as_ref() {
+                return (g.min as f32, g.max as f32);
+            }
+        }
+        (0.0, 100.0)
     }
 
     fn set_gain(&self, gain: f32) {
-        let min = self.get_min_gain();
-        let max = self.get_max_gain();
+        let (min, max) = self.get_gain_range();
         let clamped_gain = gain.clamp(min, max).round();
         self.current_gain
             .store(clamped_gain.to_bits(), Ordering::Relaxed);

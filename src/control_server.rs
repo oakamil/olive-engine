@@ -290,12 +290,13 @@ async fn index() -> Html<&'static str> {
 
 async fn get_controls(State(state): State<Arc<ServerState>>) -> Json<ControlsData> {
     let camera = &state.camera;
+    let gain_range = camera.get_gain_range();
     Json(ControlsData {
         gain: camera.get_gain(),
         exposure_ms: camera.get_exposure() as f32 / 1000.0,
         hcg: state.hcg_enabled.load(Ordering::Relaxed),
-        min_gain: camera.get_min_gain(),
-        max_gain: camera.get_max_gain(),
+        min_gain: gain_range.0,
+        max_gain: gain_range.1,
     })
 }
 
@@ -341,7 +342,7 @@ async fn stream_handler(State(state): State<Arc<ServerState>>) -> impl IntoRespo
         // Setup: mark connected and set to min bounds
         state_clone.client_connected.store(true, Ordering::SeqCst);
         let camera = &state_clone.camera;
-        camera.set_gain(camera.get_min_gain());
+        camera.set_gain(camera.get_gain_range().0);
         camera.set_exposure(16670); // Default to a low exposure for responsive UI
         camera.disable_hcg();
         state_clone.hcg_enabled.store(false, Ordering::Relaxed);

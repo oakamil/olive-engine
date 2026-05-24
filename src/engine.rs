@@ -692,7 +692,7 @@ impl Engine {
         }
 
         // Apply static hardware settings ONCE at startup
-        let gain = self.config.gain.unwrap_or(self.camera.get_max_gain());
+        let gain = self.config.gain.unwrap_or(self.camera.get_gain_range().1);
         info!("Setting base hardware settings...");
         self.camera.set_gain(gain);
         self.camera.enable_hcg();
@@ -1185,6 +1185,27 @@ impl Engine {
             if let Some((count, exp_time, pp_time, extract_time, centroids_arr, img_timestamp)) =
                 self.wait_for_extraction()
             {
+                let mut pending_sync = None;
+                {
+                    let mut locked = self.shared_position.write().unwrap();
+                    if locked.target_op == Some(TargetOp::Abort) {
+                        self.target_ra = None;
+                        self.target_dec = None;
+                        self.target_pixel = None;
+                        locked.target_op = None;
+                    } else if locked.target_ra.is_some() && locked.target_dec.is_some() {
+                        let t_ra = locked.target_ra.unwrap();
+                        let t_dec = locked.target_dec.unwrap();
+                        if locked.target_op == Some(TargetOp::Sync) {
+                            pending_sync = Some((t_ra, t_dec));
+                        } else if locked.target_op == Some(TargetOp::Slew) {
+                            self.target_ra = Some(t_ra);
+                            self.target_dec = Some(t_dec);
+                            locked.target_op = None;
+                        }
+                    }
+                }
+
                 if count < MIN_CENTROIDS {
                     // Frame discarded completely. Not added to buffer, does not count as a failure.
                     // Prevents telescope smearing movement from spiking exposure.
@@ -1198,8 +1219,8 @@ impl Engine {
                         None,
                         None,
                         count,
-                        None,
-                        None,
+                        self.target_ra,
+                        self.target_dec,
                         exp_time.as_micros() as i32,
                         Duration::ZERO,
                         extract_time,
@@ -1220,23 +1241,8 @@ impl Engine {
                 if let Some(fov) = self.fov {
                     solve_options.fov_estimate = Some(fov);
                     solve_options.fov_max_error = Some(0.5); // Provide a reasonable constraint based on FOV
-                } // Check for pending sync or slew
-                let mut pending_sync = None;
-
-                {
-                    let mut locked = self.shared_position.write().unwrap();
-                    if locked.target_ra.is_some() && locked.target_dec.is_some() {
-                        let t_ra = locked.target_ra.unwrap();
-                        let t_dec = locked.target_dec.unwrap();
-                        if locked.target_op == Some(TargetOp::Sync) {
-                            pending_sync = Some((t_ra, t_dec));
-                        } else if locked.target_op == Some(TargetOp::Slew) {
-                            self.target_ra = Some(t_ra);
-                            self.target_dec = Some(t_dec);
-                            locked.target_op = None;
-                        }
-                    }
                 }
+                // Check for pending sync or slew already processed above
 
                 if let Some(tp) = self.target_pixel {
                     solve_options.target_pixel =

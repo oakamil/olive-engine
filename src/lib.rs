@@ -43,8 +43,7 @@ pub trait CameraTrait: Send + Sync {
     fn start_capture(&mut self) -> Result<(), String>;
     fn stop_capture(&self) {}
     fn get_gain(&self) -> f32;
-    fn get_min_gain(&self) -> f32;
-    fn get_max_gain(&self) -> f32;
+    fn get_gain_range(&self) -> (f32, f32);
     fn set_gain(&self, gain: f32);
     fn get_exposure(&self) -> i32;
     fn set_exposure(&self, exposure_us: i32);

@@ -58,6 +58,7 @@ fn precess_coordinates(ra: f64, dec: f64, epoch_from_j: f64, epoch_to_j: f64) ->
 pub enum TargetOp {
     Sync,
     Slew,
+    Abort,
 }
 
 #[derive(Debug)]
@@ -321,7 +322,7 @@ impl Lx200Controller {
 
     fn abort(&mut self) {
         let mut locked = self.shared_position.write().unwrap();
-        locked.target_op = None;
+        locked.target_op = Some(TargetOp::Abort);
         debug!("Stopping slew");
     }
 
