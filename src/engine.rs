@@ -220,8 +220,9 @@ impl Engine {
         let solver = Tetra3::new(&config.database_path);
         let config_fov = config.initial_fov.map(|f| f as f64);
         let shared_position = Arc::new(std::sync::RwLock::new(SharedPosition::default()));
+        let is_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
-        let mut server = Lx200WifiTelescope::new(shared_position.clone());
+        let mut server = Lx200WifiTelescope::new(shared_position.clone(), is_running.clone());
         let telescope_server_handle = if let Some(ref h) = rt_handle {
             h.spawn(async move {
                 if let Err(e) = server.serve_requests().await {
@@ -250,7 +251,7 @@ impl Engine {
             engine_state,
             solve_timestamps: std::collections::VecDeque::new(),
             shared_result: Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new())),
-            is_running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            is_running,
             telescope_server_handle: Some(telescope_server_handle),
             rt_handle,
         }

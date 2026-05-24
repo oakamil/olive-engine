@@ -97,6 +97,7 @@ pub trait Lx200Telescope {
 
 pub struct Lx200WifiTelescope {
     controller: Arc<RwLock<Lx200Controller>>,
+    is_running: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[async_trait]
@@ -115,8 +116,10 @@ impl Lx200Telescope for Lx200WifiTelescope {
                     let _ = stream.set_nodelay(true);
                     let (reader, writer) = stream.into_split();
                     let controller = self.controller.clone();
+                    let is_running = self.is_running.clone();
                     tokio::spawn(async move {
-                        Lx200Controller::handle_connection(controller, reader, writer).await;
+                        Lx200Controller::handle_connection(controller, reader, writer, is_running)
+                            .await;
                         debug!("WiFi LX200 connection closed");
                     });
                 }
@@ -129,9 +132,13 @@ impl Lx200Telescope for Lx200WifiTelescope {
 }
 
 impl Lx200WifiTelescope {
-    pub fn new(shared_position: Arc<RwLock<SharedPosition>>) -> Self {
+    pub fn new(
+        shared_position: Arc<RwLock<SharedPosition>>,
+        is_running: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
         Lx200WifiTelescope {
             controller: Arc::new(RwLock::new(Lx200Controller::new(shared_position))),
+            is_running,
         }
     }
 }
@@ -517,8 +524,12 @@ impl Lx200Controller {
         Self::parse_coordinates(deg, min, "0")
     }
 
-    async fn handle_connection<R, W>(controller: Arc<RwLock<Self>>, reader: R, mut writer: W)
-    where
+    async fn handle_connection<R, W>(
+        controller: Arc<RwLock<Self>>,
+        reader: R,
+        mut writer: W,
+        is_running: Arc<std::sync::atomic::AtomicBool>,
+    ) where
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
     {
@@ -530,6 +541,9 @@ impl Lx200Controller {
         const HASH: u8 = b'#';
 
         loop {
+            if !is_running.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
             buffer.clear();
 
             loop {
