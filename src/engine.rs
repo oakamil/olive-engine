@@ -14,6 +14,7 @@ use ndarray::{Array2, s};
 use serde::{Deserialize, Serialize};
 
 use crate::CameraTrait;
+use crate::storage::PersistentStorage;
 use crate::telescope_server::{Lx200Telescope, Lx200WifiTelescope, SharedPosition, TargetOp};
 use tetra3::{
     fast_extractor::{FastBgSubMode, FastDownsample, FastExtractOptions, FastExtractor},
@@ -159,6 +160,7 @@ pub struct Engine {
     target_ra: Option<f64>,
     target_dec: Option<f64>,
     target_pixel: Option<(f64, f64)>,
+    storage: Option<Arc<dyn PersistentStorage>>,
     client_connected: Arc<std::sync::atomic::AtomicBool>,
     engine_state: Arc<RwLock<EngineStateData>>,
     solve_timestamps: std::collections::VecDeque<Instant>,
@@ -216,6 +218,7 @@ impl Engine {
         engine_state: Arc<RwLock<EngineStateData>>,
         imu: Option<Arc<crate::imu::Imu>>,
         rt_handle: Option<tokio::runtime::Handle>,
+        storage: Option<Arc<dyn PersistentStorage>>,
     ) -> Self {
         let solver = Tetra3::new(&config.database_path);
         let config_fov = config.initial_fov.map(|f| f as f64);
@@ -246,7 +249,8 @@ impl Engine {
             shared_position,
             target_ra: None,
             target_dec: None,
-            target_pixel: Self::load_target_pixel(),
+            target_pixel: Self::load_target_pixel(storage.as_deref()),
+            storage,
             client_connected,
             engine_state,
             solve_timestamps: std::collections::VecDeque::new(),
@@ -257,25 +261,25 @@ impl Engine {
         }
     }
 
-    fn load_target_pixel() -> Option<(f64, f64)> {
-        std::fs::read_to_string("target_pixel.txt")
-            .ok()
-            .and_then(|s| {
-                let parts: Vec<&str> = s.split(',').collect();
-                if parts.len() == 2 {
-                    if let (Ok(x), Ok(y)) = (parts[0].trim().parse(), parts[1].trim().parse()) {
-                        return Some((x, y));
-                    }
+    fn load_target_pixel(storage: Option<&dyn PersistentStorage>) -> Option<(f64, f64)> {
+        storage.and_then(|s| s.get("target_pixel")).and_then(|s| {
+            let parts: Vec<&str> = s.split(',').collect();
+            if parts.len() == 2 {
+                if let (Ok(x), Ok(y)) = (parts[0].trim().parse(), parts[1].trim().parse()) {
+                    return Some((x, y));
                 }
-                None
-            })
+            }
+            None
+        })
     }
 
-    fn save_target_pixel(pixel: Option<(f64, f64)>) {
-        if let Some((x, y)) = pixel {
-            let _ = std::fs::write("target_pixel.txt", format!("{},{}", x, y));
-        } else {
-            let _ = std::fs::remove_file("target_pixel.txt");
+    fn save_target_pixel(&self, pixel: Option<(f64, f64)>) {
+        if let Some(storage) = &self.storage {
+            if let Some((x, y)) = pixel {
+                storage.set("target_pixel", &format!("{},{}", x, y));
+            } else {
+                storage.remove("target_pixel");
+            }
         }
     }
 
@@ -1315,7 +1319,7 @@ impl Engine {
                             if let (Some(tx), Some(ty)) = (&solution.target_x, &solution.target_y) {
                                 if let (Some(x), Some(y)) = (tx[0], ty[0]) {
                                     self.target_pixel = Some((x, y));
-                                    Self::save_target_pixel(self.target_pixel);
+                                    self.save_target_pixel(self.target_pixel);
                                     self.target_ra = Some(t_ra);
                                     self.target_dec = Some(t_dec);
                                     info!(

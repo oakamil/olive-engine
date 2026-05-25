@@ -1,3 +1,4 @@
+use crate::storage::PersistentStorage;
 use log::{debug, error, info, warn};
 use nalgebra::{Matrix3, Rotation3, UnitQuaternion, Vector3};
 use std::collections::VecDeque;
@@ -46,13 +47,6 @@ pub struct TransformMetrics {
     pub camera_view_misalignment: f64,
     pub camera_up_gyro_axis: String,
     pub camera_up_misalignment: f64,
-}
-
-// Helper to strictly enforce saving to the program's launch directory
-fn get_calibration_file_path() -> std::path::PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| std::path::PathBuf::from("."))
-        .join(CALIBRATION_FILE)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -129,17 +123,20 @@ pub struct Imu {
     alignment: Arc<RwLock<AlignmentState>>,
     history: Arc<Mutex<VecDeque<(SystemTime, UnitQuaternion<f64>, MotionState, Vector3<f64>)>>>,
     calibration: Arc<Mutex<CalibrationState>>,
+    storage: Option<Arc<dyn PersistentStorage>>,
 }
 
 impl Imu {
-    pub fn start<D: ImuDevice>(mut device: D) -> Result<Self, String> {
+    pub fn start<D: ImuDevice>(
+        mut device: D,
+        storage: Option<Arc<dyn PersistentStorage>>,
+    ) -> Result<Self, String> {
         let (state_tx, state_rx) = watch::channel(None);
 
         let mut initial_alignment = AlignmentState::default();
-        let cal_path = get_calibration_file_path();
 
         // Load previous calibration (Strictly requires the 5-part format)
-        if let Ok(data) = std::fs::read_to_string(&cal_path) {
+        if let Some(data) = storage.as_ref().and_then(|s| s.get(CALIBRATION_FILE)) {
             let parts: Vec<&str> = data.trim().split(',').collect();
             if parts.len() == 5 {
                 if let (Ok(x), Ok(y), Ok(z), Ok(w), Ok(confidence)) = (
@@ -154,8 +151,7 @@ impl Imu {
                     initial_alignment.loaded_from_disk = true; // Protect this saved matrix
                     initial_alignment.best_calibration_confidence = confidence;
                     info!(
-                        "Successfully loaded saved calibration from {:?} (Confidence: {:.1}%): {:.3}, {:.3}, {:.3}, {:.3}",
-                        cal_path,
+                        "Successfully loaded saved calibration (Confidence: {:.1}%): {:.3}, {:.3}, {:.3}, {:.3}",
                         initial_alignment.best_calibration_confidence * 100.0,
                         x,
                         y,
@@ -280,8 +276,9 @@ impl Imu {
         Ok(Self {
             state_rx,
             alignment,
-            history,
-            calibration,
+            history: Arc::clone(&history),
+            calibration: Arc::clone(&calibration),
+            storage,
         })
     }
 
@@ -477,22 +474,17 @@ impl Imu {
     }
 
     // Helper to spin up a non-blocking save
-    fn save_calibration_to_disk(mount_q: UnitQuaternion<f64>, confidence: f64) {
-        tokio::spawn(async move {
-            let cal_path = get_calibration_file_path();
-            // Appending confidence to the end of the file
+    fn save_calibration_to_disk(&self, mount_q: UnitQuaternion<f64>, confidence: f64) {
+        if let Some(storage) = self.storage.clone() {
             let data = format!(
                 "{},{},{},{},{}",
                 mount_q[0], mount_q[1], mount_q[2], mount_q[3], confidence
             );
-            match tokio::fs::write(&cal_path, data).await {
-                Ok(_) => debug!("Successfully wrote calibration back to {:?}", cal_path),
-                Err(e) => error!(
-                    "CRITICAL: Failed to write calibration to {:?}. Error: {}",
-                    cal_path, e
-                ),
-            }
-        });
+            tokio::spawn(async move {
+                storage.set(CALIBRATION_FILE, &data);
+                debug!("Successfully wrote calibration back to storage");
+            });
+        }
     }
 
     pub async fn update_anchor(&self, camera_pointing: &MountCoordinates, timestamp: &SystemTime) {
@@ -611,7 +603,7 @@ impl Imu {
                                                 && new_pool_confidence >= MIN_CALIBRATION_CONFIDENCE
                                             {
                                                 align.loaded_from_disk = true; // Upgrade status to protected
-                                                Self::save_calibration_to_disk(
+                                                self.save_calibration_to_disk(
                                                     align.mount_q,
                                                     align.best_calibration_confidence,
                                                 );
@@ -628,7 +620,7 @@ impl Imu {
                                             );
                                             align.mount_q = calculated_q;
                                             align.best_calibration_confidence = new_pool_confidence;
-                                            Self::save_calibration_to_disk(
+                                            self.save_calibration_to_disk(
                                                 align.mount_q,
                                                 align.best_calibration_confidence,
                                             );
@@ -646,7 +638,7 @@ impl Imu {
 
                                             align.calibration_updates_since_save += 1;
                                             if align.calibration_updates_since_save % 5 == 0 {
-                                                Self::save_calibration_to_disk(
+                                                self.save_calibration_to_disk(
                                                     align.mount_q,
                                                     align.best_calibration_confidence,
                                                 );
