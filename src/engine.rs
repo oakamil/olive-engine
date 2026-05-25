@@ -153,7 +153,7 @@ pub struct Engine {
     fov: Option<f64>,
     imu: Option<Arc<crate::imu::Imu>>,
 
-    shared_position: Arc<std::sync::RwLock<SharedPosition>>,
+    shared_position: Arc<SharedPosition>,
     pub telescope_server_handle: Option<tokio::task::JoinHandle<()>>,
     pub rt_handle: Option<tokio::runtime::Handle>,
     target_ra: Option<f64>,
@@ -219,7 +219,7 @@ impl Engine {
     ) -> Self {
         let solver = Tetra3::new(&config.database_path);
         let config_fov = config.initial_fov.map(|f| f as f64);
-        let shared_position = Arc::new(std::sync::RwLock::new(SharedPosition::default()));
+        let shared_position = Arc::new(SharedPosition::default());
         let is_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
         let mut server = Lx200WifiTelescope::new(shared_position.clone(), is_running.clone());
@@ -246,7 +246,7 @@ impl Engine {
             shared_position,
             target_ra: None,
             target_dec: None,
-            target_pixel: None,
+            target_pixel: Self::load_target_pixel(),
             client_connected,
             engine_state,
             solve_timestamps: std::collections::VecDeque::new(),
@@ -254,6 +254,28 @@ impl Engine {
             is_running,
             telescope_server_handle: Some(telescope_server_handle),
             rt_handle,
+        }
+    }
+
+    fn load_target_pixel() -> Option<(f64, f64)> {
+        std::fs::read_to_string("target_pixel.txt")
+            .ok()
+            .and_then(|s| {
+                let parts: Vec<&str> = s.split(',').collect();
+                if parts.len() == 2 {
+                    if let (Ok(x), Ok(y)) = (parts[0].trim().parse(), parts[1].trim().parse()) {
+                        return Some((x, y));
+                    }
+                }
+                None
+            })
+    }
+
+    fn save_target_pixel(pixel: Option<(f64, f64)>) {
+        if let Some((x, y)) = pixel {
+            let _ = std::fs::write("target_pixel.txt", format!("{},{}", x, y));
+        } else {
+            let _ = std::fs::remove_file("target_pixel.txt");
         }
     }
 
@@ -1188,21 +1210,36 @@ impl Engine {
             {
                 let mut pending_sync = None;
                 {
-                    let mut locked = self.shared_position.write().unwrap();
-                    if locked.target_op == Some(TargetOp::Abort) {
+                    let target_op = self
+                        .shared_position
+                        .target_op
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let target_ra = self
+                        .shared_position
+                        .target_ra
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let target_dec = self
+                        .shared_position
+                        .target_dec
+                        .load(std::sync::atomic::Ordering::Relaxed);
+
+                    if target_op == Some(TargetOp::Abort) {
                         self.target_ra = None;
                         self.target_dec = None;
-                        self.target_pixel = None;
-                        locked.target_op = None;
-                    } else if locked.target_ra.is_some() && locked.target_dec.is_some() {
-                        let t_ra = locked.target_ra.unwrap();
-                        let t_dec = locked.target_dec.unwrap();
-                        if locked.target_op == Some(TargetOp::Sync) {
+                        self.shared_position
+                            .target_op
+                            .store(None, std::sync::atomic::Ordering::Relaxed);
+                    } else if target_ra.is_some() && target_dec.is_some() {
+                        let t_ra = target_ra.unwrap();
+                        let t_dec = target_dec.unwrap();
+                        if target_op == Some(TargetOp::Sync) {
                             pending_sync = Some((t_ra, t_dec));
-                        } else if locked.target_op == Some(TargetOp::Slew) {
+                        } else if target_op == Some(TargetOp::Slew) {
                             self.target_ra = Some(t_ra);
                             self.target_dec = Some(t_dec);
-                            locked.target_op = None;
+                            self.shared_position
+                                .target_op
+                                .store(None, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                 }
@@ -1261,8 +1298,6 @@ impl Engine {
 
                 match solution.status {
                     SolveStatus::MatchFound => {
-                        let mut locked = self.shared_position.write().unwrap();
-
                         // Report to telescope server
                         // If we have a target_ra from the solver (for target_pixel), use it.
                         // Otherwise use the image center.
@@ -1280,6 +1315,7 @@ impl Engine {
                             if let (Some(tx), Some(ty)) = (&solution.target_x, &solution.target_y) {
                                 if let (Some(x), Some(y)) = (tx[0], ty[0]) {
                                     self.target_pixel = Some((x, y));
+                                    Self::save_target_pixel(self.target_pixel);
                                     self.target_ra = Some(t_ra);
                                     self.target_dec = Some(t_dec);
                                     info!(
@@ -1298,9 +1334,15 @@ impl Engine {
                             }
 
                             // Consume the fields
-                            locked.target_op = None;
-                            locked.target_ra = None;
-                            locked.target_dec = None;
+                            self.shared_position
+                                .target_op
+                                .store(None, Ordering::Relaxed);
+                            self.shared_position
+                                .target_ra
+                                .store(None, Ordering::Relaxed);
+                            self.shared_position
+                                .target_dec
+                                .store(None, Ordering::Relaxed);
                         }
 
                         info!(
@@ -1321,14 +1363,21 @@ impl Engine {
                         }
                         solved = true;
 
-                        locked.telescope_ra.store(ra.to_bits(), Ordering::Relaxed);
-                        locked.telescope_dec.store(dec.to_bits(), Ordering::Relaxed);
+                        self.shared_position
+                            .telescope_ra
+                            .store(ra.to_bits(), Ordering::Relaxed);
+                        self.shared_position
+                            .telescope_dec
+                            .store(dec.to_bits(), Ordering::Relaxed);
                         let engine_state = self.engine_state.read().unwrap();
-                        let lat_opt = engine_state.client_latitude.or(locked.site_latitude);
-                        let lon_opt = engine_state.client_longitude.or(locked.site_longitude);
+                        let lat_opt = engine_state
+                            .client_latitude
+                            .or(self.shared_position.site_latitude.load(Ordering::Relaxed));
+                        let lon_opt = engine_state
+                            .client_longitude
+                            .or(self.shared_position.site_longitude.load(Ordering::Relaxed));
                         let client_date = engine_state.client_date;
                         drop(engine_state);
-                        drop(locked);
 
                         if let Some(imu) = &self.imu {
                             if let (Some(lat), Some(lon)) = (lat_opt, lon_opt) {
@@ -1366,13 +1415,15 @@ impl Engine {
                         let mut est_dec = None;
                         let mut est_roll = None;
 
-                        let locked = self.shared_position.read().unwrap();
                         let engine_state = self.engine_state.read().unwrap();
-                        let lat_opt = engine_state.client_latitude.or(locked.site_latitude);
-                        let lon_opt = engine_state.client_longitude.or(locked.site_longitude);
+                        let lat_opt = engine_state
+                            .client_latitude
+                            .or(self.shared_position.site_latitude.load(Ordering::Relaxed));
+                        let lon_opt = engine_state
+                            .client_longitude
+                            .or(self.shared_position.site_longitude.load(Ordering::Relaxed));
                         let client_date = engine_state.client_date;
                         drop(engine_state);
-                        drop(locked);
 
                         if let Some(imu) = &self.imu {
                             if let (Some(lat), Some(lon)) = (lat_opt, lon_opt) {
@@ -1388,9 +1439,12 @@ impl Engine {
                                     est_dec = Some(dec);
                                     est_roll = Some(eq_roll);
 
-                                    let locked = self.shared_position.write().unwrap();
-                                    locked.telescope_ra.store(ra.to_bits(), Ordering::Relaxed);
-                                    locked.telescope_dec.store(dec.to_bits(), Ordering::Relaxed);
+                                    self.shared_position
+                                        .telescope_ra
+                                        .store(ra.to_bits(), Ordering::Relaxed);
+                                    self.shared_position
+                                        .telescope_dec
+                                        .store(dec.to_bits(), Ordering::Relaxed);
                                 }
                             }
                         }

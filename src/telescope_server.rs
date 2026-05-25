@@ -7,8 +7,8 @@
 //    https://skymtn.com/mapug-astronomy/ragreiner/LX200Commands.html
 //
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::{error::Error, f64::consts::TAU, sync::Arc, sync::OnceLock, sync::RwLock};
+use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU64, Ordering};
+use std::{error::Error, f64::consts::TAU, sync::Arc, sync::OnceLock};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, FixedOffset, Local, Utc};
@@ -62,13 +62,97 @@ pub enum TargetOp {
 }
 
 #[derive(Debug)]
+pub struct AtomicOptionF64(AtomicU64);
+
+impl AtomicOptionF64 {
+    pub fn new(val: Option<f64>) -> Self {
+        let bits = match val {
+            Some(v) => v.to_bits(),
+            None => f64::NAN.to_bits(),
+        };
+        AtomicOptionF64(AtomicU64::new(bits))
+    }
+
+    pub fn load(&self, order: Ordering) -> Option<f64> {
+        let bits = self.0.load(order);
+        let val = f64::from_bits(bits);
+        if val.is_nan() { None } else { Some(val) }
+    }
+
+    pub fn store(&self, val: Option<f64>, order: Ordering) {
+        let bits = match val {
+            Some(v) => v.to_bits(),
+            None => f64::NAN.to_bits(),
+        };
+        self.0.store(bits, order);
+    }
+}
+
+#[derive(Debug)]
+pub struct AtomicOptionI64(AtomicI64);
+
+impl AtomicOptionI64 {
+    pub fn new(val: Option<i64>) -> Self {
+        let bits = match val {
+            Some(v) => v,
+            None => i64::MIN,
+        };
+        AtomicOptionI64(AtomicI64::new(bits))
+    }
+
+    pub fn load(&self, order: Ordering) -> Option<i64> {
+        let val = self.0.load(order);
+        if val == i64::MIN { None } else { Some(val) }
+    }
+
+    pub fn store(&self, val: Option<i64>, order: Ordering) {
+        let bits = match val {
+            Some(v) => v,
+            None => i64::MIN,
+        };
+        self.0.store(bits, order);
+    }
+}
+
+#[derive(Debug)]
+pub struct AtomicTargetOp(AtomicU8);
+
+impl AtomicTargetOp {
+    pub fn new(val: Option<TargetOp>) -> Self {
+        AtomicTargetOp(AtomicU8::new(Self::to_u8(val)))
+    }
+
+    fn to_u8(val: Option<TargetOp>) -> u8 {
+        match val {
+            None => 0,
+            Some(TargetOp::Sync) => 1,
+            Some(TargetOp::Slew) => 2,
+            Some(TargetOp::Abort) => 3,
+        }
+    }
+
+    pub fn load(&self, order: Ordering) -> Option<TargetOp> {
+        match self.0.load(order) {
+            1 => Some(TargetOp::Sync),
+            2 => Some(TargetOp::Slew),
+            3 => Some(TargetOp::Abort),
+            _ => None,
+        }
+    }
+
+    pub fn store(&self, val: Option<TargetOp>, order: Ordering) {
+        self.0.store(Self::to_u8(val), order);
+    }
+}
+
+#[derive(Debug)]
 pub struct SharedPosition {
-    pub target_ra: Option<f64>,
-    pub target_dec: Option<f64>,
-    pub site_date: Option<DateTime<Utc>>,
-    pub site_latitude: Option<f64>,
-    pub site_longitude: Option<f64>,
-    pub target_op: Option<TargetOp>,
+    pub target_ra: AtomicOptionF64,
+    pub target_dec: AtomicOptionF64,
+    pub site_date_ms: AtomicOptionI64,
+    pub site_latitude: AtomicOptionF64,
+    pub site_longitude: AtomicOptionF64,
+    pub target_op: AtomicTargetOp,
 
     // For reporting back to the client
     pub telescope_ra: AtomicU64,
@@ -78,12 +162,12 @@ pub struct SharedPosition {
 impl Default for SharedPosition {
     fn default() -> Self {
         SharedPosition {
-            target_ra: None,
-            target_dec: None,
-            site_date: None,
-            site_latitude: None,
-            site_longitude: None,
-            target_op: None,
+            target_ra: AtomicOptionF64::new(None),
+            target_dec: AtomicOptionF64::new(None),
+            site_date_ms: AtomicOptionI64::new(None),
+            site_latitude: AtomicOptionF64::new(None),
+            site_longitude: AtomicOptionF64::new(None),
+            target_op: AtomicTargetOp::new(None),
             telescope_ra: AtomicU64::new(0f64.to_bits()),
             telescope_dec: AtomicU64::new(0f64.to_bits()),
         }
@@ -96,7 +180,7 @@ pub trait Lx200Telescope {
 }
 
 pub struct Lx200WifiTelescope {
-    controller: Arc<RwLock<Lx200Controller>>,
+    shared_position: Arc<SharedPosition>,
     is_running: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -115,9 +199,10 @@ impl Lx200Telescope for Lx200WifiTelescope {
                     debug!("WiFi LX200 connection opened");
                     let _ = stream.set_nodelay(true);
                     let (reader, writer) = stream.into_split();
-                    let controller = self.controller.clone();
+                    let shared_pos = self.shared_position.clone();
                     let is_running = self.is_running.clone();
                     tokio::spawn(async move {
+                        let controller = Lx200Controller::new(shared_pos);
                         Lx200Controller::handle_connection(controller, reader, writer, is_running)
                             .await;
                         debug!("WiFi LX200 connection closed");
@@ -133,11 +218,11 @@ impl Lx200Telescope for Lx200WifiTelescope {
 
 impl Lx200WifiTelescope {
     pub fn new(
-        shared_position: Arc<RwLock<SharedPosition>>,
+        shared_position: Arc<SharedPosition>,
         is_running: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Lx200WifiTelescope {
-            controller: Arc::new(RwLock::new(Lx200Controller::new(shared_position))),
+            shared_position,
             is_running,
         }
     }
@@ -145,7 +230,7 @@ impl Lx200WifiTelescope {
 
 #[derive(Default, Debug)]
 struct Lx200Controller {
-    shared_position: Arc<RwLock<SharedPosition>>,
+    shared_position: Arc<SharedPosition>,
 
     // Pending target coordinates (in jnow_epoch) for sync/slew
     target_ra: Option<f64>,
@@ -177,7 +262,7 @@ struct Lx200Controller {
 }
 
 impl Lx200Controller {
-    pub fn new(shared_position: Arc<RwLock<SharedPosition>>) -> Self {
+    pub fn new(shared_position: Arc<SharedPosition>) -> Self {
         let dt = Local::now();
         let jnow = ((dt.year() as f64 + dt.ordinal0() as f64 / 365.0) * 10.0).round() / 10.0;
         debug!("Using now epoch: {}", jnow);
@@ -236,26 +321,20 @@ impl Lx200Controller {
     }
 
     fn get_ra(&self) -> String {
-        let (tel_ra, tel_dec) = {
-            let locked = self.shared_position.read().unwrap();
-            (
-                f64::from_bits(locked.telescope_ra.load(Ordering::Relaxed)),
-                f64::from_bits(locked.telescope_dec.load(Ordering::Relaxed)),
-            )
-        };
+        let (tel_ra, tel_dec) = (
+            f64::from_bits(self.shared_position.telescope_ra.load(Ordering::Relaxed)),
+            f64::from_bits(self.shared_position.telescope_dec.load(Ordering::Relaxed)),
+        );
         let (ra, _) = self.convert_to_jnow(tel_ra, tel_dec);
         let (h, m, s) = Self::to_hms((ra / 15.0).rem_euclid(24.0));
         format!("{h:02}:{m:02}:{s:02}#")
     }
 
     fn get_dec(&self) -> String {
-        let (tel_ra, tel_dec) = {
-            let locked = self.shared_position.read().unwrap();
-            (
-                f64::from_bits(locked.telescope_ra.load(Ordering::Relaxed)),
-                f64::from_bits(locked.telescope_dec.load(Ordering::Relaxed)),
-            )
-        };
+        let (tel_ra, tel_dec) = (
+            f64::from_bits(self.shared_position.telescope_ra.load(Ordering::Relaxed)),
+            f64::from_bits(self.shared_position.telescope_dec.load(Ordering::Relaxed)),
+        );
         let dec = {
             let (_, dec) = self.convert_to_jnow(tel_ra, tel_dec);
             dec
@@ -305,10 +384,15 @@ impl Lx200Controller {
         if let (Some(ra), Some(dec)) = (self.target_ra.take(), self.target_dec.take()) {
             let (j2000_ra, j2000_dec) = self.convert_to_j2000(ra, dec);
             debug!("Slewing to {}, {}", j2000_ra, j2000_dec);
-            let mut locked = self.shared_position.write().unwrap();
-            locked.target_ra = Some(j2000_ra);
-            locked.target_dec = Some(j2000_dec);
-            locked.target_op = Some(TargetOp::Slew);
+            self.shared_position
+                .target_ra
+                .store(Some(j2000_ra), Ordering::Relaxed);
+            self.shared_position
+                .target_dec
+                .store(Some(j2000_dec), Ordering::Relaxed);
+            self.shared_position
+                .target_op
+                .store(Some(TargetOp::Slew), Ordering::Relaxed);
             "0".to_string()
         } else {
             "1No object#".to_string()
@@ -319,17 +403,23 @@ impl Lx200Controller {
         if let (Some(ra), Some(dec)) = (self.target_ra.take(), self.target_dec.take()) {
             let (j2000_ra, j2000_dec) = self.convert_to_j2000(ra, dec);
             debug!("Syncing to {}, {}", j2000_ra, j2000_dec);
-            let mut locked = self.shared_position.write().unwrap();
-            locked.target_ra = Some(j2000_ra);
-            locked.target_dec = Some(j2000_dec);
-            locked.target_op = Some(TargetOp::Sync);
+            self.shared_position
+                .target_ra
+                .store(Some(j2000_ra), Ordering::Relaxed);
+            self.shared_position
+                .target_dec
+                .store(Some(j2000_dec), Ordering::Relaxed);
+            self.shared_position
+                .target_op
+                .store(Some(TargetOp::Sync), Ordering::Relaxed);
         }
         " M31 EX GAL MAG 3.5 SZ178.0'#".to_string()
     }
 
     fn abort(&mut self) {
-        let mut locked = self.shared_position.write().unwrap();
-        locked.target_op = Some(TargetOp::Abort);
+        self.shared_position
+            .target_op
+            .store(Some(TargetOp::Abort), Ordering::Relaxed);
         debug!("Stopping slew");
     }
 
@@ -343,8 +433,9 @@ impl Lx200Controller {
             Some(n) => {
                 info!("Set observer latitude");
                 self.latitude = cmd[3..9].to_string();
-                let mut locked = self.shared_position.write().unwrap();
-                locked.site_latitude = Some(n);
+                self.shared_position
+                    .site_latitude
+                    .store(Some(n), Ordering::Relaxed);
                 Self::get_success()
             }
             None => Self::get_failure(),
@@ -362,8 +453,9 @@ impl Lx200Controller {
                 self.longitude = cmd[3..9].to_string();
                 let longitude = if n > 180.0 { 360.0 - n } else { -n };
                 info!("Set observer longitude");
-                let mut locked = self.shared_position.write().unwrap();
-                locked.site_longitude = Some(longitude);
+                self.shared_position
+                    .site_longitude
+                    .store(Some(longitude), Ordering::Relaxed);
                 Self::get_success()
             }
             None => Self::get_failure(),
@@ -415,8 +507,10 @@ impl Lx200Controller {
                     self.datetime = dt;
                     self.jnow_epoch =
                         ((dt.year() as f64 + dt.ordinal0() as f64 / 365.0) * 10.0).round() / 10.0;
-                    let mut locked = self.shared_position.write().unwrap();
-                    locked.site_date = Some(dt.with_timezone(&Utc));
+                    self.shared_position.site_date_ms.store(
+                        Some(dt.with_timezone(&Utc).timestamp_millis()),
+                        Ordering::Relaxed,
+                    );
                     return "1Updating Planetary Data# #".to_string();
                 }
                 Err(e) => {
@@ -457,8 +551,7 @@ impl Lx200Controller {
     }
 
     fn get_distance_bars(&self) -> String {
-        let locked = self.shared_position.read().unwrap();
-        if locked.target_op == Some(TargetOp::Slew) {
+        if self.shared_position.target_op.load(Ordering::Relaxed) == Some(TargetOp::Slew) {
             "\x7f#".to_string()
         } else {
             "#".to_string()
@@ -525,7 +618,7 @@ impl Lx200Controller {
     }
 
     async fn handle_connection<R, W>(
-        controller: Arc<RwLock<Self>>,
+        mut controller: Self,
         reader: R,
         mut writer: W,
         is_running: Arc<std::sync::atomic::AtomicBool>,
@@ -582,7 +675,7 @@ impl Lx200Controller {
                     if chunk[0] == ACK_CMD[0] {
                         buf_reader.consume(1);
                         debug!("Received ack command");
-                        controller.write().unwrap().is_stellarium = true;
+                        controller.is_stellarium = true;
                         if let Err(e) = Self::process_output(&mut writer, "A".to_string()).await {
                             warn!("Failed to send ack response: {:?}", e);
                             return;
@@ -615,7 +708,7 @@ impl Lx200Controller {
                 if buffer == ACK_CMD {
                     debug!("Received ack command");
                     buffer.clear();
-                    controller.write().unwrap().is_stellarium = true;
+                    controller.is_stellarium = true;
                     if let Err(e) = Self::process_output(&mut writer, "A".to_string()).await {
                         warn!("Failed to send ack response: {:?}", e);
                         return;
@@ -629,7 +722,7 @@ impl Lx200Controller {
             if buffer.len() == 1 {
                 continue;
             }
-            let result = controller.write().unwrap().process_input(&buffer);
+            let result = controller.process_input(&buffer);
             match result {
                 Some(res) => {
                     debug!("Writing to client: {}", res);
