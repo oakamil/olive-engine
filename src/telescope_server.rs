@@ -180,7 +180,7 @@ pub trait Lx200Telescope {
 }
 
 pub struct Lx200WifiTelescope {
-    shared_position: Arc<SharedPosition>,
+    controller: Arc<std::sync::RwLock<Lx200Controller>>,
     is_running: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -199,10 +199,9 @@ impl Lx200Telescope for Lx200WifiTelescope {
                     debug!("WiFi LX200 connection opened");
                     let _ = stream.set_nodelay(true);
                     let (reader, writer) = stream.into_split();
-                    let shared_pos = self.shared_position.clone();
+                    let controller = self.controller.clone();
                     let is_running = self.is_running.clone();
                     tokio::spawn(async move {
-                        let controller = Lx200Controller::new(shared_pos);
                         Lx200Controller::handle_connection(controller, reader, writer, is_running)
                             .await;
                         debug!("WiFi LX200 connection closed");
@@ -222,7 +221,7 @@ impl Lx200WifiTelescope {
         is_running: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Lx200WifiTelescope {
-            shared_position,
+            controller: Arc::new(std::sync::RwLock::new(Lx200Controller::new(shared_position))),
             is_running,
         }
     }
@@ -618,7 +617,7 @@ impl Lx200Controller {
     }
 
     async fn handle_connection<R, W>(
-        mut controller: Self,
+        controller: Arc<std::sync::RwLock<Self>>,
         reader: R,
         mut writer: W,
         is_running: Arc<std::sync::atomic::AtomicBool>,
@@ -675,7 +674,7 @@ impl Lx200Controller {
                     if chunk[0] == ACK_CMD[0] {
                         buf_reader.consume(1);
                         debug!("Received ack command");
-                        controller.is_stellarium = true;
+                        controller.write().unwrap().is_stellarium = true;
                         if let Err(e) = Self::process_output(&mut writer, "A".to_string()).await {
                             warn!("Failed to send ack response: {:?}", e);
                             return;
@@ -708,7 +707,7 @@ impl Lx200Controller {
                 if buffer == ACK_CMD {
                     debug!("Received ack command");
                     buffer.clear();
-                    controller.is_stellarium = true;
+                    controller.write().unwrap().is_stellarium = true;
                     if let Err(e) = Self::process_output(&mut writer, "A".to_string()).await {
                         warn!("Failed to send ack response: {:?}", e);
                         return;
@@ -722,7 +721,7 @@ impl Lx200Controller {
             if buffer.len() == 1 {
                 continue;
             }
-            let result = controller.process_input(&buffer);
+            let result = controller.write().unwrap().process_input(&buffer);
             match result {
                 Some(res) => {
                     debug!("Writing to client: {}", res);
