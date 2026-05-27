@@ -1349,7 +1349,7 @@ impl Engine {
                                 .store(None, Ordering::Relaxed);
                         }
 
-                        info!(
+                        debug!(
                             "Solved! RA: {:.6}, Dec: {:.6}, Roll: {:.2} | Centroids: {} | Exposure: {:?} | Post-Process: {:?} | Extract: {:?} | Solve: {:?}",
                             ra,
                             dec,
