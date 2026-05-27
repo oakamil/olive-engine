@@ -9,7 +9,7 @@ use std::{
 };
 
 use chrono::{Datelike, Timelike};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use ndarray::{Array2, s};
 use serde::{Deserialize, Serialize};
 
