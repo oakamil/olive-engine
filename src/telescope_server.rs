@@ -221,7 +221,9 @@ impl Lx200WifiTelescope {
         is_running: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Lx200WifiTelescope {
-            controller: Arc::new(std::sync::RwLock::new(Lx200Controller::new(shared_position))),
+            controller: Arc::new(std::sync::RwLock::new(Lx200Controller::new(
+                shared_position,
+            ))),
             is_running,
         }
     }

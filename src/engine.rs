@@ -38,7 +38,6 @@ pub struct EngineConfig {
     pub downsample: bool,
     pub bypass_calibration: bool,
     pub noise_filter: bool,
-    pub sigma: Option<f32>,
     pub initial_fov: Option<f32>,
 }
 
@@ -58,7 +57,6 @@ impl Default for EngineConfig {
             downsample: true,
             bypass_calibration: false,
             noise_filter: false,
-            sigma: None,
             initial_fov: None,
         }
     }
@@ -114,6 +112,7 @@ pub struct EngineStateData {
     pub offset_az: Option<f64>,
     pub offset_alt: Option<f64>,
     pub offset_angle: Option<f64>,
+    pub current_sigma: Option<f32>,
 }
 
 impl Default for EngineStateData {
@@ -142,6 +141,7 @@ impl Default for EngineStateData {
             offset_az: None,
             offset_alt: None,
             offset_angle: None,
+            current_sigma: None,
         }
     }
 }
@@ -468,6 +468,11 @@ impl Engine {
                 let num_centroids;
                 let mut centroids_arr;
 
+                let state_sigma = {
+                    let st = engine_state_ext.read().unwrap();
+                    st.current_sigma
+                };
+
                 match config_ext.extractor_type {
                     Extractor::Sequential | Extractor::Fast => {
                         let array_img =
@@ -508,8 +513,9 @@ impl Engine {
                                 BgMode::Line => Some(FastBgSubMode::LineMedian),
                             };
 
+                            let active_sigma = state_sigma.unwrap_or(3.5);
                             let options = FastExtractOptions {
-                                sigma: 3.5,
+                                sigma: active_sigma,
                                 downsample,
                                 bg_sub_mode,
                                 binary_open: config_ext.noise_filter,
@@ -523,6 +529,12 @@ impl Engine {
                         }
 
                         let ext = extractor.as_mut().unwrap();
+
+                        let active_sigma = state_sigma.unwrap_or(3.5);
+                        ext.update_options(tetra3::fast_extractor::FastExtractOptionsUpdate {
+                            sigma: Some(active_sigma),
+                            ..Default::default()
+                        });
 
                         let result = if config_ext.extractor_type == Extractor::Sequential {
                             ext.extract_sequential(&array_img)
@@ -571,11 +583,12 @@ impl Engine {
                         ) {
                             let noise_estimate =
                                 cedar_detect::algorithm::estimate_noise_from_image(&gray_img);
+                            let active_sigma = state_sigma.unwrap_or(8.0);
                             let (stars, _, _, _) = cedar_detect::algorithm::get_stars_from_image(
                                 &gray_img,
                                 noise_estimate,
-                                config_ext.sigma.unwrap_or(8.0) as f64, // sigma
-                                true,                                   // normalize_rows
+                                active_sigma as f64, // sigma
+                                true,                // normalize_rows
                                 if config_ext.downsample {
                                     if crop_w * crop_h > 2_000_000 {
                                         4
@@ -587,8 +600,8 @@ impl Engine {
                                 } else {
                                     1
                                 }, // binning
-                                config_ext.noise_filter,                // detect_hot_pixels
-                                false,                                  // return_binned_image
+                                config_ext.noise_filter, // detect_hot_pixels
+                                false,               // return_binned_image
                             );
 
                             num_centroids = stars.len();
@@ -1279,7 +1292,7 @@ impl Engine {
                 let size = (height, width);
 
                 let mut solve_options = SolveOptions::default();
-                solve_options.solve_timeout_ms = Some(30.0);
+                solve_options.solve_timeout_ms = Some(exp_time.as_secs_f64() * 1000.0 * 0.90);
                 if let Some(fov) = self.fov {
                     solve_options.fov_estimate = Some(fov);
                     solve_options.fov_max_error = Some(0.5); // Provide a reasonable constraint based on FOV
