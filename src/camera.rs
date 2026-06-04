@@ -182,6 +182,8 @@ impl CameraTrait for Camera {
         self.send_command(CaptureCommand::SetExposure(exposure_us));
     }
 
+    fn set_stack_count(&self, _count: usize) {}
+
     /// Enables High Conversion Gain (HCG) via I2C on address 0x1A.
     fn enable_hcg(&self) {
         self.send_command(CaptureCommand::SetHcg(true));

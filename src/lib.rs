@@ -49,6 +49,7 @@ pub trait CameraTrait: Send + Sync {
     fn set_gain(&self, gain: f32);
     fn get_exposure(&self) -> i32;
     fn set_exposure(&self, exposure_us: i32);
+    fn set_stack_count(&self, _count: usize) {}
     fn enable_hcg(&self);
     fn disable_hcg(&self);
     fn set_focus(&self, _distance: f32) {}

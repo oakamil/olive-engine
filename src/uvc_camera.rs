@@ -158,6 +158,11 @@ impl CameraTrait for Camera {
         self.send_command(CaptureCommand::SetExposure(exposure_us));
     }
 
+    fn set_stack_count(&self, count: usize) {
+        self.stack_count_config
+            .store(count.clamp(1, 10), Ordering::Relaxed);
+    }
+
     fn enable_hcg(&self) {}
 
     fn disable_hcg(&self) {}
