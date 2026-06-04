@@ -219,13 +219,15 @@ impl Engine {
         imu: Option<Arc<crate::imu::Imu>>,
         rt_handle: Option<tokio::runtime::Handle>,
         storage: Option<Arc<dyn PersistentStorage>>,
+        fd_receiver: Option<tokio::sync::mpsc::UnboundedReceiver<i32>>,
     ) -> Self {
         let solver = Tetra3::new(&config.database_path);
         let config_fov = config.initial_fov.map(|f| f as f64);
         let shared_position = Arc::new(SharedPosition::default());
         let is_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
-        let mut server = Lx200WifiTelescope::new(shared_position.clone(), is_running.clone());
+        let mut server =
+            Lx200WifiTelescope::new(shared_position.clone(), is_running.clone(), fd_receiver);
         let telescope_server_handle = if let Some(ref h) = rt_handle {
             h.spawn(async move {
                 if let Err(e) = server.serve_requests().await {

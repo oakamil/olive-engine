@@ -7,7 +7,13 @@
 //    https://skymtn.com/mapug-astronomy/ragreiner/LX200Commands.html
 //
 
-use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU64, Ordering};
+use std::io::ErrorKind;
+use std::net::TcpStream as StdTcpStream;
+use std::os::unix::io::FromRawFd;
+use std::sync::{
+    RwLock,
+    atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering},
+};
 use std::{error::Error, f64::consts::TAU, sync::Arc, sync::OnceLock};
 
 use async_trait::async_trait;
@@ -18,7 +24,8 @@ use nalgebra::Vector3;
 use starfield::{precessionlib::compute_precession, time::Timescale};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
+    sync::mpsc::UnboundedReceiver,
 };
 
 static TIMESCALE: OnceLock<Timescale> = OnceLock::new();
@@ -180,35 +187,54 @@ pub trait Lx200Telescope {
 }
 
 pub struct Lx200WifiTelescope {
-    controller: Arc<std::sync::RwLock<Lx200Controller>>,
-    is_running: Arc<std::sync::atomic::AtomicBool>,
+    controller: Arc<RwLock<Lx200Controller>>,
+    is_running: Arc<AtomicBool>,
+    fd_receiver: Option<UnboundedReceiver<i32>>,
 }
 
 #[async_trait]
 impl Lx200Telescope for Lx200WifiTelescope {
     async fn serve_requests(&mut self) -> Result<(), Box<dyn Error + 'static>> {
-        let listener = TcpListener::bind("0.0.0.0:4030").await?;
-        info!(
-            "Running LX200 server on: {}",
-            listener.local_addr().unwrap()
-        );
-
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    debug!("WiFi LX200 connection opened");
-                    let _ = stream.set_nodelay(true);
-                    let (reader, writer) = stream.into_split();
-                    let controller = self.controller.clone();
-                    let is_running = self.is_running.clone();
-                    tokio::spawn(async move {
-                        Lx200Controller::handle_connection(controller, reader, writer, is_running)
-                            .await;
-                        debug!("WiFi LX200 connection closed");
-                    });
+        if let Some(mut rx) = self.fd_receiver.take() {
+            info!("Running LX200 server via Kotlin FDs");
+            loop {
+                match rx.recv().await {
+                    Some(fd) => {
+                        let std_stream = unsafe { StdTcpStream::from_raw_fd(fd) };
+                        if let Err(e) = std_stream.set_nonblocking(true) {
+                            warn!("Failed to set FD nonblocking: {}", e);
+                            continue;
+                        }
+                        match TcpStream::from_std(std_stream) {
+                            Ok(stream) => {
+                                debug!("WiFi LX200 connection opened from Kotlin FD");
+                                self.spawn_connection_handler(stream);
+                            }
+                            Err(e) => {
+                                warn!("Failed to wrap FD in tokio stream: {}", e);
+                            }
+                        }
+                    }
+                    None => break,
                 }
-                Err(e) => {
-                    warn!("Failed to accept WiFi LX200 connection: {:?}", e);
+            }
+            Ok(())
+        } else {
+            let listener = TcpListener::bind("0.0.0.0:4030").await?;
+            info!(
+                "Running LX200 server on: {}",
+                listener.local_addr().unwrap()
+            );
+
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        debug!("WiFi LX200 connection opened");
+                        self.spawn_connection_handler(stream);
+                    }
+                    Err(e) => {
+                        warn!("Failed to accept WiFi LX200 connection: {:?}", e);
+                    }
                 }
             }
         }
@@ -216,15 +242,25 @@ impl Lx200Telescope for Lx200WifiTelescope {
 }
 
 impl Lx200WifiTelescope {
+    fn spawn_connection_handler(&self, stream: tokio::net::TcpStream) {
+        let _ = stream.set_nodelay(true);
+        let (reader, writer) = stream.into_split();
+        let controller = self.controller.clone();
+        let is_running = self.is_running.clone();
+        tokio::spawn(async move {
+            Lx200Controller::handle_connection(controller, reader, writer, is_running).await;
+            debug!("WiFi LX200 connection closed");
+        });
+    }
     pub fn new(
         shared_position: Arc<SharedPosition>,
-        is_running: Arc<std::sync::atomic::AtomicBool>,
+        is_running: Arc<AtomicBool>,
+        fd_receiver: Option<UnboundedReceiver<i32>>,
     ) -> Self {
         Lx200WifiTelescope {
-            controller: Arc::new(std::sync::RwLock::new(Lx200Controller::new(
-                shared_position,
-            ))),
+            controller: Arc::new(RwLock::new(Lx200Controller::new(shared_position))),
             is_running,
+            fd_receiver,
         }
     }
 }
@@ -650,9 +686,9 @@ impl Lx200Controller {
                     Ok(Ok(c)) => c,
                     Ok(Err(e)) => {
                         match e.kind() {
-                            std::io::ErrorKind::ConnectionReset
-                            | std::io::ErrorKind::BrokenPipe
-                            | std::io::ErrorKind::ConnectionAborted => {
+                            ErrorKind::ConnectionReset
+                            | ErrorKind::BrokenPipe
+                            | ErrorKind::ConnectionAborted => {
                                 debug!("Client disconnected: {:?}", e);
                             }
                             _ => {
