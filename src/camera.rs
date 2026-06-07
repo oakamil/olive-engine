@@ -154,17 +154,16 @@ impl CameraTrait for Camera {
     }
 
     /// Returns the min and max analog gain allowed by the sensor (lock-free).
-    fn get_gain_range(&self) -> (f32, f32) {
-        (
-            f32::from_bits(self.min_gain.load(Ordering::Relaxed)),
-            f32::from_bits(self.max_gain.load(Ordering::Relaxed)),
-        )
+    fn get_gain_range(&self) -> (f32, f32, f32) {
+        let min_gain = f32::from_bits(self.min_gain.load(Ordering::Relaxed));
+        let max_gain = f32::from_bits(self.max_gain.load(Ordering::Relaxed));
+        (min_gain, max_gain, max_gain)
     }
 
     /// Sets the analog gain and notifies the capture thread to apply it.
     /// The value is clamped to the sensor's supported range.
     fn set_gain(&self, gain: f32) {
-        let (min, max) = self.get_gain_range();
+        let (min, max, _) = self.get_gain_range();
         let clamped_gain = gain.clamp(min, max);
         self.current_gain
             .store(clamped_gain.to_bits(), Ordering::Relaxed);

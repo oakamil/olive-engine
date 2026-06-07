@@ -45,7 +45,11 @@ pub trait CameraTrait: Send + Sync {
     fn start_capture(&mut self) -> Result<(), String>;
     fn stop_capture(&self) {}
     fn get_gain(&self) -> f32;
-    fn get_gain_range(&self) -> (f32, f32);
+    /// Returns a tuple of (min_gain, max_gain, true_max_analog_gain)
+    /// - min_gain: Minimum possible gain.
+    /// - max_gain: Maximum possible gain (including digital, useful for UI sliders).
+    /// - true_max_analog_gain: Maximum analog gain before switching to digital. Used as the default max sensitivity.
+    fn get_gain_range(&self) -> (f32, f32, f32);
     fn set_gain(&self, gain: f32);
     fn get_exposure(&self) -> i32;
     fn set_exposure(&self, exposure_us: i32);
@@ -58,6 +62,7 @@ pub trait CameraTrait: Send + Sync {
         None
     }
     fn set_brightness(&self, _brightness: i32) {}
+    fn set_zoom(&self, _zoom: f32) {}
     fn wait_for_next_capture(
         &self,
         last_timestamp: Option<SystemTime>,

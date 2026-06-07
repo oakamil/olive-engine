@@ -734,7 +734,7 @@ impl Engine {
         }
 
         // Apply static hardware settings ONCE at startup
-        let gain = self.config.gain.unwrap_or(self.camera.get_gain_range().1);
+        let gain = self.config.gain.unwrap_or(self.camera.get_gain_range().2);
         info!("Setting base hardware settings...");
         self.camera.set_gain(gain);
         self.camera.enable_hcg();
