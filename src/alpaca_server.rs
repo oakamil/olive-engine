@@ -26,6 +26,7 @@ pub struct AlpacaServer {
     shared_position: Arc<SharedPosition>,
     is_running: Arc<AtomicBool>,
     fd_receiver: Arc<tokio::sync::Mutex<Option<UnboundedReceiver<i32>>>>,
+    #[allow(dead_code)]
     discovery_fd_receiver: Arc<tokio::sync::Mutex<Option<UnboundedReceiver<i32>>>>,
 }
 
@@ -352,6 +353,7 @@ pub enum EquatorialSystem {
     JNow = 2,
 }
 
+#[allow(dead_code)]
 async fn configured_devices() -> Json<AlpacaResponse<Vec<Device>>> {
     Json(AlpacaResponse::success(
         0,

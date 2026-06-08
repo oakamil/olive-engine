@@ -17,6 +17,7 @@ pub mod imu;
 pub mod python;
 
 pub mod alpaca_server;
+pub mod dummy_camera;
 pub mod storage;
 pub mod telescope_server;
 pub mod uvc_camera;
