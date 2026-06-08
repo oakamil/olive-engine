@@ -164,6 +164,9 @@ pub struct SharedPosition {
     // For reporting back to the client
     pub telescope_ra: AtomicU64,
     pub telescope_dec: AtomicU64,
+
+    // Snapshot of Dec taken when RA is read to prevent tearing during sequential reads
+    pub snapshot_dec: AtomicOptionF64,
 }
 
 impl Default for SharedPosition {
@@ -177,6 +180,7 @@ impl Default for SharedPosition {
             target_op: AtomicTargetOp::new(None),
             telescope_ra: AtomicU64::new(0f64.to_bits()),
             telescope_dec: AtomicU64::new(0f64.to_bits()),
+            snapshot_dec: AtomicOptionF64::new(None),
         }
     }
 }
@@ -362,16 +366,25 @@ impl Lx200Controller {
             f64::from_bits(self.shared_position.telescope_ra.load(Ordering::Relaxed)),
             f64::from_bits(self.shared_position.telescope_dec.load(Ordering::Relaxed)),
         );
+        self.shared_position
+            .snapshot_dec
+            .store(Some(tel_dec), Ordering::Relaxed);
         let (ra, _) = self.convert_to_jnow(tel_ra, tel_dec);
         let (h, m, s) = Self::to_hms((ra / 15.0).rem_euclid(24.0));
         format!("{h:02}:{m:02}:{s:02}#")
     }
 
     fn get_dec(&self) -> String {
-        let (tel_ra, tel_dec) = (
-            f64::from_bits(self.shared_position.telescope_ra.load(Ordering::Relaxed)),
-            f64::from_bits(self.shared_position.telescope_dec.load(Ordering::Relaxed)),
-        );
+        let tel_ra = f64::from_bits(self.shared_position.telescope_ra.load(Ordering::Relaxed));
+        let tel_dec =
+            if let Some(snap_dec) = self.shared_position.snapshot_dec.load(Ordering::Relaxed) {
+                self.shared_position
+                    .snapshot_dec
+                    .store(None, Ordering::Relaxed);
+                snap_dec
+            } else {
+                f64::from_bits(self.shared_position.telescope_dec.load(Ordering::Relaxed))
+            };
         let dec = {
             let (_, dec) = self.convert_to_jnow(tel_ra, tel_dec);
             dec
@@ -738,6 +751,12 @@ impl Lx200Controller {
                 };
 
                 buf_reader.consume(consumed);
+
+                if buffer.len() > 1024 {
+                    warn!("Command buffer exceeded maximum size, disconnecting client");
+                    return;
+                }
+
                 if found {
                     break;
                 }

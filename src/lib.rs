@@ -16,6 +16,7 @@ pub mod imu;
 #[cfg(not(target_os = "android"))]
 pub mod python;
 
+pub mod alpaca_server;
 pub mod storage;
 pub mod telescope_server;
 pub mod uvc_camera;

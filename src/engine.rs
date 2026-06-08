@@ -14,6 +14,7 @@ use ndarray::{Array2, s};
 use serde::{Deserialize, Serialize};
 
 use crate::CameraTrait;
+use crate::alpaca_server::AlpacaServer;
 use crate::storage::PersistentStorage;
 use crate::telescope_server::{Lx200Telescope, Lx200WifiTelescope, SharedPosition, TargetOp};
 use tetra3::{
@@ -156,6 +157,7 @@ pub struct Engine {
 
     shared_position: Arc<SharedPosition>,
     pub telescope_server_handle: Option<tokio::task::JoinHandle<()>>,
+    pub alpaca_server_handle: Option<tokio::task::JoinHandle<()>>,
     pub rt_handle: Option<tokio::runtime::Handle>,
     target_ra: Option<f64>,
     target_dec: Option<f64>,
@@ -220,6 +222,8 @@ impl Engine {
         rt_handle: Option<tokio::runtime::Handle>,
         storage: Option<Arc<dyn PersistentStorage>>,
         fd_receiver: Option<tokio::sync::mpsc::UnboundedReceiver<i32>>,
+        alpaca_fd_receiver: Option<tokio::sync::mpsc::UnboundedReceiver<i32>>,
+        alpaca_discovery_fd_receiver: Option<tokio::sync::mpsc::UnboundedReceiver<i32>>,
     ) -> Self {
         let solver = Tetra3::new(&config.database_path);
         let config_fov = config.initial_fov.map(|f| f as f64);
@@ -228,18 +232,36 @@ impl Engine {
 
         let mut server =
             Lx200WifiTelescope::new(shared_position.clone(), is_running.clone(), fd_receiver);
-        let telescope_server_handle = if let Some(ref h) = rt_handle {
-            h.spawn(async move {
+        let alpaca_server = AlpacaServer::new(
+            shared_position.clone(),
+            is_running.clone(),
+            alpaca_fd_receiver,
+            alpaca_discovery_fd_receiver,
+        );
+        let (telescope_server_handle, alpaca_server_handle) = if let Some(ref h) = rt_handle {
+            let t_handle = h.spawn(async move {
                 if let Err(e) = server.serve_requests().await {
                     error!("Telescope server error: {}", e);
                 }
-            })
+            });
+            let a_handle = h.spawn(async move {
+                if let Err(e) = alpaca_server.serve_requests().await {
+                    error!("Alpaca server error: {}", e);
+                }
+            });
+            (t_handle, a_handle)
         } else {
-            tokio::spawn(async move {
+            let t_handle = tokio::spawn(async move {
                 if let Err(e) = server.serve_requests().await {
                     error!("Telescope server error: {}", e);
                 }
-            })
+            });
+            let a_handle = tokio::spawn(async move {
+                if let Err(e) = alpaca_server.serve_requests().await {
+                    error!("Alpaca server error: {}", e);
+                }
+            });
+            (t_handle, a_handle)
         };
 
         Self {
@@ -259,6 +281,7 @@ impl Engine {
             shared_result: Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new())),
             is_running,
             telescope_server_handle: Some(telescope_server_handle),
+            alpaca_server_handle: Some(alpaca_server_handle),
             rt_handle,
         }
     }
@@ -1865,6 +1888,9 @@ mod tests {
 impl Drop for Engine {
     fn drop(&mut self) {
         if let Some(handle) = self.telescope_server_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.alpaca_server_handle.take() {
             handle.abort();
         }
     }

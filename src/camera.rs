@@ -122,6 +122,7 @@ impl CameraTrait for Camera {
             height: c.height,
             fps: 0,
             crop: None,
+            initial_fov: None,
         })
     }
 
