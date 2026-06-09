@@ -160,6 +160,7 @@ pub struct SharedPosition {
     pub site_latitude: AtomicOptionF64,
     pub site_longitude: AtomicOptionF64,
     pub target_op: AtomicTargetOp,
+    pub is_slewing: AtomicBool,
 
     // For reporting back to the client
     pub telescope_ra: AtomicU64,
@@ -178,6 +179,7 @@ impl Default for SharedPosition {
             site_latitude: AtomicOptionF64::new(None),
             site_longitude: AtomicOptionF64::new(None),
             target_op: AtomicTargetOp::new(None),
+            is_slewing: AtomicBool::new(false),
             telescope_ra: AtomicU64::new(0f64.to_bits()),
             telescope_dec: AtomicU64::new(0f64.to_bits()),
             snapshot_dec: AtomicOptionF64::new(None),
@@ -601,7 +603,7 @@ impl Lx200Controller {
     }
 
     fn get_distance_bars(&self) -> String {
-        if self.shared_position.target_op.load(Ordering::Relaxed) == Some(TargetOp::Slew) {
+        if self.shared_position.is_slewing.load(Ordering::Relaxed) {
             "\x7f#".to_string()
         } else {
             "#".to_string()

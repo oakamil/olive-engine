@@ -4,7 +4,6 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use tokio::sync::mpsc::UnboundedReceiver;
 
 use axum::{
     Json, Router,
@@ -12,9 +11,9 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
-use log::{error, info};
+use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
-use tokio::net::UdpSocket;
+use tokio::{net::UdpSocket, sync::mpsc::UnboundedReceiver};
 
 use crate::telescope_server::{SharedPosition, TargetOp};
 
@@ -49,6 +48,8 @@ impl AlpacaServer {
         // Start Discovery Server
         let discovery_running = self.is_running.clone();
         tokio::spawn(async move {
+            // We no longer wait for an FD from Kotlin for UDP discovery.
+            // It is handled natively in Rust.
             if let Err(e) = run_discovery_server(discovery_running, None).await {
                 error!("Alpaca discovery server error: {}", e);
             }
@@ -75,7 +76,7 @@ impl AlpacaServer {
         let fd_receiver_opt = self.fd_receiver.lock().await.take();
 
         if let Some(mut rx) = fd_receiver_opt {
-            error!("!!! Running Alpaca REST API via Kotlin FDs !!!");
+            debug!("Running Alpaca REST API via Kotlin FDs");
             use hyper::server::conn::http1;
             use hyper_util::rt::TokioIo;
             use std::net::TcpStream as StdTcpStream;
@@ -86,7 +87,7 @@ impl AlpacaServer {
             loop {
                 match rx.recv().await {
                     Some(fd) => {
-                        error!("!!! Alpaca received FD {} from Kotlin !!!", fd);
+                        debug!("Alpaca received FD {} from Kotlin", fd);
                         let std_stream = unsafe { StdTcpStream::from_raw_fd(fd) };
                         if let Err(e) = std_stream.set_nonblocking(true) {
                             error!("Failed to set FD nonblocking: {}", e);
@@ -98,8 +99,8 @@ impl AlpacaServer {
                             tokio::spawn(async move {
                                 let hyper_service = hyper::service::service_fn(
                                     move |req: hyper::Request<hyper::body::Incoming>| {
-                                        error!(
-                                            "!!! Alpaca HTTP Request: {} {} !!!",
+                                        debug!(
+                                            "Alpaca HTTP Request: {} {}",
                                             req.method(),
                                             req.uri()
                                         );
@@ -141,14 +142,15 @@ async fn run_discovery_server(
         UdpSocket::from_std(std_sock)?
     } else {
         let sock = socket2::Socket::new(
-            socket2::Domain::IPV4,
+            socket2::Domain::IPV6,
             socket2::Type::DGRAM,
             Some(socket2::Protocol::UDP),
         )?;
         sock.set_reuse_address(true)?;
         sock.set_broadcast(true)?;
+        let _ = sock.set_only_v6(false);
         sock.bind(&socket2::SockAddr::from(SocketAddr::from((
-            [0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0],
             DISCOVERY_PORT,
         ))))?;
         sock.set_nonblocking(true)?;
@@ -170,7 +172,7 @@ async fn run_discovery_server(
 
         tick += 1;
         if tick % 10 == 0 {
-            error!(
+            debug!(
                 "Alpaca UDP Discovery thread is ALIVE and looping. tick={}",
                 tick
             );
@@ -184,7 +186,7 @@ async fn run_discovery_server(
         {
             Ok(Ok((len, addr))) => {
                 let msg = String::from_utf8_lossy(&buf[..len]);
-                error!("Alpaca UDP Discovery Received: {} from {}", msg, addr);
+                info!("Alpaca UDP Discovery Received: {} from {}", msg, addr);
                 if msg.to_lowercase().contains("alpacadiscovery1") {
                     let response = format!("{{\"AlpacaPort\": {}}}", ALPACA_PORT);
                     if let Err(e) = socket.send_to(response.as_bytes(), addr).await {
@@ -307,7 +309,6 @@ async fn management_handler(
 ) -> impl IntoResponse {
     let lower_path = path.to_lowercase();
     let client_id = params.map(|Query(p)| p.client_transaction_id).unwrap_or(0);
-    info!("Alpaca Management GET: {}", lower_path);
     if lower_path == "apiversions" || lower_path == "/apiversions" {
         return Json(AlpacaResponse::success(client_id, Some(vec![1]))).into_response();
     } else if lower_path == "v1/description" || lower_path == "/v1/description" {
@@ -372,7 +373,6 @@ async fn handle_get(
     params: Option<Query<AlpacaParams>>,
 ) -> impl IntoResponse {
     let client_id = params.map(|Query(p)| p.client_transaction_id).unwrap_or(0);
-    info!("Alpaca GET: {}", method);
     match method.to_lowercase().as_str() {
         "connected" => Json(AlpacaResponse::success(client_id, Some(true))).into_response(),
         "name" => Json(AlpacaResponse::success(
@@ -457,8 +457,7 @@ async fn handle_get(
             }
         }
         "slewing" => {
-            let is_slewing =
-                server.shared_position.target_op.load(Ordering::Relaxed) == Some(TargetOp::Slew);
+            let is_slewing = server.shared_position.is_slewing.load(Ordering::Relaxed);
             Json(AlpacaResponse::success(client_id, Some(is_slewing))).into_response()
         }
         "tracking" => Json(AlpacaResponse::success(client_id, Some(false))).into_response(),
@@ -517,7 +516,6 @@ async fn handle_put(
         _connected: None,
     });
     let client_id = p.client_transaction_id;
-    info!("Alpaca PUT: {}", method);
     match method.to_lowercase().as_str() {
         "connected" => Json(AlpacaResponse::<()>::success(client_id, None)).into_response(),
         "targetrightascension" => {
@@ -552,6 +550,7 @@ async fn handle_put(
         }
         "slewtocoordinatesasync" => {
             if let (Some(ra_hours), Some(dec_deg)) = (p.right_ascension, p.declination) {
+                info!("Slew to RA: {}, Dec: {}", ra_hours, dec_deg);
                 server
                     .shared_position
                     .target_ra
@@ -575,6 +574,7 @@ async fn handle_put(
         }
         "synctocoordinates" => {
             if let (Some(ra_hours), Some(dec_deg)) = (p.right_ascension, p.declination) {
+                info!("Sync to RA: {}, Dec: {}", ra_hours, dec_deg);
                 server
                     .shared_position
                     .target_ra
@@ -597,6 +597,7 @@ async fn handle_put(
             }
         }
         "abortslew" => {
+            info!("Abort slew");
             server
                 .shared_position
                 .target_op

@@ -1271,6 +1271,9 @@ impl Engine {
                         self.shared_position
                             .target_op
                             .store(None, std::sync::atomic::Ordering::Relaxed);
+                        self.shared_position
+                            .is_slewing
+                            .store(false, std::sync::atomic::Ordering::Relaxed);
                     } else if target_ra.is_some() && target_dec.is_some() {
                         let t_ra = target_ra.unwrap();
                         let t_dec = target_dec.unwrap();
@@ -1282,6 +1285,9 @@ impl Engine {
                             self.shared_position
                                 .target_op
                                 .store(None, std::sync::atomic::Ordering::Relaxed);
+                            self.shared_position
+                                .is_slewing
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                 }
