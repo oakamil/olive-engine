@@ -58,12 +58,21 @@ pub trait CameraTrait: Send + Sync {
     fn set_stack_count(&self, _count: usize) {}
     fn enable_hcg(&self);
     fn disable_hcg(&self);
+    fn get_focus(&self) -> Option<f32> {
+        None
+    }
     fn set_focus(&self, _distance: f32) {}
     fn set_noise_reduction(&self, _mode: u8) {}
     fn get_brightness_range(&self) -> Option<(i32, i32, i32)> {
         None
     }
+    fn get_brightness(&self) -> Option<i32> {
+        None
+    }
     fn set_brightness(&self, _brightness: i32) {}
+    fn get_zoom(&self) -> Option<f32> {
+        None
+    }
     fn set_zoom(&self, _zoom: f32) {}
     fn wait_for_next_capture(
         &self,

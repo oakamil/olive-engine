@@ -66,7 +66,7 @@ fn start_engine(
     );
 
     let camera: Arc<dyn CameraTrait> = if uvc {
-        let mut cam = UvcCamera::new(uvc_fps.unwrap_or(30), uvc_mjpeg, None, false);
+        let mut cam = UvcCamera::new(uvc_fps.unwrap_or(30), uvc_mjpeg, None, false, None);
         cam.start_capture().expect("Failed to start UVC camera");
         Arc::new(cam)
     } else {

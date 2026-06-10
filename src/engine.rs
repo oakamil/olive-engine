@@ -114,6 +114,7 @@ pub struct EngineStateData {
     pub offset_alt: Option<f64>,
     pub offset_angle: Option<f64>,
     pub current_sigma: Option<f32>,
+    pub fov: Option<f64>,
 }
 
 impl Default for EngineStateData {
@@ -143,6 +144,7 @@ impl Default for EngineStateData {
             offset_alt: None,
             offset_angle: None,
             current_sigma: None,
+            fov: None,
         }
     }
 }
@@ -347,6 +349,7 @@ impl Engine {
         state.extract_ms = extract.as_secs_f64() * 1000.0;
         state.solve_ms = solve.as_secs_f64() * 1000.0;
         state.solve_rate_hz = solve_rate_hz;
+        state.fov = self.fov;
 
         if let (Some(cur_ra), Some(cur_dec), Some(t_ra), Some(t_dec)) =
             (ra, dec, target_ra, target_dec)

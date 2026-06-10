@@ -158,6 +158,10 @@ impl CameraTrait for Camera {
         self.send_command(CaptureCommand::SetExposure(exposure_us));
     }
 
+    fn get_brightness(&self) -> Option<i32> {
+        Some(self.current_brightness.load(Ordering::Relaxed))
+    }
+
     fn set_stack_count(&self, count: usize) {
         self.stack_count_config
             .store(count.clamp(1, 10), Ordering::Relaxed);
@@ -265,8 +269,16 @@ impl Camera {
         mjpeg_enabled: bool,
         target_res: Option<(u32, u32)>,
         allow_stacking: bool,
+        initial_gain: Option<f32>,
     ) -> Self {
-        Self::with_fd(target_fps, mjpeg_enabled, target_res, None, allow_stacking)
+        Self::with_fd(
+            target_fps,
+            mjpeg_enabled,
+            target_res,
+            None,
+            allow_stacking,
+            initial_gain,
+        )
     }
 
     pub fn with_fd(
@@ -275,13 +287,15 @@ impl Camera {
         target_res: Option<(u32, u32)>,
         fd: Option<i32>,
         allow_stacking: bool,
+        initial_gain: Option<f32>,
     ) -> Self {
         log::info!(
-            "Initializing UvcCamera with_fd: target_fps={}, mjpeg={}, fd={:?}, allow_stacking={}",
+            "Initializing UvcCamera with_fd: target_fps={}, mjpeg={}, fd={:?}, allow_stacking={}, initial_gain={:?}",
             target_fps,
             mjpeg_enabled,
             fd,
-            allow_stacking
+            allow_stacking,
+            initial_gain
         );
 
         let store = Arc::new(CaptureStore {
@@ -289,7 +303,7 @@ impl Camera {
             cvar: Condvar::new(),
         });
 
-        let current_exposure = Arc::new(AtomicI32::new(16670));
+        let current_exposure = Arc::new(AtomicI32::new(33_000)); // Default 30fps = 33ms
         let config = Arc::new(Mutex::new(None));
         let ranges = Arc::new(Mutex::new(None));
 
@@ -297,10 +311,10 @@ impl Camera {
             command_tx: None,
             store,
             capture_thread: None,
-            current_gain: Arc::new(AtomicU32::new(1f32.to_bits())),
+            current_gain: Arc::new(AtomicU32::new(initial_gain.unwrap_or(f32::NAN).to_bits())),
             current_exposure,
             current_brightness: Arc::new(AtomicI32::new(0)),
-            saved_gain: Arc::new(AtomicU32::new(1f32.to_bits())),
+            saved_gain: Arc::new(AtomicU32::new(initial_gain.unwrap_or(f32::NAN).to_bits())),
             stack_count_config: Arc::new(AtomicUsize::new(1)),
             allow_stacking,
             config,
@@ -570,7 +584,26 @@ impl Camera {
         };
         let _ = devh.set_white_balance_temperature_auto(false);
 
-        let initial_gain = f32::from_bits(current_gain_atomic.load(Ordering::Relaxed));
+        let mut initial_gain = f32::from_bits(current_gain_atomic.load(Ordering::Relaxed));
+        if initial_gain.is_nan() {
+            if let Some(r) = ranges_store
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|r| r.gain.as_ref())
+            {
+                initial_gain = r.max as f32;
+                log::info!(
+                    "No initial gain provided, defaulting to max gain: {}",
+                    initial_gain
+                );
+            } else {
+                initial_gain = 50.0;
+                log::info!("No initial gain and no range, defaulting to 50.0");
+            }
+            current_gain_atomic.store(initial_gain.to_bits(), Ordering::Relaxed);
+        }
+
         current_exposure_atomic.store((1_000_000 / stream_format.fps) as i32, Ordering::Relaxed);
 
         let _ = devh.set_gain(initial_gain as u16);
