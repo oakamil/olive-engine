@@ -22,6 +22,7 @@ use tetra3::{
     solver::{SolveOptions, SolveStatus},
     tetra3::Tetra3,
 };
+use tokio::sync::mpsc::Receiver;
 
 pub const MIN_CENTROIDS: usize = 4;
 pub const CALIBRATION_INTERVAL: Duration = Duration::from_secs(10);
@@ -36,7 +37,7 @@ pub struct EngineConfig {
     pub bg_mode: BgMode,
     pub extractor_type: Extractor,
     pub crop: Option<(usize, usize)>,
-    pub downsample: bool,
+    pub downsample: u8,
     pub bypass_calibration: bool,
     pub noise_filter: bool,
     pub initial_fov: Option<f32>,
@@ -55,7 +56,7 @@ impl Default for EngineConfig {
             bg_mode: BgMode::Line,
             extractor_type: Extractor::Sequential,
             crop: None,
-            downsample: true,
+            downsample: 0,
             bypass_calibration: false,
             noise_filter: false,
             initial_fov: None,
@@ -223,9 +224,9 @@ impl Engine {
         imu: Option<Arc<crate::imu::Imu>>,
         rt_handle: Option<tokio::runtime::Handle>,
         storage: Option<Arc<dyn PersistentStorage>>,
-        fd_receiver: Option<tokio::sync::mpsc::UnboundedReceiver<i32>>,
-        alpaca_fd_receiver: Option<tokio::sync::mpsc::UnboundedReceiver<i32>>,
-        alpaca_discovery_fd_receiver: Option<tokio::sync::mpsc::UnboundedReceiver<i32>>,
+        fd_receiver: Option<Receiver<i32>>,
+        alpaca_fd_receiver: Option<Receiver<i32>>,
+        alpaca_discovery_fd_receiver: Option<Receiver<i32>>,
     ) -> Self {
         let solver = Tetra3::new(&config.database_path);
         let config_fov = config.initial_fov.map(|f| f as f64);
@@ -521,16 +522,20 @@ impl Engine {
                                 None => (width, height),
                             };
 
-                            let downsample = if config_ext.downsample {
-                                if proc_width * proc_height > 2_000_000 {
-                                    FastDownsample::X4
-                                } else if proc_width * proc_height > 1_000_000 {
-                                    FastDownsample::X2
-                                } else {
-                                    FastDownsample::None
+                            let downsample = match config_ext.downsample {
+                                4 => FastDownsample::X4,
+                                2 => FastDownsample::X2,
+                                1 => FastDownsample::None, // explicitly Off
+                                _ => {
+                                    // 0 = Auto
+                                    if proc_width * proc_height > 2_000_000 {
+                                        FastDownsample::X4
+                                    } else if proc_width * proc_height > 1_000_000 {
+                                        FastDownsample::X2
+                                    } else {
+                                        FastDownsample::None
+                                    }
                                 }
-                            } else {
-                                FastDownsample::None
                             };
 
                             let bg_sub_mode = match config_ext.bg_mode {
@@ -617,16 +622,19 @@ impl Engine {
                                 noise_estimate,
                                 active_sigma as f64, // sigma
                                 true,                // normalize_rows
-                                if config_ext.downsample {
-                                    if crop_w * crop_h > 2_000_000 {
-                                        4
-                                    } else if crop_w * crop_h > 1_000_000 {
-                                        2
-                                    } else {
-                                        1
+                                match config_ext.downsample {
+                                    4 => 4,
+                                    2 => 2,
+                                    1 => 1,
+                                    _ => {
+                                        if crop_w * crop_h > 2_000_000 {
+                                            4
+                                        } else if crop_w * crop_h > 1_000_000 {
+                                            2
+                                        } else {
+                                            1
+                                        }
                                     }
-                                } else {
-                                    1
                                 }, // binning
                                 config_ext.noise_filter, // detect_hot_pixels
                                 false,               // return_binned_image

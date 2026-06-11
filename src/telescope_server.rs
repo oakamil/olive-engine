@@ -25,7 +25,7 @@ use starfield::{precessionlib::compute_precession, time::Timescale};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
-    sync::mpsc::UnboundedReceiver,
+    sync::mpsc::Receiver,
 };
 
 static TIMESCALE: OnceLock<Timescale> = OnceLock::new();
@@ -195,7 +195,7 @@ pub trait Lx200Telescope {
 pub struct Lx200WifiTelescope {
     controller: Arc<RwLock<Lx200Controller>>,
     is_running: Arc<AtomicBool>,
-    fd_receiver: Option<UnboundedReceiver<i32>>,
+    fd_receiver: Option<Receiver<i32>>,
 }
 
 #[async_trait]
@@ -261,7 +261,7 @@ impl Lx200WifiTelescope {
     pub fn new(
         shared_position: Arc<SharedPosition>,
         is_running: Arc<AtomicBool>,
-        fd_receiver: Option<UnboundedReceiver<i32>>,
+        fd_receiver: Option<Receiver<i32>>,
     ) -> Self {
         Lx200WifiTelescope {
             controller: Arc::new(RwLock::new(Lx200Controller::new(shared_position))),

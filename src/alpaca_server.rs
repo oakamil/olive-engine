@@ -13,7 +13,7 @@ use axum::{
 };
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
-use tokio::{net::UdpSocket, sync::mpsc::UnboundedReceiver};
+use tokio::{net::UdpSocket, sync::mpsc::Receiver};
 
 use crate::telescope_server::{SharedPosition, TargetOp};
 
@@ -24,17 +24,17 @@ const DISCOVERY_PORT: u16 = 32227;
 pub struct AlpacaServer {
     shared_position: Arc<SharedPosition>,
     is_running: Arc<AtomicBool>,
-    fd_receiver: Arc<tokio::sync::Mutex<Option<UnboundedReceiver<i32>>>>,
+    fd_receiver: Arc<tokio::sync::Mutex<Option<Receiver<i32>>>>,
     #[allow(dead_code)]
-    discovery_fd_receiver: Arc<tokio::sync::Mutex<Option<UnboundedReceiver<i32>>>>,
+    discovery_fd_receiver: Arc<tokio::sync::Mutex<Option<Receiver<i32>>>>,
 }
 
 impl AlpacaServer {
     pub fn new(
         shared_position: Arc<SharedPosition>,
         is_running: Arc<AtomicBool>,
-        fd_receiver: Option<UnboundedReceiver<i32>>,
-        discovery_fd_receiver: Option<UnboundedReceiver<i32>>,
+        fd_receiver: Option<Receiver<i32>>,
+        discovery_fd_receiver: Option<Receiver<i32>>,
     ) -> Self {
         Self {
             shared_position,
