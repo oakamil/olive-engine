@@ -768,9 +768,11 @@ impl Engine {
         }
 
         // Apply static hardware settings ONCE at startup
-        let gain = self.config.gain.unwrap_or(self.camera.get_gain_range().2);
-        info!("Setting base hardware settings...");
-        self.camera.set_gain(gain);
+        let initial_gain = self.config.gain;
+        if let Some(g) = initial_gain {
+            info!("Setting base hardware settings...");
+            self.camera.set_gain(g);
+        }
         self.camera.enable_hcg();
 
         if self.config.bypass_calibration {
@@ -806,7 +808,8 @@ impl Engine {
                 info!("Client disconnected. Restarting calibration hardware reset.");
                 was_connected = false;
                 self.camera.restore_state();
-                self.camera.set_gain(gain);
+                let g = initial_gain.unwrap_or(self.camera.get_gain_range().2);
+                self.camera.set_gain(g);
                 self.camera.enable_hcg();
             }
 
