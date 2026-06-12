@@ -121,7 +121,7 @@ async fn main() {
         isp: if args.uvc { false } else { args.isp },
         bg_mode: args.bg_mode,
         extractor_type: args.extractor_type,
-        downsample: !args.no_downsample,
+        downsample: if args.no_downsample { 0 } else { 1 },
         bypass_calibration: args.bypass_calibration,
         ..Default::default()
     };
@@ -162,6 +162,7 @@ async fn main() {
         imu,
         None,
         storage,
+        None,
         None,
         None,
     );
