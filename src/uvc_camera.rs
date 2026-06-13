@@ -708,10 +708,6 @@ impl Camera {
 
         std::thread::sleep(Duration::from_millis(500));
 
-        // Set auto exposure to Auto AE, wait 50 ms
-        let _ = devh.set_ae_mode(AutoExposureMode::Auto);
-        std::thread::sleep(Duration::from_millis(50));
-
         // Turn off auto-exposure
         match devh.set_ae_mode(AutoExposureMode::Manual) {
             Err(_) => {
