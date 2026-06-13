@@ -537,78 +537,9 @@ impl Camera {
             }
         };
 
-        // Per empirical results with an SC2210 camera, set all values to their defaults
-        if let Some(range) = uvc_ranges.saturation {
-            let _ = devh.set_saturation(range.default.try_into().unwrap());
-        }
-        if let Some(range) = uvc_ranges.contrast {
-            let _ = devh.set_contrast(range.default.try_into().unwrap());
-        }
-        if let Some(range) = uvc_ranges.white_balance_temperature {
-            let _ = devh.set_white_balance_temperature(range.default.try_into().unwrap());
-        }
-        if let Some(range) = uvc_ranges.sharpness {
-            let _ = devh.set_sharpness(range.default.try_into().unwrap());
-        }
-        if let Some(range) = uvc_ranges.brightness {
-            let def: i16 = range.default.try_into().unwrap();
-            let _ = devh.set_brightness(def);
-            current_brightness_atomic.store(range.default, Ordering::Relaxed);
-        }
-        if let Some(range) = uvc_ranges.gamma {
-            let _ = devh.set_gamma(range.default.try_into().unwrap());
-        }
-
         {
             let mut lock = ranges_store.lock().unwrap();
-            *lock = Some(uvc_ranges);
-        }
-
-        // Turn off auto-exposure and auto-white-balance
-        // Turn off auto-exposure and auto-white-balance
-        match devh.set_ae_mode(AutoExposureMode::Manual) {
-            Err(_) => {
-                // Fall back to ShutterPriority if supported
-                info!("Failed to set auto-exposure mode to manual");
-                let supported_ae_modes = devh.supported_ae_modes().unwrap_or(Vec::new());
-                if supported_ae_modes.contains(&AutoExposureMode::ShutterPriority) {
-                    match devh.set_ae_mode(AutoExposureMode::ShutterPriority) {
-                        Err(_) => warn!("Failed to set shutter priority mode"),
-                        _ => {}
-                    };
-                } else {
-                    warn!("Shutter priority not supported!");
-                }
-            }
-            _ => {}
-        };
-        let _ = devh.set_white_balance_temperature_auto(false);
-
-        let mut initial_gain = f32::from_bits(current_gain_atomic.load(Ordering::Relaxed));
-        if initial_gain.is_nan() {
-            if let Some(r) = ranges_store
-                .lock()
-                .unwrap()
-                .as_ref()
-                .and_then(|r| r.gain.as_ref())
-            {
-                initial_gain = r.max as f32;
-                log::info!(
-                    "No initial gain provided, defaulting to max gain: {}",
-                    initial_gain
-                );
-            } else {
-                initial_gain = 50.0;
-                log::info!("No initial gain and no range, defaulting to 50.0");
-            }
-            current_gain_atomic.store(initial_gain.to_bits(), Ordering::Relaxed);
-        }
-
-        current_exposure_atomic.store((1_000_000 / stream_format.fps) as i32, Ordering::Relaxed);
-
-        let _ = devh.set_gain(initial_gain as u16);
-        if let Err(e) = devh.set_exposure_abs(10000 / stream_format.fps) {
-            log::warn!("Failed to set initial UVC exposure: {:?}", e);
+            *lock = Some(uvc_ranges.clone());
         }
 
         {
@@ -625,6 +556,7 @@ impl Camera {
 
         let store_clone = Arc::clone(&store);
         let stack_count_config_clone = Arc::clone(&stack_count_config);
+        let current_exposure_atomic_clone = Arc::clone(&current_exposure_atomic);
 
         struct StreamContext {
             stacked_count: usize,
@@ -762,7 +694,7 @@ impl Camera {
                             width: width as u32,
                             height: height as u32,
                             timestamp,
-                            exposure_time_us: current_exposure_atomic.load(Ordering::Relaxed)
+                            exposure_time_us: current_exposure_atomic_clone.load(Ordering::Relaxed)
                                 * (target_stack.max(1) as i32),
                             post_process_time,
                         }));
@@ -773,6 +705,81 @@ impl Camera {
             )
             .expect("Failed to start stream");
         log::info!("UVC stream started successfully");
+
+        std::thread::sleep(Duration::from_millis(500));
+
+        // Set auto exposure to Auto AE, wait 50 ms
+        let _ = devh.set_ae_mode(AutoExposureMode::Auto);
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Turn off auto-exposure
+        match devh.set_ae_mode(AutoExposureMode::Manual) {
+            Err(_) => {
+                // Fall back to ShutterPriority if supported
+                info!("Failed to set auto-exposure mode to manual");
+                let supported_ae_modes = devh.supported_ae_modes().unwrap_or(Vec::new());
+                if supported_ae_modes.contains(&AutoExposureMode::ShutterPriority) {
+                    match devh.set_ae_mode(AutoExposureMode::ShutterPriority) {
+                        Err(_) => warn!("Failed to set shutter priority mode"),
+                        _ => {}
+                    };
+                } else {
+                    warn!("Shutter priority not supported!");
+                }
+            }
+            _ => {}
+        };
+
+        // Disable AWB
+        let _ = devh.set_white_balance_temperature_auto(false);
+
+        // Per empirical results with an SC2210 camera, set all values to their defaults
+        if let Some(range) = uvc_ranges.saturation {
+            let _ = devh.set_saturation(range.default.try_into().unwrap());
+        }
+        if let Some(range) = uvc_ranges.contrast {
+            let _ = devh.set_contrast(range.default.try_into().unwrap());
+        }
+        if let Some(range) = uvc_ranges.white_balance_temperature {
+            let _ = devh.set_white_balance_temperature(range.default.try_into().unwrap());
+        }
+        if let Some(range) = uvc_ranges.sharpness {
+            let _ = devh.set_sharpness(range.default.try_into().unwrap());
+        }
+        if let Some(range) = uvc_ranges.brightness {
+            let def: i16 = range.default.try_into().unwrap();
+            let _ = devh.set_brightness(def);
+            current_brightness_atomic.store(range.default, Ordering::Relaxed);
+        }
+        if let Some(range) = uvc_ranges.gamma {
+            let _ = devh.set_gamma(range.default.try_into().unwrap());
+        }
+
+        // Delaying to ensure that the camera fully transitions to manual / shutter priority mode
+        std::thread::sleep(Duration::from_millis(100));
+
+        current_exposure_atomic.store((1_000_000 / stream_format.fps) as i32, Ordering::Relaxed);
+        if let Err(e) = devh.set_exposure_abs(10000 / stream_format.fps) {
+            log::warn!("Failed to set initial UVC exposure: {:?}", e);
+        }
+
+        let mut initial_gain = f32::from_bits(current_gain_atomic.load(Ordering::Relaxed));
+        if initial_gain.is_nan() {
+            if let Some(r) = uvc_ranges.gain.as_ref() {
+                initial_gain = r.max as f32;
+                log::info!(
+                    "No initial gain provided, defaulting to max gain: {}",
+                    initial_gain
+                );
+            } else {
+                initial_gain = 50.0;
+                log::info!("No initial gain and no range, defaulting to 50.0");
+            }
+            current_gain_atomic.store(initial_gain.to_bits(), Ordering::Relaxed);
+        }
+        let _ = devh.set_gain(initial_gain as u16);
+
+        // Keep stream_handle alive for the duration of the loop
 
         // Keep stream_handle alive for the duration of the loop
 
@@ -791,21 +798,16 @@ impl Camera {
                     *store.image.lock().unwrap() = None;
                 }
                 Ok(CaptureCommand::SetUvcControls(controls)) => {
-                    let mut current_ae_mode = AutoExposureMode::Manual;
-                    let supported_ae_modes = devh.supported_ae_modes().unwrap_or(Vec::new());
-                    if supported_ae_modes.contains(&AutoExposureMode::ShutterPriority)
-                        && !supported_ae_modes.contains(&AutoExposureMode::Manual)
-                    {
-                        current_ae_mode = AutoExposureMode::ShutterPriority;
-                    }
                     if let Some(val) = controls.ae_mode {
-                        current_ae_mode = match val {
+                        let mut current_ae_mode = match val {
                             1 => AutoExposureMode::Manual,
                             2 => AutoExposureMode::Auto,
                             4 => AutoExposureMode::ShutterPriority,
                             8 => AutoExposureMode::AperturePriority,
                             _ => AutoExposureMode::Manual,
                         };
+
+                        let supported_ae_modes = devh.supported_ae_modes().unwrap_or(Vec::new());
                         // Enforce fallback if Manual isn't supported
                         if current_ae_mode == AutoExposureMode::Manual
                             && supported_ae_modes.contains(&AutoExposureMode::ShutterPriority)
@@ -813,10 +815,10 @@ impl Camera {
                         {
                             current_ae_mode = AutoExposureMode::ShutterPriority;
                         }
-                    }
-                    let _ = devh.set_ae_mode(current_ae_mode);
-                    let _ = devh.set_white_balance_temperature_auto(false);
 
+                        let _ = devh.set_ae_mode(current_ae_mode);
+                        let _ = devh.set_white_balance_temperature_auto(false);
+                    }
                     if let Some(val) = controls.saturation {
                         let _ = devh.set_saturation(val.try_into().unwrap_or(0));
                     }
