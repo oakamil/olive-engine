@@ -13,6 +13,20 @@ use std::time::{Duration, SystemTime};
 use turbojpeg;
 use uvc::{AutoExposureMode, FrameFormat};
 
+macro_rules! try_set_control {
+    ($name:expr, $action:expr) => {
+        if let Err(e) = $action {
+            log::warn!("Failed to set {}: {:?}. Retrying in 100ms...", $name, e);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if let Err(e2) = $action {
+                log::warn!("Failed to set {} on retry: {:?}", $name, e2);
+            } else {
+                log::info!("Successfully set {} on retry.", $name);
+            }
+        }
+    };
+}
+
 // --- Data Structures ---
 
 #[derive(Clone, Debug, Default)]
@@ -72,6 +86,7 @@ pub struct Camera {
     mjpeg_enabled: bool,
     target_res: Option<(u32, u32)>,
     fd: Option<i32>,
+    descriptors: Option<Vec<u8>>,
 }
 
 impl CameraTrait for Camera {
@@ -99,6 +114,7 @@ impl CameraTrait for Camera {
         let mjpeg_enabled = self.mjpeg_enabled;
         let target_res = self.target_res;
         let fd = self.fd;
+        let descriptors = self.descriptors.clone();
 
         self.capture_thread = Some(thread::spawn(move || {
             Self::capture_loop(
@@ -113,6 +129,7 @@ impl CameraTrait for Camera {
                 mjpeg_enabled,
                 target_res,
                 fd,
+                descriptors,
                 stack_count_config,
             );
         }));
@@ -276,6 +293,7 @@ impl Camera {
             mjpeg_enabled,
             target_res,
             None,
+            None,
             allow_stacking,
             initial_gain,
         )
@@ -286,6 +304,7 @@ impl Camera {
         mjpeg_enabled: bool,
         target_res: Option<(u32, u32)>,
         fd: Option<i32>,
+        descriptors: Option<Vec<u8>>,
         allow_stacking: bool,
         initial_gain: Option<f32>,
     ) -> Self {
@@ -323,6 +342,7 @@ impl Camera {
             mjpeg_enabled,
             target_res,
             fd,
+            descriptors,
         }
     }
 
@@ -348,13 +368,23 @@ impl Camera {
         mjpeg_enabled: bool,
         target_res: Option<(u32, u32)>,
         fd: Option<i32>,
+        descriptors: Option<Vec<u8>>,
         stack_count_config: Arc<AtomicUsize>,
     ) {
         let ctx = uvc::Context::new().expect("Failed to create UVC context");
 
         let mut _dev_keep_alive = None;
         let devh = if let Some(fd) = fd {
-            ctx.wrap_fd(fd).expect("Failed to open UVC device with FD")
+            if let Some(ref d) = descriptors {
+                ctx.wrap_fd_with_descriptors(fd, d).unwrap_or_else(|e| {
+                    panic!(
+                        "Failed to open UVC device with descriptors. Error: {:?}, raw err code",
+                        e
+                    )
+                })
+            } else {
+                ctx.wrap_fd(fd).expect("Failed to open UVC device with FD")
+            }
         } else {
             let dev = ctx
                 .find_device(None, None, None)
@@ -709,55 +739,60 @@ impl Camera {
         std::thread::sleep(Duration::from_millis(500));
 
         // Turn off auto-exposure
-        match devh.set_ae_mode(AutoExposureMode::Manual) {
-            Err(_) => {
-                // Fall back to ShutterPriority if supported
-                info!("Failed to set auto-exposure mode to manual");
-                let supported_ae_modes = devh.supported_ae_modes().unwrap_or(Vec::new());
-                if supported_ae_modes.contains(&AutoExposureMode::ShutterPriority) {
-                    match devh.set_ae_mode(AutoExposureMode::ShutterPriority) {
-                        Err(_) => warn!("Failed to set shutter priority mode"),
-                        _ => {}
-                    };
-                } else {
-                    warn!("Shutter priority not supported!");
-                }
-            }
-            _ => {}
-        };
+        let supported_ae_modes = devh.supported_ae_modes().unwrap_or(Vec::new());
+        if supported_ae_modes.contains(&AutoExposureMode::Manual) {
+            try_set_control!("ae_mode manual", devh.set_ae_mode(AutoExposureMode::Manual));
+        } else if supported_ae_modes.contains(&AutoExposureMode::ShutterPriority) {
+            try_set_control!(
+                "ae_mode shutter priority",
+                devh.set_ae_mode(AutoExposureMode::ShutterPriority)
+            );
+        } else {
+            log::warn!("Neither Manual nor Shutter priority auto exposure modes are supported!");
+        }
 
         // Disable AWB
-        let _ = devh.set_white_balance_temperature_auto(false);
+        try_set_control!("awb off", devh.set_white_balance_temperature_auto(false));
 
         // Per empirical results with an SC2210 camera, set all values to their defaults
         if let Some(range) = uvc_ranges.saturation {
-            let _ = devh.set_saturation(range.default.try_into().unwrap());
+            try_set_control!(
+                "saturation",
+                devh.set_saturation(range.default.try_into().unwrap())
+            );
         }
         if let Some(range) = uvc_ranges.contrast {
-            let _ = devh.set_contrast(range.default.try_into().unwrap());
+            try_set_control!(
+                "contrast",
+                devh.set_contrast(range.default.try_into().unwrap())
+            );
         }
         if let Some(range) = uvc_ranges.white_balance_temperature {
-            let _ = devh.set_white_balance_temperature(range.default.try_into().unwrap());
+            try_set_control!(
+                "white_balance_temp",
+                devh.set_white_balance_temperature(range.default.try_into().unwrap())
+            );
         }
         if let Some(range) = uvc_ranges.sharpness {
-            let _ = devh.set_sharpness(range.default.try_into().unwrap());
+            try_set_control!(
+                "sharpness",
+                devh.set_sharpness(range.default.try_into().unwrap())
+            );
         }
         if let Some(range) = uvc_ranges.brightness {
             let def: i16 = range.default.try_into().unwrap();
-            let _ = devh.set_brightness(def);
+            try_set_control!("brightness", devh.set_brightness(def));
             current_brightness_atomic.store(range.default, Ordering::Relaxed);
         }
         if let Some(range) = uvc_ranges.gamma {
-            let _ = devh.set_gamma(range.default.try_into().unwrap());
+            try_set_control!("gamma", devh.set_gamma(range.default.try_into().unwrap()));
         }
 
         // Delaying to ensure that the camera fully transitions to manual / shutter priority mode
         std::thread::sleep(Duration::from_millis(100));
 
         current_exposure_atomic.store((1_000_000 / stream_format.fps) as i32, Ordering::Relaxed);
-        if let Err(e) = devh.set_exposure_abs(10000 / stream_format.fps) {
-            log::warn!("Failed to set initial UVC exposure: {:?}", e);
-        }
+        try_set_control!("exposure", devh.set_exposure_abs(10000 / stream_format.fps));
 
         let mut initial_gain = f32::from_bits(current_gain_atomic.load(Ordering::Relaxed));
         if initial_gain.is_nan() {
@@ -773,7 +808,7 @@ impl Camera {
             }
             current_gain_atomic.store(initial_gain.to_bits(), Ordering::Relaxed);
         }
-        let _ = devh.set_gain(initial_gain as u16);
+        try_set_control!("gain", devh.set_gain(initial_gain as u16));
 
         // Keep stream_handle alive for the duration of the loop
 
@@ -784,12 +819,12 @@ impl Camera {
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(CaptureCommand::StopCaptureThread) => break,
                 Ok(CaptureCommand::SetGain(gain)) => {
-                    let _ = devh.set_gain(gain as u16);
+                    try_set_control!("gain", devh.set_gain(gain as u16));
 
                     *store.image.lock().unwrap() = None;
                 }
                 Ok(CaptureCommand::SetExposure(exposure)) => {
-                    let _ = devh.set_exposure_abs((exposure / 100) as u32);
+                    try_set_control!("exposure", devh.set_exposure_abs((exposure / 100) as u32));
 
                     *store.image.lock().unwrap() = None;
                 }
@@ -812,34 +847,48 @@ impl Camera {
                             current_ae_mode = AutoExposureMode::ShutterPriority;
                         }
 
-                        let _ = devh.set_ae_mode(current_ae_mode);
-                        let _ = devh.set_white_balance_temperature_auto(false);
+                        try_set_control!("ae_mode", devh.set_ae_mode(current_ae_mode));
+                        try_set_control!("awb off", devh.set_white_balance_temperature_auto(false));
                     }
                     if let Some(val) = controls.saturation {
-                        let _ = devh.set_saturation(val.try_into().unwrap_or(0));
+                        try_set_control!(
+                            "saturation",
+                            devh.set_saturation(val.try_into().unwrap_or(0))
+                        );
                     }
                     if let Some(val) = controls.contrast {
-                        let _ = devh.set_contrast(val.try_into().unwrap_or(0));
+                        try_set_control!(
+                            "contrast",
+                            devh.set_contrast(val.try_into().unwrap_or(0))
+                        );
                     }
                     if let Some(val) = controls.white_balance_temperature {
-                        let _ = devh.set_white_balance_temperature(val.try_into().unwrap_or(0));
+                        try_set_control!(
+                            "white_balance_temp",
+                            devh.set_white_balance_temperature(val.try_into().unwrap_or(0))
+                        );
                     }
                     if let Some(val) = controls.sharpness {
-                        let _ = devh.set_sharpness(val.try_into().unwrap_or(0));
+                        try_set_control!(
+                            "sharpness",
+                            devh.set_sharpness(val.try_into().unwrap_or(0))
+                        );
                     }
                     if let Some(val) = controls.brightness {
-                        let _ = devh.set_brightness(val.try_into().unwrap_or(0));
+                        try_set_control!(
+                            "brightness",
+                            devh.set_brightness(val.try_into().unwrap_or(0))
+                        );
                     }
                     if let Some(val) = controls.gamma {
-                        let _ = devh.set_gamma(val.try_into().unwrap_or(0));
+                        try_set_control!("gamma", devh.set_gamma(val.try_into().unwrap_or(0)));
                     }
                     if let Some(val) = controls.gain {
-                        let _ = devh.set_gain(val.try_into().unwrap_or(0));
+                        try_set_control!("gain", devh.set_gain(val.try_into().unwrap_or(0)));
                     }
 
                     if let Some(val) = controls.exposure_abs {
-                        let _ = devh.set_exposure_abs(val);
-                    } else {
+                        try_set_control!("exposure_abs", devh.set_exposure_abs(val));
                     }
 
                     *store.image.lock().unwrap() = None;
