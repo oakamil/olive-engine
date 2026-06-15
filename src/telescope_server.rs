@@ -8,8 +8,6 @@
 //
 
 use std::io::ErrorKind;
-use std::net::TcpStream as StdTcpStream;
-use std::os::unix::io::FromRawFd;
 use std::sync::{
     RwLock,
     atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering},
@@ -24,8 +22,7 @@ use nalgebra::Vector3;
 use starfield::{precessionlib::compute_precession, time::Timescale};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream},
-    sync::mpsc::Receiver,
+    net::TcpListener,
 };
 
 static TIMESCALE: OnceLock<Timescale> = OnceLock::new();
@@ -195,52 +192,25 @@ pub trait Lx200Telescope {
 pub struct Lx200WifiTelescope {
     controller: Arc<RwLock<Lx200Controller>>,
     is_running: Arc<AtomicBool>,
-    fd_receiver: Option<Receiver<i32>>,
 }
 
 #[async_trait]
 impl Lx200Telescope for Lx200WifiTelescope {
     async fn serve_requests(&mut self) -> Result<(), Box<dyn Error + 'static>> {
-        if let Some(mut rx) = self.fd_receiver.take() {
-            info!("Running LX200 server via Kotlin FDs");
-            loop {
-                match rx.recv().await {
-                    Some(fd) => {
-                        let std_stream = unsafe { StdTcpStream::from_raw_fd(fd) };
-                        if let Err(e) = std_stream.set_nonblocking(true) {
-                            warn!("Failed to set FD nonblocking: {}", e);
-                            continue;
-                        }
-                        match TcpStream::from_std(std_stream) {
-                            Ok(stream) => {
-                                debug!("WiFi LX200 connection opened from Kotlin FD");
-                                self.spawn_connection_handler(stream);
-                            }
-                            Err(e) => {
-                                warn!("Failed to wrap FD in tokio stream: {}", e);
-                            }
-                        }
-                    }
-                    None => break,
-                }
-            }
-            Ok(())
-        } else {
-            let listener = TcpListener::bind("0.0.0.0:4030").await?;
-            info!(
-                "Running LX200 server on: {}",
-                listener.local_addr().unwrap()
-            );
+        let listener = TcpListener::bind("0.0.0.0:4030").await?;
+        info!(
+            "Running LX200 server on: {}",
+            listener.local_addr().unwrap()
+        );
 
-            loop {
-                match listener.accept().await {
-                    Ok((stream, _)) => {
-                        debug!("WiFi LX200 connection opened");
-                        self.spawn_connection_handler(stream);
-                    }
-                    Err(e) => {
-                        warn!("Failed to accept WiFi LX200 connection: {:?}", e);
-                    }
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    debug!("WiFi LX200 connection opened");
+                    self.spawn_connection_handler(stream);
+                }
+                Err(e) => {
+                    warn!("Failed to accept WiFi LX200 connection: {:?}", e);
                 }
             }
         }
@@ -258,21 +228,21 @@ impl Lx200WifiTelescope {
             debug!("WiFi LX200 connection closed");
         });
     }
-    pub fn new(
-        shared_position: Arc<SharedPosition>,
-        is_running: Arc<AtomicBool>,
-        fd_receiver: Option<Receiver<i32>>,
-    ) -> Self {
+    pub fn get_controller(&self) -> Arc<RwLock<Lx200Controller>> {
+        self.controller.clone()
+    }
+
+    pub fn new(shared_position: Arc<SharedPosition>, is_running: Arc<AtomicBool>) -> Self {
         Lx200WifiTelescope {
             controller: Arc::new(RwLock::new(Lx200Controller::new(shared_position))),
             is_running,
-            fd_receiver,
         }
     }
 }
 
 #[derive(Default, Debug)]
-struct Lx200Controller {
+pub struct Lx200Controller {
+    pub client_buffer: Vec<u8>,
     shared_position: Arc<SharedPosition>,
 
     // Pending target coordinates (in jnow_epoch) for sync/slew
@@ -301,7 +271,7 @@ struct Lx200Controller {
 
     // Stellarium seems to use J2000 epoch. If Stellarium is connected do not
     // precess.
-    is_stellarium: bool,
+    pub is_stellarium: bool,
 }
 
 impl Lx200Controller {
@@ -320,7 +290,40 @@ impl Lx200Controller {
             timezone: None,
             time: None,
             is_stellarium: false,
+            client_buffer: Vec::new(),
         }
+    }
+
+    pub fn process_client_data(&mut self, data: &[u8]) -> Vec<u8> {
+        let mut response = Vec::new();
+        for &byte in data {
+            self.client_buffer.push(byte);
+
+            if self.client_buffer.len() == 1 && self.client_buffer[0] == 0x06 {
+                self.is_stellarium = true;
+                response.extend_from_slice(b"A");
+                self.client_buffer.clear();
+                continue;
+            }
+            if self.client_buffer == b"$$$" {
+                self.client_buffer.clear();
+                continue;
+            }
+            if self.client_buffer.len() > 1024 {
+                self.client_buffer.clear();
+                continue;
+            }
+            if byte == b'#' {
+                if self.client_buffer.len() > 1 {
+                    let cmd_buffer = self.client_buffer.clone();
+                    if let Some(res) = self.process_input(&cmd_buffer) {
+                        response.extend_from_slice(res.as_bytes());
+                    }
+                }
+                self.client_buffer.clear();
+            }
+        }
+        response
     }
 
     // Returns the command portion of the input string

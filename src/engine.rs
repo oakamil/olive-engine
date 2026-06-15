@@ -160,6 +160,8 @@ pub struct Engine {
 
     shared_position: Arc<SharedPosition>,
     pub telescope_server_handle: Option<tokio::task::JoinHandle<()>>,
+    pub lx200_controller:
+        std::sync::Arc<std::sync::RwLock<crate::telescope_server::Lx200Controller>>,
     pub alpaca_server_handle: Option<tokio::task::JoinHandle<()>>,
     pub rt_handle: Option<tokio::runtime::Handle>,
     target_ra: Option<f64>,
@@ -224,7 +226,6 @@ impl Engine {
         imu: Option<Arc<crate::imu::Imu>>,
         rt_handle: Option<tokio::runtime::Handle>,
         storage: Option<Arc<dyn PersistentStorage>>,
-        fd_receiver: Option<Receiver<i32>>,
         alpaca_fd_receiver: Option<Receiver<i32>>,
         alpaca_discovery_fd_receiver: Option<Receiver<i32>>,
     ) -> Self {
@@ -233,8 +234,8 @@ impl Engine {
         let shared_position = Arc::new(SharedPosition::default());
         let is_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
-        let mut server =
-            Lx200WifiTelescope::new(shared_position.clone(), is_running.clone(), fd_receiver);
+        let mut server = Lx200WifiTelescope::new(shared_position.clone(), is_running.clone());
+        let lx200_controller = server.get_controller();
         let alpaca_server = AlpacaServer::new(
             shared_position.clone(),
             is_running.clone(),
@@ -286,6 +287,7 @@ impl Engine {
             telescope_server_handle: Some(telescope_server_handle),
             alpaca_server_handle: Some(alpaca_server_handle),
             rt_handle,
+            lx200_controller,
         }
     }
 
