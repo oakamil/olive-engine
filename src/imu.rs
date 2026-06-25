@@ -211,7 +211,8 @@ impl Imu {
                             .as_secs_f64();
                         let gyro_mag = gyro_vec_rad.norm();
 
-                        let delta_q = if gyro_mag > 1e-6 {
+                        // 0.001 rad/s is approx 0.057 deg/s, a better deadband for stationary drift
+                        let delta_q = if gyro_mag > 0.001 {
                             UnitQuaternion::new(gyro_vec_rad * dt)
                         } else {
                             UnitQuaternion::identity()
@@ -766,6 +767,23 @@ impl Imu {
         align.error_history.clear();
     }
 
+    // Clears the entire calibration matrix, history, and deletes the persistent file.
+    pub async fn clear_calibration(&self) {
+        let mut align = self.alignment.write().await;
+        align.mount_q = UnitQuaternion::identity();
+        align.calibration_axes.clear();
+        align.loaded_from_disk = false;
+        align.best_calibration_confidence = 0.0;
+
+        if let Some(storage) = self.storage.clone() {
+            tokio::spawn(async move {
+                storage.remove(CALIBRATION_FILE);
+                info!("Deleted IMU calibration file from persistent storage.");
+            });
+        }
+        info!("IMU calibration matrix and history have been cleared.");
+    }
+
     // IMU-derived estimate of camera pointing as of the given time.
     pub async fn get_estimated_pointing(
         &self,
@@ -776,6 +794,10 @@ impl Imu {
         if let (Some(anchor_horiz), Some(anchor_quat)) =
             (align.last_camera_position, align.imu_anchor_state)
         {
+            if !align.loaded_from_disk && align.calibration_axes.len() < 3 {
+                return Ok(anchor_horiz);
+            }
+
             // 1. Fetch the raw IMU state for the requested time
             let target_q = self.get_historical_quat(timestamp).unwrap_or_else(|| {
                 debug!("get_estimated falling back to real-time quaternion");
@@ -787,6 +809,11 @@ impl Imu {
             // meaning it includes any arbitrary physical mounting offsets (roll, pitch, yaw)
             // between how the IMU is mounted versus how the camera sensor is oriented.
             let imu_local_delta = anchor_quat.conjugate() * target_q;
+
+            // Reject tiny movements to avoid reporting stationary drift
+            if imu_local_delta.angle().to_degrees() < 0.05 {
+                return Ok(anchor_horiz);
+            }
 
             // 3. Coordinate Transformation (Similarity Transform / Change of Basis).
             // We must convert the IMU's local movement into the camera's optical reference frame.
