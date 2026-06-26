@@ -116,6 +116,8 @@ pub struct EngineStateData {
     pub offset_angle: Option<f64>,
     pub current_sigma: Option<f32>,
     pub fov: Option<f64>,
+    pub requested_target_ra: Option<f64>,
+    pub requested_target_dec: Option<f64>,
 }
 
 impl Default for EngineStateData {
@@ -146,6 +148,8 @@ impl Default for EngineStateData {
             offset_angle: None,
             current_sigma: None,
             fov: None,
+            requested_target_ra: None,
+            requested_target_dec: None,
         }
     }
 }
@@ -1268,6 +1272,26 @@ impl Engine {
             {
                 let mut pending_sync = None;
                 {
+                    if let Ok(mut st) = self.engine_state.write() {
+                        if let (Some(ra), Some(dec)) =
+                            (st.requested_target_ra, st.requested_target_dec)
+                        {
+                            self.target_ra = Some(ra);
+                            self.target_dec = Some(dec);
+                            st.requested_target_ra = None;
+                            st.requested_target_dec = None;
+
+                            // Let the shared position know we are slewing so external clients get updated state if any
+                            self.shared_position
+                                .target_op
+                                .store(Some(TargetOp::Slew), std::sync::atomic::Ordering::Relaxed);
+                            self.shared_position
+                                .is_slewing
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                            info!("Engine received target request: RA={}, Dec={}", ra, dec);
+                        }
+                    }
+
                     let target_op = self
                         .shared_position
                         .target_op
