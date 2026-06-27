@@ -118,6 +118,7 @@ pub struct EngineStateData {
     pub fov: Option<f64>,
     pub requested_target_ra: Option<f64>,
     pub requested_target_dec: Option<f64>,
+    pub requested_align_target_pixel: Option<(f64, f64)>,
 }
 
 impl Default for EngineStateData {
@@ -150,6 +151,7 @@ impl Default for EngineStateData {
             fov: None,
             requested_target_ra: None,
             requested_target_dec: None,
+            requested_align_target_pixel: None,
         }
     }
 }
@@ -1289,6 +1291,13 @@ impl Engine {
                                 .is_slewing
                                 .store(true, std::sync::atomic::Ordering::Relaxed);
                             info!("Engine received target request: RA={}, Dec={}", ra, dec);
+                        }
+
+                        if let Some((x, y)) = st.requested_align_target_pixel {
+                            self.target_pixel = Some((x, y));
+                            self.save_target_pixel(self.target_pixel);
+                            st.requested_align_target_pixel = None;
+                            info!("Engine received align target pixel request: ({}, {})", x, y);
                         }
                     }
 
