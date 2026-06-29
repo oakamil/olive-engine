@@ -396,13 +396,70 @@ impl Engine {
         }
     }
 
-    pub fn start(self) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
+    pub fn start(
+        self,
+    ) -> (
+        std::thread::JoinHandle<()>,
+        std::thread::JoinHandle<()>,
+        Option<std::thread::JoinHandle<()>>,
+    ) {
         let camera_ext = self.camera.clone();
         let config_ext = self.config.clone();
         let shared_res_ext = self.shared_result.clone();
         let engine_state_ext = self.engine_state.clone();
         let is_running_ext = self.is_running.clone();
         let client_connected_ext = self.client_connected.clone();
+
+        let t3 = if let Some(imu_arc) = self.imu.clone() {
+            let shared_pos_clone = self.shared_position.clone();
+            let engine_state_clone = self.engine_state.clone();
+            let is_running_clone = self.is_running.clone();
+
+            Some(std::thread::spawn(move || {
+                const IMU_UPDATE_INTERVAL: std::time::Duration =
+                    std::time::Duration::from_millis(100);
+                while is_running_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Ok(est) = futures::executor::block_on(
+                        imu_arc.get_estimated_pointing(&SystemTime::now()),
+                    ) {
+                        let lat_opt;
+                        let lon_opt;
+                        let client_date;
+                        {
+                            let engine_state = engine_state_clone.read().unwrap();
+                            lat_opt = engine_state.client_latitude.or(shared_pos_clone
+                                .site_latitude
+                                .load(std::sync::atomic::Ordering::Relaxed));
+                            lon_opt = engine_state.client_longitude.or(shared_pos_clone
+                                .site_longitude
+                                .load(std::sync::atomic::Ordering::Relaxed));
+                            client_date = engine_state.client_date;
+                        }
+
+                        if let (Some(lat), Some(lon)) = (lat_opt, lon_opt) {
+                            let dt = client_date.unwrap_or_else(chrono::Utc::now);
+                            let (ra, dec, eq_roll) =
+                                alt_az_to_ra_dec(est.pitch, est.yaw, est.roll, lat, lon, dt);
+
+                            shared_pos_clone
+                                .telescope_ra
+                                .store(ra.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                            shared_pos_clone
+                                .telescope_dec
+                                .store(dec.to_bits(), std::sync::atomic::Ordering::Relaxed);
+
+                            let mut state_write = engine_state_clone.write().unwrap();
+                            state_write.ra = Some(ra);
+                            state_write.dec = Some(dec);
+                            state_write.roll = Some(eq_roll);
+                        }
+                    }
+                    std::thread::sleep(IMU_UPDATE_INTERVAL);
+                }
+            }))
+        } else {
+            None
+        };
 
         let t1 = std::thread::spawn(move || {
             let mut extractor: Option<FastExtractor> = None;
@@ -736,7 +793,7 @@ impl Engine {
                 engine.run_solving_loop();
             }
         });
-        (t1, t2)
+        (t1, t2, t3)
     }
 
     fn wait_for_extraction(
