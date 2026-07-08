@@ -17,6 +17,7 @@ const MIN_CALIBRATION_CONFIDENCE: f64 = 0.15;
 const HARDWARE_ALTERATION_THRESHOLD_DEG: f64 = 10.0;
 // Wait this many frames after physical movement stops to allow the accelerometer's
 // gravity vector to completely level out.
+#[allow(dead_code)]
 const SETTLE_FRAMES: usize = 15;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -244,7 +245,10 @@ impl Imu {
                             motion_state,
                         };
 
-                        let _ = state_tx.send(Some(update));
+                        if state_tx.send(Some(update)).is_err() {
+                            log::info!("IMU state channel disconnected. Stopping polling thread.");
+                            break;
+                        }
 
                         {
                             let mut hist = history_clone.lock().unwrap();
@@ -390,73 +394,6 @@ impl Imu {
         Some(closest_quat)
     }
 
-    // State-bracketed extraction: Finds the exact moment the mount transitioned to Motionless.
-    fn get_post_slew_quat(&self, target_time: &SystemTime) -> Option<UnitQuaternion<f64>> {
-        let hist = self.history.lock().unwrap();
-        if hist.is_empty() {
-            return None;
-        }
-
-        let oldest_time = hist.front().unwrap().0;
-
-        if *target_time < oldest_time {
-            let diff = oldest_time.duration_since(*target_time).unwrap_or_default();
-            if diff > Duration::from_secs(2) {
-                return None;
-            }
-        }
-
-        let mut closest_idx = 0;
-        let mut min_diff = Duration::from_secs(u64::MAX);
-
-        for (i, (time, _, _, _)) in hist.iter().enumerate() {
-            let diff = if time > target_time {
-                time.duration_since(*target_time).unwrap_or_default()
-            } else {
-                target_time.duration_since(*time).unwrap_or_default()
-            };
-
-            if diff < min_diff {
-                min_diff = diff;
-                closest_idx = i;
-            }
-        }
-
-        if min_diff > Duration::from_secs(5) {
-            return None;
-        }
-
-        // --- STATE-BRACKETED EXTRACTION WITH DECELERATION SETTLING ---
-        let mut selected_idx = closest_idx;
-
-        if hist[selected_idx].2 == MotionState::Moving {
-            // Target landed during a slew. Scan forward (newer frames) to find the first Stable frame.
-            for i in selected_idx..hist.len() {
-                if hist[i].2 == MotionState::Stable {
-                    selected_idx = i + SETTLE_FRAMES;
-                    break;
-                }
-            }
-        } else {
-            // Target landed during stillness. Scan backward (older frames) to find the exact moment
-            // the mount transitioned from Moving to Stable, isolating the true end of the slew.
-            for i in (0..selected_idx).rev() {
-                if hist[i].2 == MotionState::Moving {
-                    selected_idx = (i + 1) + SETTLE_FRAMES;
-                    break;
-                }
-            }
-        }
-
-        // Safety bound check: If the settle period pushes us past the newest frame in the buffer,
-        // just grab the absolute newest frame available.
-        if selected_idx >= hist.len() {
-            selected_idx = hist.len() - 1;
-        }
-
-        Some(hist[selected_idx].1)
-    }
-
     fn mount_to_quat(coord: &MountCoordinates) -> UnitQuaternion<f64> {
         UnitQuaternion::from_euler_angles(
             coord.roll.to_radians(),
@@ -481,7 +418,7 @@ impl Imu {
                 "{},{},{},{},{}",
                 mount_q[0], mount_q[1], mount_q[2], mount_q[3], confidence
             );
-            tokio::spawn(async move {
+            std::thread::spawn(move || {
                 storage.set(CALIBRATION_FILE, &data);
                 debug!("Successfully wrote calibration back to storage");
             });
@@ -492,8 +429,8 @@ impl Imu {
         let imu_state = *self.state_rx.borrow();
 
         if imu_state.is_some() {
-            // Utilize State-Bracketed extraction to find the exact moment the slew finished
-            let historical_imu_q = self.get_post_slew_quat(timestamp);
+            // Find the exact historical quaternion that matches the image timestamp
+            let historical_imu_q = self.get_historical_quat(timestamp);
 
             if let Some(hist_q) = historical_imu_q {
                 let mut align = self.alignment.write().await;
@@ -599,17 +536,17 @@ impl Imu {
                                             align.mount_q = calculated_q;
                                             align.best_calibration_confidence = new_pool_confidence;
 
-                                            // Only lock to disk once it proves baseline 3D volume
-                                            if is_mature
-                                                && new_pool_confidence >= MIN_CALIBRATION_CONFIDENCE
-                                            {
+                                            // Save to disk immediately so progress isn't lost if the app closes
+                                            self.save_calibration_to_disk(
+                                                align.mount_q,
+                                                align.best_calibration_confidence,
+                                            );
+
+                                            // Only lock to High Water Mark mode once we have enough diverse data points
+                                            if is_mature {
                                                 align.loaded_from_disk = true; // Upgrade status to protected
-                                                self.save_calibration_to_disk(
-                                                    align.mount_q,
-                                                    align.best_calibration_confidence,
-                                                );
                                                 info!(
-                                                    "Initial Calibration Locked! Confidence: {:.1}%",
+                                                    "Bootstrapping complete. Calibration Locked! Confidence: {:.1}%",
                                                     align.best_calibration_confidence * 100.0
                                                 );
                                             }
@@ -776,7 +713,7 @@ impl Imu {
         align.best_calibration_confidence = 0.0;
 
         if let Some(storage) = self.storage.clone() {
-            tokio::spawn(async move {
+            std::thread::spawn(move || {
                 storage.remove(CALIBRATION_FILE);
                 info!("Deleted IMU calibration file from persistent storage.");
             });

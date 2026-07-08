@@ -12,6 +12,7 @@ use chrono::{Datelike, Timelike};
 use log::{debug, error, info, warn};
 use ndarray::{Array2, s};
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::Receiver
 
 use crate::CameraTrait;
 use crate::alpaca_server::AlpacaServer;
@@ -22,7 +23,6 @@ use tetra3::{
     solver::{SolveOptions, SolveStatus},
     tetra3::Tetra3,
 };
-use tokio::sync::mpsc::Receiver;
 
 pub const MIN_CENTROIDS: usize = 4;
 pub const CALIBRATION_INTERVAL: Duration = Duration::from_secs(10);
@@ -287,7 +287,7 @@ impl Engine {
             storage,
             client_connected,
             engine_state,
-            solve_timestamps: std::collections::VecDeque::new(),
+            solve_timestamps: std::collections::VecDeque::with_capacity(60),
             shared_result: Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new())),
             is_running,
             telescope_server_handle: Some(telescope_server_handle),
@@ -417,7 +417,7 @@ impl Engine {
 
             Some(std::thread::spawn(move || {
                 const IMU_UPDATE_INTERVAL: std::time::Duration =
-                    std::time::Duration::from_millis(100);
+                    std::time::Duration::from_millis(33);
                 while is_running_clone.load(std::sync::atomic::Ordering::Relaxed) {
                     if let Ok(est) = futures::executor::block_on(
                         imu_arc.get_estimated_pointing(&SystemTime::now()),
@@ -448,10 +448,50 @@ impl Engine {
                                 .telescope_dec
                                 .store(dec.to_bits(), std::sync::atomic::Ordering::Relaxed);
 
-                            let mut state_write = engine_state_clone.write().unwrap();
-                            state_write.ra = Some(ra);
-                            state_write.dec = Some(dec);
-                            state_write.roll = Some(eq_roll);
+                            if let Ok(mut state) = engine_state_clone.write() {
+                                state.ra = Some(ra);
+                                state.dec = Some(dec);
+                                state.roll = Some(eq_roll);
+
+                                if let (Some(cur_ra), Some(cur_dec), Some(t_ra), Some(t_dec)) =
+                                    (Some(ra), Some(dec), state.target_ra, state.target_dec)
+                                {
+                                    let d_ra = angle_diff_deg(t_ra, cur_ra);
+                                    let d_dec = t_dec - cur_dec;
+                                    state.offset_ra = Some(d_ra);
+                                    state.offset_dec = Some(d_dec);
+
+                                    if let (Some(lat), Some(lon)) =
+                                        (state.client_latitude, state.client_longitude)
+                                    {
+                                        let time = chrono::Utc::now();
+                                        let (cur_alt, cur_az) =
+                                            calculate_alt_az(cur_ra, cur_dec, lat, lon, &time);
+                                        let (t_alt, t_az) =
+                                            calculate_alt_az(t_ra, t_dec, lat, lon, &time);
+
+                                        let d_alt = t_alt - cur_alt;
+                                        let d_az = angle_diff_deg(t_az, cur_az);
+
+                                        state.offset_alt = Some(d_alt);
+                                        state.offset_az = Some(d_az);
+
+                                        let x = -d_az * cur_alt.to_radians().cos();
+                                        let y = d_alt;
+                                        state.offset_angle = Some(x.atan2(y).to_degrees());
+                                    } else {
+                                        state.offset_alt = None;
+                                        state.offset_az = None;
+                                        state.offset_angle = None;
+                                    }
+                                } else {
+                                    state.offset_ra = None;
+                                    state.offset_dec = None;
+                                    state.offset_alt = None;
+                                    state.offset_az = None;
+                                    state.offset_angle = None;
+                                }
+                            }
                         }
                     }
                     std::thread::sleep(IMU_UPDATE_INTERVAL);
@@ -1517,12 +1557,10 @@ impl Engine {
                         }
                         solved = true;
 
-                        self.shared_position
-                            .telescope_ra
-                            .store(ra.to_bits(), Ordering::Relaxed);
-                        self.shared_position
-                            .telescope_dec
-                            .store(dec.to_bits(), Ordering::Relaxed);
+                        let mut final_ra = ra;
+                        let mut final_dec = dec;
+                        let mut final_roll = solution.roll;
+
                         let engine_state = self.engine_state.read().unwrap();
                         let lat_opt = engine_state
                             .client_latitude
@@ -1547,14 +1585,33 @@ impl Engine {
                                 futures::executor::block_on(
                                     imu.update_anchor(&mount_coords, &img_timestamp),
                                 );
+
+                                if let Ok(est) = futures::executor::block_on(
+                                    imu.get_estimated_pointing(&SystemTime::now()),
+                                ) {
+                                    let dt_now = client_date.unwrap_or_else(chrono::Utc::now);
+                                    let (current_ra, current_dec, current_roll) = alt_az_to_ra_dec(
+                                        est.pitch, est.yaw, est.roll, lat, lon, dt_now,
+                                    );
+                                    final_ra = current_ra;
+                                    final_dec = current_dec;
+                                    final_roll = Some(current_roll);
+                                }
                             }
                         }
 
+                        self.shared_position
+                            .telescope_ra
+                            .store(final_ra.to_bits(), Ordering::Relaxed);
+                        self.shared_position
+                            .telescope_dec
+                            .store(final_dec.to_bits(), Ordering::Relaxed);
+
                         self.update_solve_stats(
                             true,
-                            Some(ra),
-                            Some(dec),
-                            solution.roll,
+                            Some(final_ra),
+                            Some(final_dec),
+                            final_roll,
                             count,
                             self.target_ra,
                             self.target_dec,

@@ -613,7 +613,13 @@ impl Camera {
                     );
 
                     let receive_time = std::time::Instant::now();
-                    let timestamp = SystemTime::now();
+
+                    let target_stack = stack_count_config_clone.load(Ordering::Relaxed);
+                    let current_exposure = current_exposure_atomic_clone.load(Ordering::Relaxed);
+                    let total_exposure_us = (current_exposure * target_stack.max(1) as i32) as u64;
+                    let half_exposure = std::time::Duration::from_micros(total_exposure_us / 2);
+                    let pipeline_latency = std::time::Duration::from_millis(30);
+                    let timestamp = SystemTime::now() - half_exposure - pipeline_latency;
 
                     let mut width = frame.width() as usize;
                     let mut height = frame.height() as usize;
@@ -627,7 +633,6 @@ impl Camera {
 
                     let mut image_data = Vec::new();
                     let mut direct_accumulate = false;
-                    let target_stack = stack_count_config_clone.load(Ordering::Relaxed);
 
                     if frame.format() == FrameFormat::MJPEG {
                         let mut decompressor = match turbojpeg::Decompressor::new() {
@@ -792,7 +797,8 @@ impl Camera {
         std::thread::sleep(Duration::from_millis(100));
 
         current_exposure_atomic.store((1_000_000 / stream_format.fps) as i32, Ordering::Relaxed);
-        try_set_control!("exposure", devh.set_exposure_abs(10000 / stream_format.fps));
+        // Setting exposure locks up some cameras, skip for now
+        // try_set_control!("exposure", devh.set_exposure_abs(10000 / stream_format.fps));
 
         let mut initial_gain = f32::from_bits(current_gain_atomic.load(Ordering::Relaxed));
         if initial_gain.is_nan() {
