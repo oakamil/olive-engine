@@ -12,7 +12,7 @@ use chrono::{Datelike, Timelike};
 use log::{debug, error, info, warn};
 use ndarray::{Array2, s};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::Receiver
+use tokio::sync::mpsc::Receiver;
 
 use crate::CameraTrait;
 use crate::alpaca_server::AlpacaServer;

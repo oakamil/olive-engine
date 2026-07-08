@@ -348,7 +348,10 @@ impl Imu {
     }
 
     // For real-time UI queries. Finds the literal closest timestamp without bracketing logic.
-    fn get_historical_quat(&self, target_time: &SystemTime) -> Option<UnitQuaternion<f64>> {
+    fn get_historical_quat(
+        &self,
+        target_time: &SystemTime,
+    ) -> Option<(UnitQuaternion<f64>, MotionState)> {
         let hist = self.history.lock().unwrap();
         if hist.is_empty() {
             return None;
@@ -368,9 +371,10 @@ impl Imu {
         }
 
         let mut closest_quat = hist[0].1;
+        let mut closest_motion = hist[0].2;
         let mut min_diff = Duration::from_secs(u64::MAX);
 
-        for (time, quat, _, _) in hist.iter() {
+        for (time, quat, motion, _) in hist.iter() {
             let diff = if time > target_time {
                 time.duration_since(*target_time).unwrap_or_default()
             } else {
@@ -380,6 +384,7 @@ impl Imu {
             if diff < min_diff {
                 min_diff = diff;
                 closest_quat = *quat;
+                closest_motion = *motion;
             }
         }
 
@@ -391,7 +396,7 @@ impl Imu {
             return None;
         }
 
-        Some(closest_quat)
+        Some((closest_quat, closest_motion))
     }
 
     fn mount_to_quat(coord: &MountCoordinates) -> UnitQuaternion<f64> {
@@ -432,7 +437,14 @@ impl Imu {
             // Find the exact historical quaternion that matches the image timestamp
             let historical_imu_q = self.get_historical_quat(timestamp);
 
-            if let Some(hist_q) = historical_imu_q {
+            if let Some((hist_q, motion_state)) = historical_imu_q {
+                if motion_state != MotionState::Stable {
+                    debug!(
+                        "Image was captured during movement. Rejecting anchor to prevent timestamp and rolling shutter artifacts."
+                    );
+                    return;
+                }
+
                 let mut align = self.alignment.write().await;
                 let new_true_q = Self::mount_to_quat(camera_pointing);
 
@@ -736,10 +748,13 @@ impl Imu {
             }
 
             // 1. Fetch the raw IMU state for the requested time
-            let target_q = self.get_historical_quat(timestamp).unwrap_or_else(|| {
-                debug!("get_estimated falling back to real-time quaternion");
-                self.state_rx.borrow().unwrap().quaternion
-            });
+            let target_q = self
+                .get_historical_quat(timestamp)
+                .map(|h| h.0)
+                .unwrap_or_else(|| {
+                    debug!("get_estimated falling back to real-time quaternion");
+                    self.state_rx.borrow().unwrap().quaternion
+                });
 
             // 2. Calculate the raw physical movement of the IMU chip itself.
             // This rotational delta is strictly in the IMU's local reference frame,
