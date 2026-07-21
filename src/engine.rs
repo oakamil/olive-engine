@@ -16,12 +16,10 @@ use tokio::sync::mpsc::Receiver;
 
 use crate::CameraTrait;
 use crate::alpaca_server::AlpacaServer;
-use crate::storage::PersistentStorage;
 use crate::telescope_server::{Lx200Telescope, Lx200WifiTelescope, SharedPosition, TargetOp};
 use tetra3::{
     fast_extractor::{FastBgSubMode, FastDownsample, FastExtractOptions, FastExtractor},
     solver::{SolveOptions, SolveStatus},
-    tetra3::Tetra3,
 };
 
 pub const MIN_CENTROIDS: usize = 4;
@@ -160,9 +158,8 @@ impl Default for EngineStateData {
 pub struct Engine {
     camera: Arc<dyn CameraTrait>,
     config: EngineConfig,
-    solver: Tetra3,
+    pub fused_solver: Arc<olive_solve::FusedSolver>,
     fov: Option<f64>,
-    imu: Option<Arc<crate::imu::Imu>>,
 
     shared_position: Arc<SharedPosition>,
     pub telescope_server_handle: Option<tokio::task::JoinHandle<()>>,
@@ -173,7 +170,7 @@ pub struct Engine {
     target_ra: Option<f64>,
     target_dec: Option<f64>,
     target_pixel: Option<(f64, f64)>,
-    storage: Option<Arc<dyn PersistentStorage>>,
+    storage: Option<Arc<dyn olive_imu::storage::PersistentStorage>>,
     client_connected: Arc<std::sync::atomic::AtomicBool>,
     engine_state: Arc<RwLock<EngineStateData>>,
     solve_timestamps: std::collections::VecDeque<Instant>,
@@ -224,18 +221,26 @@ fn calculate_alt_az(
 }
 
 impl Engine {
-    pub fn new(
+    pub async fn new(
         camera: Arc<dyn CameraTrait>,
         config: EngineConfig,
         client_connected: Arc<std::sync::atomic::AtomicBool>,
         engine_state: Arc<RwLock<EngineStateData>>,
-        imu: Option<Arc<crate::imu::Imu>>,
+        imu_type: Option<olive_solve::ImuType>,
         rt_handle: Option<tokio::runtime::Handle>,
-        storage: Option<Arc<dyn PersistentStorage>>,
+        storage: Option<Arc<dyn olive_imu::storage::PersistentStorage>>,
         alpaca_fd_receiver: Option<Receiver<i32>>,
         alpaca_discovery_fd_receiver: Option<Receiver<i32>>,
     ) -> Self {
-        let solver = Tetra3::new(&config.database_path);
+        let fused_solver = Arc::new(
+            olive_solve::FusedSolver::new(
+                std::path::Path::new(&config.database_path),
+                imu_type,
+                storage.clone(),
+            )
+            .await
+            .expect("Failed to initialize FusedSolver"),
+        );
         let config_fov = config.initial_fov.map(|f| f as f64);
         let shared_position = Arc::new(SharedPosition::default());
         let is_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -274,12 +279,84 @@ impl Engine {
             (t_handle, a_handle)
         };
 
+        let engine_state_clone = engine_state.clone();
+        let shared_pos_clone = shared_position.clone();
+        let fused_solver_clone = fused_solver.clone();
+        let is_running_clone = is_running.clone();
+
+        let polling_task = async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(33));
+            while is_running_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                interval.tick().await;
+                if let Some(pos) = fused_solver_clone.get_latest_position().await {
+                    shared_pos_clone
+                        .telescope_ra
+                        .store(pos.ra.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                    shared_pos_clone
+                        .telescope_dec
+                        .store(pos.dec.to_bits(), std::sync::atomic::Ordering::Relaxed);
+
+                    if let Ok(mut state) = engine_state_clone.write() {
+                        state.ra = Some(pos.ra);
+                        state.dec = Some(pos.dec);
+                        state.roll = Some(pos.roll);
+
+                        if let (Some(cur_ra), Some(cur_dec), Some(t_ra), Some(t_dec)) = (
+                            Some(pos.ra),
+                            Some(pos.dec),
+                            state.target_ra,
+                            state.target_dec,
+                        ) {
+                            let d_ra = angle_diff_deg(t_ra, cur_ra);
+                            let d_dec = t_dec - cur_dec;
+                            state.offset_ra = Some(d_ra);
+                            state.offset_dec = Some(d_dec);
+
+                            if let (Some(lat), Some(lon)) =
+                                (state.client_latitude, state.client_longitude)
+                            {
+                                let time = chrono::Utc::now();
+                                let (cur_alt, cur_az) =
+                                    calculate_alt_az(cur_ra, cur_dec, lat, lon, &time);
+                                let (t_alt, t_az) = calculate_alt_az(t_ra, t_dec, lat, lon, &time);
+
+                                let d_alt = t_alt - cur_alt;
+                                let d_az = angle_diff_deg(t_az, cur_az);
+
+                                state.offset_alt = Some(d_alt);
+                                state.offset_az = Some(d_az);
+
+                                let x = -d_az * cur_alt.to_radians().cos();
+                                let y = d_alt;
+                                state.offset_angle = Some(x.atan2(y).to_degrees());
+                            } else {
+                                state.offset_alt = None;
+                                state.offset_az = None;
+                                state.offset_angle = None;
+                            }
+                        } else {
+                            state.offset_ra = None;
+                            state.offset_dec = None;
+                            state.offset_alt = None;
+                            state.offset_az = None;
+                            state.offset_angle = None;
+                        }
+                    }
+                }
+            }
+        };
+
+        if let Some(ref h) = rt_handle {
+            h.spawn(polling_task);
+        } else {
+            tokio::spawn(polling_task);
+        }
+
         Self {
             camera,
             config,
-            solver,
+            fused_solver,
             fov: config_fov,
-            imu,
             shared_position,
             target_ra: None,
             target_dec: None,
@@ -297,7 +374,9 @@ impl Engine {
         }
     }
 
-    fn load_target_pixel(storage: Option<&dyn PersistentStorage>) -> Option<(f64, f64)> {
+    fn load_target_pixel(
+        storage: Option<&dyn olive_imu::storage::PersistentStorage>,
+    ) -> Option<(f64, f64)> {
         storage.and_then(|s| s.get("target_pixel")).and_then(|s| {
             let parts: Vec<&str> = s.split(',').collect();
             if parts.len() == 2 {
@@ -328,9 +407,6 @@ impl Engine {
     fn update_solve_stats(
         &mut self,
         solved: bool,
-        ra: Option<f64>,
-        dec: Option<f64>,
-        roll: Option<f64>,
         centroids: usize,
         target_ra: Option<f64>,
         target_dec: Option<f64>,
@@ -347,9 +423,6 @@ impl Engine {
         let solve_rate_hz = self.solve_timestamps.len() as f64 / 5.0;
 
         let mut state = self.engine_state.write().unwrap();
-        state.ra = ra;
-        state.dec = dec;
-        state.roll = roll;
         state.centroids = centroids;
         state.target_ra = target_ra;
         state.target_dec = target_dec;
@@ -359,147 +432,15 @@ impl Engine {
         state.solve_ms = solve.as_secs_f64() * 1000.0;
         state.solve_rate_hz = solve_rate_hz;
         state.fov = self.fov;
-
-        if let (Some(cur_ra), Some(cur_dec), Some(t_ra), Some(t_dec)) =
-            (ra, dec, target_ra, target_dec)
-        {
-            let d_ra = angle_diff_deg(t_ra, cur_ra);
-            let d_dec = t_dec - cur_dec;
-            state.offset_ra = Some(d_ra);
-            state.offset_dec = Some(d_dec);
-
-            if let (Some(lat), Some(lon)) = (state.client_latitude, state.client_longitude) {
-                let time = chrono::Utc::now();
-                let (cur_alt, cur_az) = calculate_alt_az(cur_ra, cur_dec, lat, lon, &time);
-                let (t_alt, t_az) = calculate_alt_az(t_ra, t_dec, lat, lon, &time);
-
-                let d_alt = t_alt - cur_alt;
-                let d_az = angle_diff_deg(t_az, cur_az);
-
-                state.offset_alt = Some(d_alt);
-                state.offset_az = Some(d_az);
-
-                let x = -d_az * cur_alt.to_radians().cos();
-                let y = d_alt;
-                state.offset_angle = Some(x.atan2(y).to_degrees());
-            } else {
-                state.offset_alt = None;
-                state.offset_az = None;
-                state.offset_angle = None;
-            }
-        } else {
-            state.offset_ra = None;
-            state.offset_dec = None;
-            state.offset_alt = None;
-            state.offset_az = None;
-            state.offset_angle = None;
-        }
     }
 
-    pub fn start(
-        self,
-    ) -> (
-        std::thread::JoinHandle<()>,
-        std::thread::JoinHandle<()>,
-        Option<std::thread::JoinHandle<()>>,
-    ) {
+    pub fn start(self) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
         let camera_ext = self.camera.clone();
         let config_ext = self.config.clone();
         let shared_res_ext = self.shared_result.clone();
         let engine_state_ext = self.engine_state.clone();
         let is_running_ext = self.is_running.clone();
         let client_connected_ext = self.client_connected.clone();
-
-        let t3 = if let Some(imu_arc) = self.imu.clone() {
-            let shared_pos_clone = self.shared_position.clone();
-            let engine_state_clone = self.engine_state.clone();
-            let is_running_clone = self.is_running.clone();
-
-            Some(std::thread::spawn(move || {
-                const IMU_UPDATE_INTERVAL: std::time::Duration =
-                    std::time::Duration::from_millis(33);
-                while is_running_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                    if let Ok(est) = futures::executor::block_on(
-                        imu_arc.get_estimated_pointing(&SystemTime::now()),
-                    ) {
-                        let lat_opt;
-                        let lon_opt;
-                        let client_date;
-                        {
-                            let engine_state = engine_state_clone.read().unwrap();
-                            lat_opt = engine_state.client_latitude.or(shared_pos_clone
-                                .site_latitude
-                                .load(std::sync::atomic::Ordering::Relaxed));
-                            lon_opt = engine_state.client_longitude.or(shared_pos_clone
-                                .site_longitude
-                                .load(std::sync::atomic::Ordering::Relaxed));
-                            client_date = engine_state.client_date;
-                        }
-
-                        if let (Some(lat), Some(lon)) = (lat_opt, lon_opt) {
-                            let dt = client_date.unwrap_or_else(chrono::Utc::now);
-                            let (ra, dec, eq_roll) =
-                                alt_az_to_ra_dec(est.pitch, est.yaw, est.roll, lat, lon, dt);
-
-                            shared_pos_clone
-                                .telescope_ra
-                                .store(ra.to_bits(), std::sync::atomic::Ordering::Relaxed);
-                            shared_pos_clone
-                                .telescope_dec
-                                .store(dec.to_bits(), std::sync::atomic::Ordering::Relaxed);
-
-                            if let Ok(mut state) = engine_state_clone.write() {
-                                state.ra = Some(ra);
-                                state.dec = Some(dec);
-                                state.roll = Some(eq_roll);
-
-                                if let (Some(cur_ra), Some(cur_dec), Some(t_ra), Some(t_dec)) =
-                                    (Some(ra), Some(dec), state.target_ra, state.target_dec)
-                                {
-                                    let d_ra = angle_diff_deg(t_ra, cur_ra);
-                                    let d_dec = t_dec - cur_dec;
-                                    state.offset_ra = Some(d_ra);
-                                    state.offset_dec = Some(d_dec);
-
-                                    if let (Some(lat), Some(lon)) =
-                                        (state.client_latitude, state.client_longitude)
-                                    {
-                                        let time = chrono::Utc::now();
-                                        let (cur_alt, cur_az) =
-                                            calculate_alt_az(cur_ra, cur_dec, lat, lon, &time);
-                                        let (t_alt, t_az) =
-                                            calculate_alt_az(t_ra, t_dec, lat, lon, &time);
-
-                                        let d_alt = t_alt - cur_alt;
-                                        let d_az = angle_diff_deg(t_az, cur_az);
-
-                                        state.offset_alt = Some(d_alt);
-                                        state.offset_az = Some(d_az);
-
-                                        let x = -d_az * cur_alt.to_radians().cos();
-                                        let y = d_alt;
-                                        state.offset_angle = Some(x.atan2(y).to_degrees());
-                                    } else {
-                                        state.offset_alt = None;
-                                        state.offset_az = None;
-                                        state.offset_angle = None;
-                                    }
-                                } else {
-                                    state.offset_ra = None;
-                                    state.offset_dec = None;
-                                    state.offset_alt = None;
-                                    state.offset_az = None;
-                                    state.offset_angle = None;
-                                }
-                            }
-                        }
-                    }
-                    std::thread::sleep(IMU_UPDATE_INTERVAL);
-                }
-            }))
-        } else {
-            None
-        };
 
         let t1 = std::thread::spawn(move || {
             let mut extractor: Option<FastExtractor> = None;
@@ -833,7 +774,7 @@ impl Engine {
                 engine.run_solving_loop();
             }
         });
-        (t1, t2, t3)
+        (t1, t2)
     }
 
     fn wait_for_extraction(
@@ -888,8 +829,6 @@ impl Engine {
         let target_min = self.config.target_centroids;
         let target_max = (self.config.target_centroids as f64 * 1.25).round() as usize;
 
-        let mut imu_calibration_start: Option<Instant> = None;
-        let mut first_solve: Option<(f64, f64)> = None;
         let mut was_connected = false;
 
         loop {
@@ -922,9 +861,6 @@ impl Engine {
             self.update_status("Calibration");
             self.update_solve_stats(
                 false,
-                None,
-                None,
-                None,
                 0,
                 None,
                 None,
@@ -985,9 +921,6 @@ impl Engine {
                     {
                         self.update_solve_stats(
                             false,
-                            None,
-                            None,
-                            None,
                             count,
                             self.target_ra,
                             self.target_dec,
@@ -1045,26 +978,14 @@ impl Engine {
 
                     if let Some(arr) = &last_centroids_arr {
                         let solve_start = Instant::now();
-                        let solution = self.solver.solve_from_centroids(&arr.slice(s![..min(40, arr.nrows()), ..]).to_owned(), size, SolveOptions::default())
+                        let solution = futures::executor::block_on(self.fused_solver.solve_from_centroids(&arr.slice(s![..min(40, arr.nrows()), ..]).to_owned(), size, SolveOptions::default(), None))
                             .expect("Critical Error: solver failed to execute during calibration. Is the database path valid?");
                         let solve_time = solve_start.elapsed();
 
                         if matches!(solution.status, SolveStatus::MatchFound) {
-                            if let Some(imu) = &self.imu {
-                                if imu_calibration_start.is_none() {
-                                    imu.start_calibration();
-                                    imu_calibration_start = Some(Instant::now());
-                                    if let (Some(ra), Some(dec)) = (solution.ra, solution.dec) {
-                                        first_solve = Some((ra, dec));
-                                    }
-                                }
-                            }
                             self.fov = solution.fov;
                             self.update_solve_stats(
                                 true,
-                                solution.ra,
-                                solution.dec,
-                                solution.roll,
                                 0,
                                 None,
                                 None,
@@ -1155,16 +1076,15 @@ impl Engine {
                         let size = (camera_config.height as f64, camera_config.width as f64);
 
                         if let Some(arr) = &last_centroids_arr {
-                            let solution = self
-                                .solver
-                                .solve_from_centroids(
+                            let solution = futures::executor::block_on(
+                                self.fused_solver.solve_from_centroids(
                                     &arr.slice(s![..min(40, arr.nrows()), ..]).to_owned(),
                                     size,
                                     SolveOptions::default(),
-                                )
-                                .expect(
-                                    "Critical Error: solver failed to execute during calibration.",
-                                );
+                                    None,
+                                ),
+                            )
+                            .expect("Critical Error: solver failed to execute during calibration.");
 
                             if matches!(solution.status, SolveStatus::MatchFound) {
                                 self.fov = solution.fov;
@@ -1193,92 +1113,6 @@ impl Engine {
                     );
                     self.camera.restore_state();
                     calibrated = true;
-                }
-            }
-
-            if calibrated {
-                if let Some(imu) = &self.imu {
-                    if let Some(start_time) = imu_calibration_start {
-                        let elapsed = start_time.elapsed();
-                        if elapsed < Duration::from_secs(5) {
-                            info!("Waiting for IMU calibration to reach 5 seconds...");
-                            std::thread::sleep(Duration::from_secs(5) - elapsed);
-                        }
-
-                        let mut verified = false;
-                        info!("Taking final frame for IMU calibration verification...");
-
-                        if let Some((_, _, _, _, arr, _)) = self.wait_for_extraction() {
-                            let camera_config = self.camera.get_config().unwrap();
-                            let size = (camera_config.height as f64, camera_config.width as f64);
-                            if let Ok(solution) = self.solver.solve_from_centroids(
-                                &arr.slice(s![..min(40, arr.nrows()), ..]).to_owned(),
-                                size,
-                                SolveOptions::default(),
-                            ) {
-                                if matches!(solution.status, SolveStatus::MatchFound) {
-                                    if let Some((first_ra, first_dec)) = first_solve {
-                                        let time_diff = start_time.elapsed().as_secs_f64();
-                                        let max_expected_drift_deg =
-                                            (15.0 / 3600.0) * time_diff * 1.5;
-
-                                        if let (Some(ra), Some(dec)) = (solution.ra, solution.dec) {
-                                            let mut ra_diff = (ra - first_ra).abs();
-                                            if ra_diff > 180.0 {
-                                                ra_diff = 360.0 - ra_diff;
-                                            }
-                                            let dec_diff = (dec - first_dec).abs();
-
-                                            let total_drift_deg =
-                                                (ra_diff.powi(2) + dec_diff.powi(2)).sqrt();
-
-                                            if total_drift_deg <= max_expected_drift_deg + 0.1 {
-                                                verified = true;
-                                            } else {
-                                                warn!(
-                                                    "IMU calibration rejected due to large movement: {:.3} deg drift (expected max {:.3} deg)",
-                                                    total_drift_deg, max_expected_drift_deg
-                                                );
-                                            }
-                                        } else {
-                                            warn!(
-                                                "IMU calibration verification failed: missing ra/dec in final frame"
-                                            );
-                                        }
-                                    } else {
-                                        verified = true;
-                                    }
-                                } else {
-                                    warn!(
-                                        "IMU calibration verification failed: could not solve final frame"
-                                    );
-                                }
-                            } else {
-                                warn!("IMU calibration verification failed: solver error");
-                            }
-                        } else {
-                            warn!(
-                                "IMU calibration verification failed: could not extract centroids"
-                            );
-                        }
-
-                        if verified {
-                            imu.stop_calibration();
-                        } else {
-                            imu.abort_calibration();
-                            calibrated = false;
-                            imu_calibration_start = None;
-                            first_solve = None;
-                        }
-                    }
-                }
-            } else {
-                if let Some(imu) = &self.imu {
-                    if imu_calibration_start.is_some() {
-                        imu.abort_calibration();
-                        imu_calibration_start = None;
-                        first_solve = None;
-                    }
                 }
             }
 
@@ -1323,9 +1157,6 @@ impl Engine {
 
         self.update_solve_stats(
             false,
-            None,
-            None,
-            None,
             0,
             None,
             None,
@@ -1338,6 +1169,7 @@ impl Engine {
 
         let mut consecutive_failures = 0;
         const MAX_FAILURES: usize = 3;
+        let mut observer_location_set = false;
 
         // Rolling average buffer to smooth out frame-to-frame scintillation dips
         let mut recent_centroids: Vec<usize> = Vec::with_capacity(5);
@@ -1447,9 +1279,6 @@ impl Engine {
                     );
                     self.update_solve_stats(
                         false,
-                        None,
-                        None,
-                        None,
                         count,
                         self.target_ra,
                         self.target_dec,
@@ -1485,7 +1314,25 @@ impl Engine {
                         Some(Array2::from_shape_vec((1, 2), vec![t_ra, t_dec]).unwrap());
                 }
 
-                let solution = self.solver.solve_from_centroids(&centroids_arr.slice(s![..min(40, centroids_arr.nrows()), ..]).to_owned(), size, solve_options)
+                let engine_state = self.engine_state.read().unwrap();
+                let lat_opt = engine_state
+                    .client_latitude
+                    .or(self.shared_position.site_latitude.load(Ordering::Relaxed));
+                let lon_opt = engine_state
+                    .client_longitude
+                    .or(self.shared_position.site_longitude.load(Ordering::Relaxed));
+                drop(engine_state);
+
+                if !observer_location_set {
+                    if let (Some(lat), Some(lon)) = (lat_opt, lon_opt) {
+                        futures::executor::block_on(
+                            self.fused_solver.set_observer_location(lat, lon),
+                        );
+                        observer_location_set = true;
+                    }
+                }
+
+                let solution = futures::executor::block_on(self.fused_solver.solve_from_centroids(&centroids_arr.slice(s![..min(40, centroids_arr.nrows()), ..]).to_owned(), size, solve_options, Some(img_timestamp)))
                     .expect("Critical Error: solver failed to execute during solving loop. Is the database accessible?");
 
                 let solve_time = solve_start.elapsed();
@@ -1557,61 +1404,8 @@ impl Engine {
                         }
                         solved = true;
 
-                        let mut final_ra = ra;
-                        let mut final_dec = dec;
-                        let mut final_roll = solution.roll;
-
-                        let engine_state = self.engine_state.read().unwrap();
-                        let lat_opt = engine_state
-                            .client_latitude
-                            .or(self.shared_position.site_latitude.load(Ordering::Relaxed));
-                        let lon_opt = engine_state
-                            .client_longitude
-                            .or(self.shared_position.site_longitude.load(Ordering::Relaxed));
-                        let client_date = engine_state.client_date;
-                        drop(engine_state);
-
-                        if let Some(imu) = &self.imu {
-                            if let (Some(lat), Some(lon)) = (lat_opt, lon_opt) {
-                                let dt: chrono::DateTime<chrono::Utc> =
-                                    client_date.unwrap_or_else(|| img_timestamp.into());
-                                let (alt, az, alt_az_roll) =
-                                    ra_dec_to_alt_az(ra, dec, solution.roll.unwrap(), lat, lon, dt);
-                                let mount_coords = crate::imu::MountCoordinates {
-                                    pitch: alt,
-                                    yaw: az,
-                                    roll: alt_az_roll,
-                                };
-                                futures::executor::block_on(
-                                    imu.update_anchor(&mount_coords, &img_timestamp),
-                                );
-
-                                if let Ok(est) = futures::executor::block_on(
-                                    imu.get_estimated_pointing(&SystemTime::now()),
-                                ) {
-                                    let dt_now = client_date.unwrap_or_else(chrono::Utc::now);
-                                    let (current_ra, current_dec, current_roll) = alt_az_to_ra_dec(
-                                        est.pitch, est.yaw, est.roll, lat, lon, dt_now,
-                                    );
-                                    final_ra = current_ra;
-                                    final_dec = current_dec;
-                                    final_roll = Some(current_roll);
-                                }
-                            }
-                        }
-
-                        self.shared_position
-                            .telescope_ra
-                            .store(final_ra.to_bits(), Ordering::Relaxed);
-                        self.shared_position
-                            .telescope_dec
-                            .store(final_dec.to_bits(), Ordering::Relaxed);
-
                         self.update_solve_stats(
                             true,
-                            Some(final_ra),
-                            Some(final_dec),
-                            final_roll,
                             count,
                             self.target_ra,
                             self.target_dec,
@@ -1622,49 +1416,8 @@ impl Engine {
                         );
                     }
                     _ => {
-                        let mut est_ra = None;
-                        let mut est_dec = None;
-                        let mut est_roll = None;
-
-                        let engine_state = self.engine_state.read().unwrap();
-                        let lat_opt = engine_state
-                            .client_latitude
-                            .or(self.shared_position.site_latitude.load(Ordering::Relaxed));
-                        let lon_opt = engine_state
-                            .client_longitude
-                            .or(self.shared_position.site_longitude.load(Ordering::Relaxed));
-                        let client_date = engine_state.client_date;
-                        drop(engine_state);
-
-                        if let Some(imu) = &self.imu {
-                            if let (Some(lat), Some(lon)) = (lat_opt, lon_opt) {
-                                if let Ok(est) = futures::executor::block_on(
-                                    imu.get_estimated_pointing(&SystemTime::now()),
-                                ) {
-                                    let dt = client_date.unwrap_or_else(chrono::Utc::now);
-                                    let (ra, dec, eq_roll) = alt_az_to_ra_dec(
-                                        est.pitch, est.yaw, est.roll, lat, lon, dt,
-                                    );
-
-                                    est_ra = Some(ra);
-                                    est_dec = Some(dec);
-                                    est_roll = Some(eq_roll);
-
-                                    self.shared_position
-                                        .telescope_ra
-                                        .store(ra.to_bits(), Ordering::Relaxed);
-                                    self.shared_position
-                                        .telescope_dec
-                                        .store(dec.to_bits(), Ordering::Relaxed);
-                                }
-                            }
-                        }
-
                         self.update_solve_stats(
                             false,
-                            est_ra,
-                            est_dec,
-                            est_roll,
                             count,
                             self.target_ra,
                             self.target_dec,

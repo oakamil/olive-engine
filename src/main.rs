@@ -76,26 +76,13 @@ async fn main() {
     let args = Args::parse();
 
     let storage_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let storage: Option<Arc<dyn olive_engine::storage::PersistentStorage>> = Some(Arc::new(
-        olive_engine::storage::FileStorage::new(storage_dir),
-    ));
+    let storage: Option<Arc<dyn olive_imu::storage::PersistentStorage>> =
+        Some(Arc::new(olive_imu::storage::FileStorage::new(storage_dir)));
 
     // Initialize IMU if requested
-    let imu: Option<Arc<olive_engine::imu::Imu>> = match args.imu.as_str() {
-        "bno085" => {
-            let device = olive_engine::bno08x::Bno08xDevice::new(5).expect("Failed to init BNO085");
-            Some(Arc::new(
-                olive_engine::imu::Imu::start(device, storage.clone())
-                    .expect("Failed to start IMU thread"),
-            ))
-        }
-        "bmi160" => {
-            let device = olive_engine::bmi160::Bmi160Device::new().expect("Failed to init BMI160");
-            Some(Arc::new(
-                olive_engine::imu::Imu::start(device, storage.clone())
-                    .expect("Failed to start IMU thread"),
-            ))
-        }
+    let imu: Option<olive_solve::ImuType> = match args.imu.as_str() {
+        "bno085" => Some(olive_solve::ImuType::Bno085),
+        "bmi160" => Some(olive_solve::ImuType::Bmi160),
         "none" => None,
         _ => panic!("Invalid IMU selected. Options are: none, bno085, bmi160"),
     };
@@ -154,7 +141,7 @@ async fn main() {
     });
 
     // Initialize the engine
-    let engine = Engine::new(
+    let mut engine = Engine::new(
         camera,
         config,
         client_connected,
@@ -164,8 +151,9 @@ async fn main() {
         storage,
         None,
         None,
-        None,
-    );
+    )
+    .await;
+    let _ = engine.fused_solver.start_imu().await;
     let _ = engine.start();
 
     // Trap Ctrl-C to handle graceful shutdown

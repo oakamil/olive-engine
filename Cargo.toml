@@ -14,8 +14,10 @@ futures-util = "0.3"
 tower-http = { version = "0.5", features = ["fs", "cors"] }
 base64 = "0.22"
 image = "0.25"
-tetra3 = { path = "../olive-solve/tetra3" }
+olive-solve = { path = "../olive-solve" }
+olive-imu = { path = "../olive-solve/olive-imu" }
 starfield = "0.10.2"
+tetra3 = { path = "../olive-solve/tetra3" }
 nalgebra = "0.32"
 ndarray = "0.17"
 rayon = "1.11.0"
@@ -36,9 +38,6 @@ socket2 = "0.6.4"
 libcamera = "0.7.0"
 rppal = "0.22.1"
 pyo3 = { version = "0.21.2" }
-bno080 = { git = "https://github.com/oakamil/bno080.git", branch = "arvr" }
-bmi160 = "1.1.0"
-linux-embedded-hal = "0.4.0"
 env_logger = "0.11"
 
 [features]

@@ -88,7 +88,7 @@ fn start_engine(
             .await;
     });
 
-    let engine = Engine::new(
+    let engine = futures::executor::block_on(Engine::new(
         camera,
         config,
         client_connected,
@@ -98,8 +98,7 @@ fn start_engine(
         None,
         None,
         None,
-        None,
-    );
+    ));
     let _ = engine.start();
 
     loop {

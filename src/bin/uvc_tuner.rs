@@ -122,7 +122,7 @@ fn main() {
         "Initializing UVC Tuner with target {} fps (mjpeg: {})...",
         selected_fps, selected_mjpeg
     );
-    let mut camera = Camera::new(selected_fps, selected_mjpeg, selected_res);
+    let mut camera = Camera::new(selected_fps, selected_mjpeg, selected_res, false, None);
 
     let mut start_attempts = 0;
     while let Err(e) = camera.start_capture() {
@@ -234,7 +234,7 @@ fn main() {
     let mut extractor: Option<FastExtractor> = None;
 
     // Set Gain for the test
-    let test_gain = user_gain.unwrap_or_else(|| camera.get_max_gain());
+    let test_gain = user_gain.unwrap_or_else(|| camera.get_gain_ramge().1);
     println!("Setting camera gain for tests: {}", test_gain);
     camera.set_gain(test_gain);
 
