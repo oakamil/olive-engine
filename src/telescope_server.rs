@@ -12,7 +12,7 @@ use std::sync::{
     RwLock,
     atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering},
 };
-use std::{error::Error, f64::consts::TAU, sync::Arc, sync::OnceLock};
+use std::{error::Error, f64::consts::TAU, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, FixedOffset, Local, Utc};
@@ -25,18 +25,13 @@ use tokio::{
     net::TcpListener,
 };
 
-static TIMESCALE: OnceLock<Timescale> = OnceLock::new();
-
-pub fn init_timescale() {
-    TIMESCALE.get_or_init(|| Timescale::default());
-}
-
-fn get_timescale() -> &'static Timescale {
-    TIMESCALE.get_or_init(|| Timescale::default())
-}
-
-fn precess_coordinates(ra: f64, dec: f64, epoch_from_j: f64, epoch_to_j: f64) -> (f64, f64) {
-    let ts = get_timescale();
+fn precess_coordinates(
+    ra: f64,
+    dec: f64,
+    epoch_from_j: f64,
+    epoch_to_j: f64,
+    ts: &Timescale,
+) -> (f64, f64) {
     let epoch_from = ts.j(epoch_from_j);
     let epoch_to = ts.j(epoch_to_j);
 
@@ -236,18 +231,26 @@ impl Lx200WifiTelescope {
         self.controller.clone()
     }
 
-    pub fn new(shared_position: Arc<SharedPosition>, is_running: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        shared_position: Arc<SharedPosition>,
+        is_running: Arc<AtomicBool>,
+        timescale: Arc<Timescale>,
+    ) -> Self {
         Lx200WifiTelescope {
-            controller: Arc::new(RwLock::new(Lx200Controller::new(shared_position))),
+            controller: Arc::new(RwLock::new(Lx200Controller::new(
+                shared_position,
+                timescale,
+            ))),
             is_running,
         }
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct Lx200Controller {
     pub client_buffer: Vec<u8>,
     shared_position: Arc<SharedPosition>,
+    timescale: Arc<Timescale>,
 
     // Pending target coordinates (in jnow_epoch) for sync/slew
     target_ra: Option<f64>,
@@ -279,12 +282,13 @@ pub struct Lx200Controller {
 }
 
 impl Lx200Controller {
-    pub fn new(shared_position: Arc<SharedPosition>) -> Self {
+    pub fn new(shared_position: Arc<SharedPosition>, timescale: Arc<Timescale>) -> Self {
         let dt = Local::now();
         let jnow = ((dt.year() as f64 + dt.ordinal0() as f64 / 365.0) * 10.0).round() / 10.0;
         debug!("Using now epoch: {}", jnow);
         Lx200Controller {
             shared_position,
+            timescale,
             datetime: dt.with_timezone(dt.offset()),
             latitude: "+00:00".to_string(),
             longitude: "000:00".to_string(),
@@ -360,14 +364,14 @@ impl Lx200Controller {
         if self.is_stellarium {
             return (ra, dec);
         }
-        precess_coordinates(ra, dec, self.jnow_epoch, 2000.0)
+        precess_coordinates(ra, dec, self.jnow_epoch, 2000.0, &self.timescale)
     }
 
     fn convert_to_jnow(&self, ra: f64, dec: f64) -> (f64, f64) {
         if self.is_stellarium {
             return (ra, dec);
         }
-        precess_coordinates(ra, dec, 2000.0, self.jnow_epoch)
+        precess_coordinates(ra, dec, 2000.0, self.jnow_epoch, &self.timescale)
     }
 
     fn get_ra(&self) -> String {
@@ -952,7 +956,8 @@ mod tests {
 
     async fn setup_controller() -> (Lx200Controller, Arc<RwLock<SharedPosition>>) {
         let shared_position = Arc::new(RwLock::new(SharedPosition::default()));
-        let controller = Lx200Controller::new(shared_position.clone());
+        let timescale = Arc::new(Timescale::default());
+        let controller = Lx200Controller::new(shared_position.clone(), timescale);
         (controller, shared_position)
     }
 

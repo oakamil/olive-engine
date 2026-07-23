@@ -16,13 +16,10 @@ use tokio::sync::mpsc::Receiver;
 use crate::CameraTrait;
 use crate::alpaca_server::AlpacaServer;
 use crate::telescope_server::{Lx200Telescope, Lx200WifiTelescope, SharedPosition, TargetOp};
-use std::sync::OnceLock;
 use tetra3::{
     fast_extractor::{FastBgSubMode, FastDownsample, FastExtractOptions, FastExtractor},
     solver::{SolveOptions, SolveStatus},
 };
-
-static TIMESCALE: OnceLock<starfield::time::Timescale> = OnceLock::new();
 
 pub const MIN_CENTROIDS: usize = 4;
 pub const CALIBRATION_INTERVAL: Duration = Duration::from_secs(10);
@@ -196,8 +193,8 @@ fn calculate_alt_az(
     lat_deg: f64,
     lon_deg: f64,
     time: &chrono::DateTime<chrono::Utc>,
+    ts: &starfield::time::Timescale,
 ) -> (f64, f64) {
-    let ts = TIMESCALE.get_or_init(|| starfield::time::Timescale::default());
     let t = ts.from_datetime(*time);
     let gast_hours = t.gast();
 
@@ -249,12 +246,17 @@ impl Engine {
         let shared_position = Arc::new(SharedPosition::default());
         let is_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
-        tokio::task::spawn_blocking(|| {
-            let _ = TIMESCALE.get_or_init(|| starfield::time::Timescale::default());
-            crate::telescope_server::init_timescale();
-        });
+        let timescale = Arc::new(
+            tokio::task::spawn_blocking(|| starfield::time::Timescale::default())
+                .await
+                .expect("Failed to initialize Timescale"),
+        );
 
-        let mut server = Lx200WifiTelescope::new(shared_position.clone(), is_running.clone());
+        let mut server = Lx200WifiTelescope::new(
+            shared_position.clone(),
+            is_running.clone(),
+            timescale.clone(),
+        );
         let lx200_controller = server.get_controller();
         let alpaca_server = AlpacaServer::new(
             shared_position.clone(),
@@ -292,6 +294,7 @@ impl Engine {
         let shared_pos_clone = shared_position.clone();
         let fused_solver_clone = fused_solver.clone();
         let is_running_clone = is_running.clone();
+        let timescale_clone = timescale.clone();
 
         let polling_task = async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(33));
@@ -335,8 +338,10 @@ impl Engine {
 
                         if let (Some(lat), Some(lon)) = (lat_opt_state, lon_opt_state) {
                             let time = chrono::Utc::now();
-                            let (cur_alt, cur_az) = calculate_alt_az(ra, dec, lat, lon, &time);
-                            let (t_alt, t_az) = calculate_alt_az(t_ra, t_dec, lat, lon, &time);
+                            let (cur_alt, cur_az) =
+                                calculate_alt_az(ra, dec, lat, lon, &time, &timescale_clone);
+                            let (t_alt, t_az) =
+                                calculate_alt_az(t_ra, t_dec, lat, lon, &time, &timescale_clone);
 
                             let d_alt = t_alt - cur_alt;
                             let d_az = angle_diff_deg(t_az, cur_az);
