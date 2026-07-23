@@ -1382,8 +1382,6 @@ impl Engine {
                                 if let (Some(x), Some(y)) = (tx[0], ty[0]) {
                                     self.target_pixel = Some((x, y));
                                     self.save_target_pixel(self.target_pixel);
-                                    self.target_ra = Some(t_ra);
-                                    self.target_dec = Some(t_dec);
                                     info!(
                                         "Synced to target RA/Dec: ({}, {}). New target pixel: {:?}",
                                         t_ra, t_dec, self.target_pixel
