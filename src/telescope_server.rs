@@ -27,6 +27,10 @@ use tokio::{
 
 static TIMESCALE: OnceLock<Timescale> = OnceLock::new();
 
+pub fn init_timescale() {
+    TIMESCALE.get_or_init(|| Timescale::default());
+}
+
 fn get_timescale() -> &'static Timescale {
     TIMESCALE.get_or_init(|| Timescale::default())
 }
@@ -402,7 +406,7 @@ impl Lx200Controller {
             "+"
         };
 
-        format!("{sign}{h:02}*{m:02}'{s:02}#")
+        format!("{sign}{:02}*{m:02}'{s:02}#", h.abs())
     }
 
     fn set_target_ra(&mut self, cmd: &str) -> String {

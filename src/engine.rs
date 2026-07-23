@@ -16,10 +16,13 @@ use tokio::sync::mpsc::Receiver;
 use crate::CameraTrait;
 use crate::alpaca_server::AlpacaServer;
 use crate::telescope_server::{Lx200Telescope, Lx200WifiTelescope, SharedPosition, TargetOp};
+use std::sync::OnceLock;
 use tetra3::{
     fast_extractor::{FastBgSubMode, FastDownsample, FastExtractOptions, FastExtractor},
     solver::{SolveOptions, SolveStatus},
 };
+
+static TIMESCALE: OnceLock<starfield::time::Timescale> = OnceLock::new();
 
 pub const MIN_CENTROIDS: usize = 4;
 pub const CALIBRATION_INTERVAL: Duration = Duration::from_secs(10);
@@ -116,6 +119,7 @@ pub struct EngineStateData {
     pub requested_target_ra: Option<f64>,
     pub requested_target_dec: Option<f64>,
     pub requested_align_target_pixel: Option<(f64, f64)>,
+    pub is_imu_estimate: bool,
 }
 
 impl Default for EngineStateData {
@@ -149,6 +153,7 @@ impl Default for EngineStateData {
             requested_target_ra: None,
             requested_target_dec: None,
             requested_align_target_pixel: None,
+            is_imu_estimate: false,
         }
     }
 }
@@ -192,7 +197,7 @@ fn calculate_alt_az(
     lon_deg: f64,
     time: &chrono::DateTime<chrono::Utc>,
 ) -> (f64, f64) {
-    let ts = starfield::time::Timescale::default();
+    let ts = TIMESCALE.get_or_init(|| starfield::time::Timescale::default());
     let t = ts.from_datetime(*time);
     let gast_hours = t.gast();
 
@@ -244,6 +249,11 @@ impl Engine {
         let shared_position = Arc::new(SharedPosition::default());
         let is_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
+        tokio::task::spawn_blocking(|| {
+            let _ = TIMESCALE.get_or_init(|| starfield::time::Timescale::default());
+            crate::telescope_server::init_timescale();
+        });
+
         let mut server = Lx200WifiTelescope::new(shared_position.clone(), is_running.clone());
         let lx200_controller = server.get_controller();
         let alpaca_server = AlpacaServer::new(
@@ -288,58 +298,69 @@ impl Engine {
             while is_running_clone.load(std::sync::atomic::Ordering::Relaxed) {
                 interval.tick().await;
                 if let Some(pos) = fused_solver_clone.get_latest_position().await {
+                    let ra = pos.ra;
+                    let dec = pos.dec;
+                    let eq_roll = pos.roll;
+
                     shared_pos_clone
                         .telescope_ra
-                        .store(pos.ra.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                        .store(ra.to_bits(), std::sync::atomic::Ordering::Relaxed);
                     shared_pos_clone
                         .telescope_dec
-                        .store(pos.dec.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                        .store(dec.to_bits(), std::sync::atomic::Ordering::Relaxed);
+
+                    let mut target_ra_opt = None;
+                    let mut target_dec_opt = None;
+                    let mut lat_opt_state = None;
+                    let mut lon_opt_state = None;
+
+                    if let Ok(state) = engine_state_clone.read() {
+                        target_ra_opt = state.target_ra;
+                        target_dec_opt = state.target_dec;
+                        lat_opt_state = state.client_latitude;
+                        lon_opt_state = state.client_longitude;
+                    }
+
+                    let mut offset_ra = None;
+                    let mut offset_dec = None;
+                    let mut offset_alt = None;
+                    let mut offset_az = None;
+                    let mut offset_angle = None;
+
+                    if let (Some(t_ra), Some(t_dec)) = (target_ra_opt, target_dec_opt) {
+                        let d_ra = angle_diff_deg(t_ra, ra);
+                        let d_dec = t_dec - dec;
+                        offset_ra = Some(d_ra);
+                        offset_dec = Some(d_dec);
+
+                        if let (Some(lat), Some(lon)) = (lat_opt_state, lon_opt_state) {
+                            let time = chrono::Utc::now();
+                            let (cur_alt, cur_az) = calculate_alt_az(ra, dec, lat, lon, &time);
+                            let (t_alt, t_az) = calculate_alt_az(t_ra, t_dec, lat, lon, &time);
+
+                            let d_alt = t_alt - cur_alt;
+                            let d_az = angle_diff_deg(t_az, cur_az);
+
+                            offset_alt = Some(d_alt);
+                            offset_az = Some(d_az);
+
+                            let x = -d_az * cur_alt.to_radians().cos();
+                            let y = d_alt;
+                            offset_angle = Some(x.atan2(y).to_degrees());
+                        }
+                    }
 
                     if let Ok(mut state) = engine_state_clone.write() {
-                        state.ra = Some(pos.ra);
-                        state.dec = Some(pos.dec);
-                        state.roll = Some(pos.roll);
+                        state.ra = Some(ra);
+                        state.dec = Some(dec);
+                        state.roll = Some(eq_roll);
+                        state.is_imu_estimate = pos.source == olive_solve::PositionSource::Imu;
 
-                        if let (Some(cur_ra), Some(cur_dec), Some(t_ra), Some(t_dec)) = (
-                            Some(pos.ra),
-                            Some(pos.dec),
-                            state.target_ra,
-                            state.target_dec,
-                        ) {
-                            let d_ra = angle_diff_deg(t_ra, cur_ra);
-                            let d_dec = t_dec - cur_dec;
-                            state.offset_ra = Some(d_ra);
-                            state.offset_dec = Some(d_dec);
-
-                            if let (Some(lat), Some(lon)) =
-                                (state.client_latitude, state.client_longitude)
-                            {
-                                let time = chrono::Utc::now();
-                                let (cur_alt, cur_az) =
-                                    calculate_alt_az(cur_ra, cur_dec, lat, lon, &time);
-                                let (t_alt, t_az) = calculate_alt_az(t_ra, t_dec, lat, lon, &time);
-
-                                let d_alt = t_alt - cur_alt;
-                                let d_az = angle_diff_deg(t_az, cur_az);
-
-                                state.offset_alt = Some(d_alt);
-                                state.offset_az = Some(d_az);
-
-                                let x = -d_az * cur_alt.to_radians().cos();
-                                let y = d_alt;
-                                state.offset_angle = Some(x.atan2(y).to_degrees());
-                            } else {
-                                state.offset_alt = None;
-                                state.offset_az = None;
-                                state.offset_angle = None;
-                            }
-                        } else {
-                            state.offset_ra = None;
-                            state.offset_dec = None;
-                            state.offset_alt = None;
-                            state.offset_az = None;
-                            state.offset_angle = None;
-                        }
+                        state.offset_ra = offset_ra;
+                        state.offset_dec = offset_dec;
+                        state.offset_alt = offset_alt;
+                        state.offset_az = offset_az;
+                        state.offset_angle = offset_angle;
                     }
                 }
             }
@@ -1628,7 +1649,6 @@ pub fn calculate_hfr(
     hfrs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     hfrs[hfrs.len() / 2]
 }
-
 
 #[cfg(test)]
 mod tests {
