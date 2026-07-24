@@ -20,7 +20,6 @@ mod hardware {
     };
     use log::info;
     use rayon::prelude::*;
-    use rppal::i2c::I2c;
     #[cfg(target_arch = "aarch64")]
     use std::arch::aarch64::*;
     #[cfg(target_arch = "aarch64")]
@@ -34,9 +33,7 @@ mod hardware {
     use std::time::{Duration, SystemTime};
 
     // --- Defined Constants ---
-    const I2C_ADDR: u16 = 0x1A;
     const INITIAL_EXPOSURE_US: i32 = 50_000;
-    const I2C_BUSES_TO_SCAN: &[u8] = &[0, 1, 4, 6, 10, 11, 12, 13, 14, 15];
 
     // Internal sensitivity bounds for the Pi Camera
     const MIN_EXPOSURE_US: i32 = 16_667;
@@ -52,9 +49,11 @@ mod hardware {
 
     /// Commands sent from the main thread to the capture thread.
     enum CaptureCommand {
+        // We don't have a command to set HCG. Instead, enable HCG via modprobe.
+        // For example, in /etc/modprobe.d/imx290.conf:
+        // options imx290 hcg_mode=1
         SetGain(f32),
         SetExposure(i32),
-        SetHcg(bool),
         StopCaptureThread,
     }
 
@@ -92,14 +91,6 @@ mod hardware {
                 || s.contains('B')
                 || s.contains('Y')
                 || s.contains('V'))
-    }
-
-    fn is_hcg_supported(model: &str) -> bool {
-        let model = model.to_lowercase();
-        model.contains("imx290")
-            || model.contains("imx327")
-            || model.contains("imx462")
-            || model.contains("imx662")
     }
 
     pub struct Camera {
@@ -187,16 +178,6 @@ mod hardware {
         }
 
         fn set_stack_count(&self, _count: usize) {}
-
-        /// Enables High Conversion Gain (HCG) via I2C on address 0x1A.
-        fn enable_hcg(&self) {
-            self.send_command(CaptureCommand::SetHcg(true));
-        }
-
-        /// Disables High Conversion Gain (HCG) via I2C on address 0x1A.
-        fn disable_hcg(&self) {
-            self.send_command(CaptureCommand::SetHcg(false));
-        }
 
         // --- Data Retrieval ---
 
@@ -642,66 +623,6 @@ mod hardware {
             (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
         }
 
-        /// Scans the defined I2C buses to find the camera at address 0x1A using rppal.
-        fn detect_i2c_bus() -> Option<u8> {
-            for &bus in I2C_BUSES_TO_SCAN {
-                if let Ok(mut i2c) = I2c::with_bus(bus) {
-                    // Without I2C_SLAVE_FORCE, set_slave_address will fail with OS Error 16 (EBUSY)
-                    // if the V4L2 kernel driver has already claimed the camera sensor.
-                    match i2c.set_slave_address(I2C_ADDR) {
-                        Ok(_) => {
-                            // The address is free. Try a simple read to ping the device.
-                            if i2c.smbus_receive_byte().is_ok() {
-                                return Some(bus);
-                            }
-                        }
-                        Err(rppal::i2c::Error::Io(e)) if e.raw_os_error() == Some(16) => {
-                            // EBUSY (16) explicitly means a driver is using this address on this bus.
-                            // Since we are looking for the active camera, this is exactly what we want!
-                            return Some(bus);
-                        }
-                        Err(_) => {} // Other I/O errors, move on to the next bus
-                    }
-                }
-            }
-            None
-        }
-
-        /// Writes raw bytes to the detected I2C bus to enable/disable HCG using `i2cset`.
-        /// Bypasses kernel driver locks by enforcing the proper I2C_RDWR ioctl block via i2c-tools.
-        fn write_i2c_hcg(enable: bool) -> std::io::Result<()> {
-            let bus = Self::detect_i2c_bus().ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::NotFound, "Camera I2C bus not found")
-            })?;
-
-            // The target value for register 0x3009
-            let val = if enable { "0x11" } else { "0x01" };
-
-            log::debug!("Executing: i2cset -y -f {} 0x1a 0x30 0x09 {} i", bus, val);
-
-            // i2cset -y (yes) -f (force) <bus> <chip-addr> <reg-high> <reg-low> <val> i (block data)
-            let output = std::process::Command::new("i2cset")
-                .arg("-y")
-                .arg("-f")
-                .arg(bus.to_string())
-                .arg("0x1a") // I2C Address
-                .arg("0x30") // Register High Byte
-                .arg("0x09") // Register Low Byte
-                .arg(val) // Data Byte
-                .arg("i") // I2C Block Write Mode
-                .output()?;
-
-            if !output.status.success() {
-                let err_msg = String::from_utf8_lossy(&output.stderr);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("i2cset failed: {}", err_msg.trim()),
-                ));
-            }
-
-            Ok(())
-        }
-
         fn configure_camera(
             active_camera: &mut ActiveCamera<'_>,
             role: StreamRole,
@@ -1103,70 +1024,6 @@ mod hardware {
                 while let Ok(cmd) = rx.try_recv() {
                     match cmd {
                         CaptureCommand::StopCaptureThread => break 'capture,
-                        CaptureCommand::SetHcg(enable) => {
-                            if !is_hcg_supported(&cam_config.model) {
-                                log::info!(
-                                    "HCG isn't supported on the current camera: {}",
-                                    cam_config.model
-                                );
-                                continue;
-                            }
-                            log::info!("Initiating HCG toggle sequence (Target: {})", enable);
-
-                            // 1. Drain any pending/completed requests into a holding vector
-                            let mut held_requests = Vec::new();
-                            while let Ok(req) = req_rx.try_recv() {
-                                held_requests.push(req);
-                            }
-
-                            // 2. Stop the pipeline to halt hardware processing.
-                            // Any frames actively exposed or moving through the pipeline will be cancelled
-                            // and immediately pushed into `req_rx`
-                            log::debug!(
-                                "Stopping camera pipeline... (held {} completed requests)",
-                                held_requests.len()
-                            );
-                            if let Err(e) = active_camera.stop() {
-                                log::error!("Failed to stop camera for HCG toggle: {}", e);
-                            }
-
-                            // 3. Restart the pipeline
-                            log::debug!("Restarting camera pipeline...");
-                            if let Err(e) = active_camera.start(None) {
-                                log::error!("Failed to restart camera for HCG toggle: {}", e);
-                            }
-
-                            // 4. Attempt to write I2C while the pipeline clock is running
-                            log::debug!("Writing HCG via I2C (started state)...");
-                            if let Err(e) = Self::write_i2c_hcg(enable) {
-                                log::warn!("HCG write failed: {}", e);
-                            } else {
-                                log::info!("HCG write succeeded.");
-                            }
-
-                            // 5. Rest before we flood the queue with buffers again
-                            std::thread::sleep(Duration::from_millis(100));
-
-                            // 6. Grab any cancelled requests that were dumped during the `stop()` call
-                            while let Ok(req) = req_rx.try_recv() {
-                                held_requests.push(req);
-                            }
-
-                            // 7. Re-queue everything with our latest controls
-                            log::debug!(
-                                "Re-queuing {} requests after HCG toggle...",
-                                held_requests.len()
-                            );
-                            for mut req in held_requests {
-                                req.reuse(ReuseFlag::REUSE_BUFFERS);
-                                {
-                                    let req_ctrls = req.controls_mut();
-                                    Self::apply_controls(req_ctrls, target_gain, target_exposure);
-                                }
-                                let _ = active_camera.queue_request(req);
-                            }
-                            log::info!("HCG toggle sequence complete.");
-                        }
                         CaptureCommand::SetGain(gain) => {
                             target_gain = gain;
                         }
@@ -1195,8 +1052,7 @@ mod hardware {
                     }
 
                     // GUARD: Skip processing entirely if the hardware aborted this request.
-                    // Since we now handle cancelled frames explicitly during the HCG toggle,
-                    // this mostly catches unexpected hardware stutters.
+                    // This mostly catches unexpected hardware stutters.
                     if latest_req.status() == libcamera::request::RequestStatus::Cancelled {
                         latest_req.reuse(ReuseFlag::REUSE_BUFFERS);
                         Self::apply_controls(
@@ -1326,8 +1182,6 @@ mod stub {
             1000
         }
         fn set_exposure(&self, _exposure_us: i32) {}
-        fn enable_hcg(&self) {}
-        fn disable_hcg(&self) {}
         fn wait_for_next_capture(
             &self,
             _ts: Option<SystemTime>,

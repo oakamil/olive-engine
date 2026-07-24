@@ -68,6 +68,7 @@ pub struct IntermediateResult {
     pub extract_time: Duration,
     pub centroids_arr: Array2<f64>,
     pub timestamp: SystemTime,
+    pub mean_brightness: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default, clap::ValueEnum, Serialize, Deserialize)]
@@ -739,6 +740,22 @@ impl Engine {
                     }
                 }
 
+                let target = config_ext.target_centroids as usize;
+                let needs_brightness =
+                    num_centroids < 4 || num_centroids < (target as f64 * 0.75) as usize;
+                let mean_brightness = if needs_brightness {
+                    let step = 256;
+                    let count = img_data.len() / step;
+                    if count > 0 {
+                        let sum: u64 = img_data.iter().step_by(step).map(|&p| p as u64).sum();
+                        sum as f64 / count as f64
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
+
                 let extract_time = extract_start.elapsed();
 
                 // Calculate focus metric only when camera mode is active (manual focus).
@@ -790,6 +807,7 @@ impl Engine {
                     extract_time,
                     centroids_arr,
                     timestamp: img_timestamp,
+                    mean_brightness,
                 };
 
                 let (lock, cvar) = &*shared_res_ext;
@@ -801,6 +819,13 @@ impl Engine {
 
         let t2 = std::thread::spawn(move || {
             let mut engine = self;
+
+            // Apply static hardware settings ONCE at startup
+            if let Some(g) = engine.config.gain {
+                log::info!("Setting base hardware settings...");
+                engine.camera.set_gain(g);
+            }
+
             loop {
                 if !engine.is_running.load(std::sync::atomic::Ordering::Relaxed) {
                     log::info!("Main engine thread stopping.");
@@ -810,7 +835,6 @@ impl Engine {
                     std::thread::sleep(std::time::Duration::from_millis(500));
                     continue;
                 }
-                engine.run_calibration_loop();
                 engine.run_solving_loop();
             }
         });
@@ -819,7 +843,15 @@ impl Engine {
 
     fn wait_for_extraction(
         &self,
-    ) -> Option<(usize, Duration, Duration, Duration, Array2<f64>, SystemTime)> {
+    ) -> Option<(
+        usize,
+        Duration,
+        Duration,
+        Duration,
+        Array2<f64>,
+        SystemTime,
+        f64,
+    )> {
         let (lock, cvar) = &*self.shared_result;
         let mut inner = lock.lock().unwrap();
 
@@ -836,6 +868,7 @@ impl Engine {
                 res.extract_time,
                 res.centroids_arr,
                 res.timestamp,
+                res.mean_brightness,
             ))
         } else {
             None
@@ -859,7 +892,6 @@ impl Engine {
             info!("Setting base hardware settings...");
             self.camera.set_gain(g);
         }
-        self.camera.enable_hcg();
 
         if self.config.bypass_calibration {
             info!("Bypassing calibration loop based on configuration.");
@@ -894,7 +926,6 @@ impl Engine {
                 self.camera.restore_state();
                 let g = initial_gain.unwrap_or(self.camera.get_gain_range().2);
                 self.camera.set_gain(g);
-                self.camera.enable_hcg();
             }
 
             // Immediate UI update for exposure and status
@@ -956,8 +987,15 @@ impl Engine {
                         break;
                     }
 
-                    if let Some((count, exp_time, pp_time, extract_time, arr, _timestamp)) =
-                        self.wait_for_extraction()
+                    if let Some((
+                        count,
+                        exp_time,
+                        pp_time,
+                        extract_time,
+                        arr,
+                        _timestamp,
+                        _mean_brightness,
+                    )) = self.wait_for_extraction()
                     {
                         self.update_solve_stats(
                             false,
@@ -1205,10 +1243,7 @@ impl Engine {
             Duration::ZERO,
             Duration::ZERO,
         );
-        let target_max = (self.config.target_centroids as f64 * 1.5).round() as usize;
-
         let mut consecutive_failures = 0;
-        const MAX_FAILURES: usize = 3;
         let mut observer_location_set = false;
 
         // Rolling average buffer to smooth out frame-to-frame scintillation dips
@@ -1238,8 +1273,15 @@ impl Engine {
             }
             self.update_status("Solving");
 
-            if let Some((count, exp_time, pp_time, extract_time, centroids_arr, img_timestamp)) =
-                self.wait_for_extraction()
+            if let Some((
+                count,
+                exp_time,
+                pp_time,
+                extract_time,
+                centroids_arr,
+                img_timestamp,
+                mean_brightness,
+            )) = self.wait_for_extraction()
             {
                 let mut pending_sync = None;
                 {
@@ -1311,8 +1353,6 @@ impl Engine {
                 }
 
                 if count < MIN_CENTROIDS {
-                    // Frame discarded completely. Not added to buffer, does not count as a failure.
-                    // Prevents telescope smearing movement from spiking exposure.
                     warn!(
                         "Discarding frame: {} centroids (< {} min). Telescope might be moving.",
                         count, MIN_CENTROIDS
@@ -1327,6 +1367,20 @@ impl Engine {
                         extract_time,
                         Duration::ZERO,
                     );
+
+                    // Recovery check if we are lost
+                    if consecutive_failures > 3 {
+                        if mean_brightness < 20.0 {
+                            if self.camera.adjust_sensitivity(1.5) {
+                                recent_centroids.clear();
+                            }
+                        } else if mean_brightness > 220.0 {
+                            if self.camera.adjust_sensitivity(0.5) {
+                                recent_centroids.clear();
+                            }
+                        }
+                    }
+
                     continue;
                 }
 
@@ -1486,49 +1540,42 @@ impl Engine {
                 }
 
                 // Continuous exposure/gain adjustment
-                if !self.config.bypass_calibration {
-                    if matches_current {
-                        if recent_centroids.len() >= 5 {
-                            recent_centroids.remove(0);
-                        }
-                        recent_centroids.push(count);
+                if !self.config.bypass_calibration && matches_current {
+                    let target = self.config.target_centroids as usize;
 
-                        // Strict requirement: Buffer must be full to trigger a downward adjustment.
-                        let buffer_full = recent_centroids.len() >= 5;
-                        // Use floating point math to prevent integer truncation
+                    if recent_centroids.len() >= 5 {
+                        recent_centroids.remove(0);
+                    }
+                    recent_centroids.push(count);
+
+                    if recent_centroids.len() >= 5 {
                         let avg_count = (recent_centroids.iter().sum::<usize>() as f64
                             / recent_centroids.len() as f64)
                             .round() as usize;
 
-                        // Only trigger a downward adjustment if the buffer is full and we exceed the ceiling (125% of target)
-                        let needs_downward = buffer_full && avg_count > target_max;
-                        // Only trigger an upward adjustment if we repeatedly fail to solve (regardless of buffer fullness)
-                        let needs_upward = consecutive_failures >= MAX_FAILURES;
+                        let lower_bound = (target as f64 * 0.75) as usize;
+                        let upper_bound = (target as f64 * 1.5) as usize;
 
-                        if needs_downward || needs_upward {
-                            let safe_count = avg_count.max(1);
-                            let raw_factor =
-                                self.config.target_centroids as f64 / safe_count as f64;
+                        let mut factor: Option<f64> = None;
 
-                            let factor = if needs_downward {
-                                // Needs less exposure. Drop quickly (max 50% per frame)
-                                1.0 + (raw_factor - 1.0).max(-0.5) * 0.8
-                            } else if needs_upward && avg_count < target_max {
-                                // Failed to solve and we are below 150% limit. Increase exposure by a small amount (5%)
-                                1.05
-                            } else {
-                                // Star count is already very high. Don't blindly increase exposure further.
-                                1.0
-                            };
+                        if avg_count < lower_bound {
+                            let f = target as f64 / avg_count.max(1) as f64;
+                            factor = Some(f.min(1.5)); // max 50% increase
+                        } else if avg_count > upper_bound {
+                            let f = target as f64 / avg_count as f64;
+                            factor = Some(f.max(0.5)); // max 50% decrease
+                        }
 
-                            let applied = self.camera.adjust_sensitivity(factor);
-                            if applied {
-                                // Flush the history so we evaluate the new exposure fresh, stopping the ratchet
-                                recent_centroids.clear();
-                                consecutive_failures = 0;
-                            } else if needs_upward {
-                                // Prevent spamming failure adjustments if we hit the hardware max limit
-                                consecutive_failures = 0;
+                        if let Some(mut f) = factor {
+                            // Bright sky check
+                            if f > 1.0 && mean_brightness > 200.0 {
+                                f = 1.0;
+                            }
+                            if f != 1.0 {
+                                let applied = self.camera.adjust_sensitivity(f);
+                                if applied {
+                                    recent_centroids.clear();
+                                }
                             }
                         }
                     }

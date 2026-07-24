@@ -20,7 +20,6 @@ use std::sync::RwLock;
 pub struct ServerState {
     pub camera: Arc<dyn CameraTrait>,
     pub semaphore: Arc<Semaphore>,
-    pub hcg_enabled: AtomicBool,
     pub client_connected: Arc<AtomicBool>,
     pub engine_state: Arc<RwLock<crate::engine::EngineStateData>>,
 }
@@ -29,7 +28,6 @@ pub struct ServerState {
 pub struct ControlsData {
     pub gain: f32,
     pub exposure_ms: f32,
-    pub hcg: bool,
     #[serde(default)]
     pub min_gain: f32,
     #[serde(default)]
@@ -96,12 +94,7 @@ const INDEX_HTML: &str = r#"
       <input type="range" id="gain" step="0.1">
       
       <label>Exposure (ms) <span id="exp-val" class="value">0</span></label>
-      <input type="range" id="exposure" min="16.667" max="100" step="0.1">
-      
-      <label style="display:flex; align-items:center; margin-top: 25px;">
-        <input type="checkbox" id="hcg" style="width:auto; margin-right:10px;">
-        Enable HCG
-      </label>
+      <input type="range" id="exposure" min="16.667" max="100" step="0.1">      
     </div>
     <div id="viewer">
       <img id="cam-image" alt="Camera Stream" draggable="false">
@@ -243,7 +236,6 @@ const INDEX_HTML: &str = r#"
     const gainVal = document.getElementById('gain-val');
     const exp = document.getElementById('exposure');
     const expVal = document.getElementById('exp-val');
-    const hcg = document.getElementById('hcg');
 
     async function loadControls() {
       const r = await fetch('/api/controls');
@@ -256,15 +248,12 @@ const INDEX_HTML: &str = r#"
       
       exp.value = data.exposure_ms;
       expVal.innerText = data.exposure_ms.toFixed(3);
-      
-      hcg.checked = data.hcg;
     }
 
     async function setControls() {
       const data = {
         gain: parseFloat(gain.value),
         exposure_ms: parseFloat(exp.value),
-        hcg: hcg.checked
       };
       await fetch('/api/controls', {
         method: 'POST',
@@ -278,7 +267,6 @@ const INDEX_HTML: &str = r#"
 
     gain.addEventListener('change', setControls);
     exp.addEventListener('change', setControls);
-    hcg.addEventListener('change', setControls);
   </script>
 </body>
 </html>
@@ -294,7 +282,6 @@ async fn get_controls(State(state): State<Arc<ServerState>>) -> Json<ControlsDat
     Json(ControlsData {
         gain: camera.get_gain(),
         exposure_ms: camera.get_exposure() as f32 / 1000.0,
-        hcg: state.hcg_enabled.load(Ordering::Relaxed),
         min_gain: gain_range.0,
         max_gain: gain_range.1,
     })
@@ -307,17 +294,6 @@ async fn post_controls(
     let camera = &state.camera;
     camera.set_gain(payload.gain);
     camera.set_exposure((payload.exposure_ms * 1000.0) as i32);
-
-    let current_hcg = state.hcg_enabled.load(Ordering::Relaxed);
-    if payload.hcg != current_hcg {
-        if payload.hcg {
-            camera.enable_hcg();
-        } else {
-            camera.disable_hcg();
-        }
-        state.hcg_enabled.store(payload.hcg, Ordering::Relaxed);
-    }
-
     StatusCode::OK
 }
 
@@ -344,8 +320,6 @@ async fn stream_handler(State(state): State<Arc<ServerState>>) -> impl IntoRespo
         let camera = &state_clone.camera;
         camera.set_gain(camera.get_gain_range().0);
         camera.set_exposure(16670); // Default to a low exposure for responsive UI
-        camera.disable_hcg();
-        state_clone.hcg_enabled.store(false, Ordering::Relaxed);
 
         let mut last_ts = None;
         loop {
@@ -462,7 +436,6 @@ pub async fn start_server(
     let state = Arc::new(ServerState {
         camera,
         semaphore: Arc::new(Semaphore::new(1)), // Limit to 1 connection to minimize memory footprint
-        hcg_enabled: AtomicBool::new(false),
         client_connected,
         engine_state,
     });

@@ -184,10 +184,6 @@ impl CameraTrait for Camera {
             .store(count.clamp(1, 10), Ordering::Relaxed);
     }
 
-    fn enable_hcg(&self) {}
-
-    fn disable_hcg(&self) {}
-
     fn get_last_capture(&self) -> Option<Arc<Image>> {
         let lock = self.store.image.lock().unwrap();
         lock.clone()

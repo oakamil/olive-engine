@@ -102,8 +102,6 @@ impl CameraTrait for DummyCamera {
         100_000
     }
     fn set_exposure(&self, _exposure_us: i32) {}
-    fn enable_hcg(&self) {}
-    fn disable_hcg(&self) {}
 
     fn wait_for_next_capture(
         &self,
