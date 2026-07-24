@@ -470,6 +470,8 @@ impl Engine {
         let t1 = std::thread::spawn(move || {
             let mut extractor: Option<FastExtractor> = None;
             let mut last_processed_timestamp = None;
+            let mut active_max_area = 150;
+            let mut fov_locked_in = false;
             let mut hfr_history: std::collections::VecDeque<(std::time::SystemTime, f64)> =
                 std::collections::VecDeque::new();
 
@@ -568,9 +570,9 @@ impl Engine {
                 let num_centroids;
                 let mut centroids_arr;
 
-                let state_sigma = {
+                let (state_sigma, state_fov) = {
                     let st = engine_state_ext.read().unwrap();
-                    st.current_sigma
+                    (st.current_sigma, st.fov)
                 };
 
                 match config_ext.extractor_type {
@@ -583,6 +585,21 @@ impl Engine {
                                     continue;
                                 }
                             };
+
+                        let active_sigma = state_sigma.unwrap_or(3.5);
+                        let mut update_max_area = None;
+                        if !fov_locked_in {
+                            let best_fov = state_fov.or(config_ext.initial_fov.map(|f| f as f64));
+                            if let Some(fov) = best_fov {
+                                if fov > 0.0 {
+                                    let ratio = (width as f64) / fov;
+                                    active_max_area =
+                                        (20.0 + 0.03 * (ratio * ratio)).round() as usize;
+                                    fov_locked_in = true;
+                                    update_max_area = Some(active_max_area);
+                                }
+                            }
+                        }
 
                         if extractor.is_none() {
                             let final_crop = config_ext
@@ -617,14 +634,13 @@ impl Engine {
                                 BgMode::Line => Some(FastBgSubMode::LineMedian),
                             };
 
-                            let active_sigma = state_sigma.unwrap_or(3.5);
                             let options = FastExtractOptions {
                                 sigma: active_sigma,
                                 downsample,
                                 bg_sub_mode,
                                 binary_open: config_ext.noise_filter,
                                 min_area: Some(2),
-                                max_area: Some(20),
+                                max_area: Some(active_max_area),
                                 crop: final_crop,
                                 //centroid_window: Some(3),
                                 ..FastExtractOptions::default()
@@ -633,10 +649,9 @@ impl Engine {
                         }
 
                         let ext = extractor.as_mut().unwrap();
-
-                        let active_sigma = state_sigma.unwrap_or(3.5);
                         ext.update_options(tetra3::fast_extractor::FastExtractOptionsUpdate {
                             sigma: Some(active_sigma),
+                            max_area: update_max_area,
                             ..Default::default()
                         });
 
