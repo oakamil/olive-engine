@@ -28,7 +28,7 @@ memchr = "2.7"
 futures = "0.3.32"
 serde = { version = "1.0.228", features = ["derive"] }
 cedar_detect = { git = "https://github.com/oakamil/cedar-detect" }
-turbojpeg = "1.4.0"
+turbojpeg = { git = "https://github.com/oakamil/rust-turbojpeg.git" }
 hyper = "1"
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 tower = { version = "0.4", features = ["util"] }
