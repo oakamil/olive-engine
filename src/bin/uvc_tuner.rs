@@ -234,7 +234,7 @@ fn main() {
     let mut extractor: Option<FastExtractor> = None;
 
     // Set Gain for the test
-    let test_gain = user_gain.unwrap_or_else(|| camera.get_gain_ramge().1);
+    let test_gain = user_gain.unwrap_or_else(|| camera.get_gain_range().1);
     println!("Setting camera gain for tests: {}", test_gain);
     camera.set_gain(test_gain);
 

@@ -141,7 +141,7 @@ async fn main() {
     });
 
     // Initialize the engine
-    let mut engine = Engine::new(
+    let engine = Engine::new(
         camera,
         config,
         client_connected,

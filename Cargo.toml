@@ -35,10 +35,12 @@ tower = { version = "0.4", features = ["util"] }
 socket2 = "0.6.4"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
-libcamera = "0.7.0"
-rppal = "0.22.1"
 pyo3 = { version = "0.21.2" }
 env_logger = "0.11"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libcamera = "0.7.0"
+rppal = "0.22.1"
 
 [features]
 extension-module = ["pyo3/extension-module"]
