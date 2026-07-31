@@ -54,8 +54,7 @@ cargo run --release -- --database-path ~/data/default_database.npz
 * `--isp`: (Optional) Enable ISP mode configuration for the ultra-fast camera pipeline.
 * `--uvc`: (Optional) Use UVC camera instead of libcamera.
 * `--bg-mode <BG_MODE>`: (Optional) Background subtraction mode for extraction (`line`, `global`, `block`). Default is `line`.
-* `--extractor-type <EXTRACTOR_TYPE>`: (Optional) Extractor type to use (`sequential`, `fast`, `cedar`). Default is `sequential`.
-* `--rayon-threads <RAYON_THREADS>`: (Optional) Rayon threads configuration. Default is 2.
+* `--extractor-type <EXTRACTOR_TYPE>`: (Optional) Extractor type to use (`approximate`, `fast`, `cedar`). Default is `approximate`.
 
 ### Web server
 
@@ -74,7 +73,7 @@ Additional features are planned for this solving engine, including:
 
 1\. Which extractor type and mode should I use?
 
-`cedar` provides the fastest performance, but its use is [restricted](https://github.com/smroid/cedar-detect/blob/main/LICENSE.md). `sequential` sacrifices a bit of accuracy for performance, and is recommended on lower end hardware. `fast` utilizes rayon multi-threading which can hold up CPU threads on lower end hardware. The background subtraction modes apply to `sequential` and `fast`, with `block` being the slowest but applying semi-local background processing. `global` is generally slightly faster than `line`, but `line` can better deal with certain types of image artifacts.
+`cedar` provides the fastest performance, but its use is [restricted](https://github.com/smroid/cedar-detect/blob/main/LICENSE.md). `approximate` sacrifices a bit of accuracy for performance, and is recommended on lower end hardware. `fast` utilizes a robust algorithm for finding centroids. The background subtraction modes apply to `approximate` and `fast`, with `block` being the slowest but applying semi-local background processing. `global` is generally slightly faster than `line`, but `line` can better deal with certain types of image artifacts.
 
 2\. What's ISP mode and why should I use it?
 

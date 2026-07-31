@@ -291,13 +291,13 @@ fn main() {
             }
 
             let ext = extractor.as_mut().unwrap();
-            let result = ext.extract_sequential(&array_img);
+            let result = ext.extract(&array_img);
 
-            let num_centroids = result.len();
+            let num_centroids = result.centroids.len();
             total_centroids += num_centroids;
 
             let mut centroids_arr = Array2::<f64>::zeros((num_centroids, 2));
-            for (i, c) in result.iter().enumerate() {
+            for (i, c) in result.centroids.iter().enumerate() {
                 centroids_arr[[i, 0]] = c.y;
                 centroids_arr[[i, 1]] = c.x;
             }

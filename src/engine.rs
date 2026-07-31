@@ -51,7 +51,7 @@ impl Default for EngineConfig {
             ),
             isp: false,
             bg_mode: BgMode::Line,
-            extractor_type: Extractor::Sequential,
+            extractor_type: Extractor::Approximate,
             crop: None,
             downsample: 0,
             bypass_calibration: false,
@@ -66,7 +66,7 @@ pub struct IntermediateResult {
     pub exp_time: Duration,
     pub pp_time: Duration,
     pub extract_time: Duration,
-    pub centroids_arr: Array2<f64>,
+    pub centroids_batch: Vec<Array2<f64>>,
     pub timestamp: SystemTime,
     pub mean_brightness: f64,
 }
@@ -74,7 +74,7 @@ pub struct IntermediateResult {
 #[derive(Clone, Debug, PartialEq, Eq, Default, clap::ValueEnum, Serialize, Deserialize)]
 pub enum Extractor {
     #[default]
-    Sequential,
+    Approximate,
     Fast,
     Cedar,
 }
@@ -240,7 +240,6 @@ impl Engine {
                 imu_type,
                 storage.clone(),
             )
-            .await
             .expect("Failed to initialize FusedSolver"),
         );
         let config_fov = config.initial_fov.map(|f| f as f64);
@@ -301,7 +300,7 @@ impl Engine {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(33));
             while is_running_clone.load(std::sync::atomic::Ordering::Relaxed) {
                 interval.tick().await;
-                if let Some(pos) = fused_solver_clone.get_latest_position().await {
+                if let Some(pos) = fused_solver_clone.get_latest_position() {
                     let ra = pos.ra;
                     let dec = pos.dec;
                     let eq_roll = pos.roll;
@@ -569,7 +568,7 @@ impl Engine {
 
                 let extract_start = Instant::now();
                 let num_centroids;
-                let mut centroids_arr;
+                let centroids_batch;
 
                 let (state_sigma, state_fov) = {
                     let st = engine_state_ext.read().unwrap();
@@ -577,7 +576,7 @@ impl Engine {
                 };
 
                 match config_ext.extractor_type {
-                    Extractor::Sequential | Extractor::Fast => {
+                    Extractor::Approximate | Extractor::Fast => {
                         let array_img =
                             match Array2::from_shape_vec((height, width), img_data.clone()) {
                                 Ok(arr) => arr,
@@ -635,14 +634,31 @@ impl Engine {
                                 BgMode::Line => Some(FastBgSubMode::LineMedian),
                             };
 
+                            let approximate_background =
+                                config_ext.extractor_type == Extractor::Approximate;
                             let options = FastExtractOptions {
                                 sigma: active_sigma,
+                                approximate_background,
                                 downsample,
                                 bg_sub_mode,
                                 binary_open: config_ext.noise_filter,
                                 min_area: Some(2),
                                 max_area: Some(active_max_area),
                                 crop: final_crop,
+                                virtual_crops: Some(vec![
+                                    tetra3::extractor::Crop::Center {
+                                        width: proc_width / 4,
+                                        height: proc_height / 4,
+                                    },
+                                    tetra3::extractor::Crop::Center {
+                                        width: proc_width / 2,
+                                        height: proc_height / 2,
+                                    },
+                                    tetra3::extractor::Crop::Center {
+                                        width: proc_width * 2 / 3,
+                                        height: proc_height * 2 / 3,
+                                    },
+                                ]),
                                 //centroid_window: Some(3),
                                 ..FastExtractOptions::default()
                             };
@@ -656,18 +672,34 @@ impl Engine {
                             ..Default::default()
                         });
 
-                        let result = if config_ext.extractor_type == Extractor::Sequential {
-                            ext.extract_sequential(&array_img)
-                        } else {
-                            ext.extract(&array_img)
-                        };
+                        let result = ext.extract(&array_img);
 
-                        num_centroids = result.len();
-                        centroids_arr = Array2::<f64>::zeros((num_centroids, 2));
-                        for (i, c) in result.iter().enumerate() {
-                            centroids_arr[[i, 0]] = c.y;
-                            centroids_arr[[i, 1]] = c.x;
+                        num_centroids = result.centroids.len();
+
+                        let mut batch = Vec::new();
+                        let target_c = config_ext.target_centroids as f64 * 0.5;
+
+                        if let Some(vc) = result.virtual_crop_centroids {
+                            for crop_cents in vc {
+                                if (crop_cents.len() as f64) >= target_c {
+                                    let mut arr = Array2::<f64>::zeros((crop_cents.len(), 2));
+                                    for (i, c) in crop_cents.iter().enumerate() {
+                                        arr[[i, 0]] = c.y;
+                                        arr[[i, 1]] = c.x;
+                                    }
+                                    batch.push(arr);
+                                }
+                            }
                         }
+
+                        let mut arr = Array2::<f64>::zeros((num_centroids, 2));
+                        for (i, c) in result.centroids.iter().enumerate() {
+                            arr[[i, 0]] = c.y;
+                            arr[[i, 1]] = c.x;
+                        }
+                        batch.push(arr);
+
+                        centroids_batch = batch;
                     }
                     Extractor::Cedar => {
                         let final_crop = config_ext
@@ -728,11 +760,12 @@ impl Engine {
                             );
 
                             num_centroids = stars.len();
-                            centroids_arr = Array2::<f64>::zeros((num_centroids, 2));
+                            let mut arr = Array2::<f64>::zeros((num_centroids, 2));
                             for (i, c) in stars.iter().enumerate() {
-                                centroids_arr[[i, 0]] = c.centroid_y + crop_y as f64;
-                                centroids_arr[[i, 1]] = c.centroid_x + crop_x as f64;
+                                arr[[i, 0]] = c.centroid_y + crop_y as f64;
+                                arr[[i, 1]] = c.centroid_x + crop_x as f64;
                             }
+                            centroids_batch = vec![arr];
                         } else {
                             error!("Failed to create ImageBuffer from image data");
                             continue;
@@ -764,7 +797,13 @@ impl Engine {
                 let mut hfr = if client_connected_ext.load(std::sync::atomic::Ordering::Relaxed)
                     || is_paused
                 {
-                    calculate_hfr(&img_data, width, height, &centroids_arr, 30)
+                    calculate_hfr(
+                        &img_data,
+                        width,
+                        height,
+                        centroids_batch.last().unwrap(),
+                        30,
+                    )
                 } else {
                     0.0
                 };
@@ -805,7 +844,7 @@ impl Engine {
                     exp_time: Duration::from_micros(exposure_us as u64),
                     pp_time: post_process_time,
                     extract_time,
-                    centroids_arr,
+                    centroids_batch,
                     timestamp: img_timestamp,
                     mean_brightness,
                 };
@@ -848,7 +887,7 @@ impl Engine {
         Duration,
         Duration,
         Duration,
-        Array2<f64>,
+        Vec<Array2<f64>>,
         SystemTime,
         f64,
     )> {
@@ -866,7 +905,7 @@ impl Engine {
                 res.exp_time,
                 res.pp_time,
                 res.extract_time,
-                res.centroids_arr,
+                res.centroids_batch,
                 res.timestamp,
                 res.mean_brightness,
             ))
@@ -967,7 +1006,7 @@ impl Engine {
                 );
 
                 let mut total_centroids = 0;
-                let mut last_centroids_arr = None;
+                let mut last_centroids_batch = None;
                 let mut valid_samples = 0;
                 let required_samples = if self.camera.get_exposure() < 500_000 {
                     3
@@ -1020,7 +1059,7 @@ impl Engine {
                         }
 
                         total_centroids += count;
-                        last_centroids_arr = Some(arr);
+                        last_centroids_batch = Some(arr);
                         valid_samples += 1;
                     } else {
                         std::thread::sleep(Duration::from_millis(50));
@@ -1054,9 +1093,13 @@ impl Engine {
                     let camera_config = self.camera.get_config().unwrap();
                     let size = (camera_config.height as f64, camera_config.width as f64);
 
-                    if let Some(arr) = &last_centroids_arr {
+                    if let Some(batch) = &last_centroids_batch {
                         let solve_start = Instant::now();
-                        let solution = futures::executor::block_on(self.fused_solver.solve_from_centroids(&arr.slice(s![..min(40, arr.nrows()), ..]).to_owned(), size, SolveOptions::default(), None))
+                        let sliced_batch: Vec<Array2<f64>> = batch
+                            .iter()
+                            .map(|a| a.slice(s![..min(40, a.nrows()), ..]).to_owned())
+                            .collect();
+                        let solution = self.fused_solver.solve_from_centroids_batch(&sliced_batch, size, SolveOptions::default(), None)
                             .expect("Critical Error: solver failed to execute during calibration. Is the database path valid?");
                         let solve_time = solve_start.elapsed();
 
@@ -1153,16 +1196,22 @@ impl Engine {
                         let camera_config = self.camera.get_config().unwrap();
                         let size = (camera_config.height as f64, camera_config.width as f64);
 
-                        if let Some(arr) = &last_centroids_arr {
-                            let solution = futures::executor::block_on(
-                                self.fused_solver.solve_from_centroids(
-                                    &arr.slice(s![..min(40, arr.nrows()), ..]).to_owned(),
+                        if let Some(batch) = &last_centroids_batch {
+                            let sliced_batch: Vec<Array2<f64>> = batch
+                                .iter()
+                                .map(|a| a.slice(s![..min(40, a.nrows()), ..]).to_owned())
+                                .collect();
+                            let solution = self
+                                .fused_solver
+                                .solve_from_centroids_batch(
+                                    &sliced_batch,
                                     size,
                                     SolveOptions::default(),
                                     None,
-                                ),
-                            )
-                            .expect("Critical Error: solver failed to execute during calibration.");
+                                )
+                                .expect(
+                                    "Critical Error: solver failed to execute during calibration.",
+                                );
 
                             if matches!(solution.status, SolveStatus::MatchFound) {
                                 self.fov = solution.fov;
@@ -1278,7 +1327,7 @@ impl Engine {
                 exp_time,
                 pp_time,
                 extract_time,
-                centroids_arr,
+                centroids_batch,
                 img_timestamp,
                 mean_brightness,
             )) = self.wait_for_extraction()
@@ -1419,14 +1468,16 @@ impl Engine {
 
                 if !observer_location_set {
                     if let (Some(lat), Some(lon)) = (lat_opt, lon_opt) {
-                        futures::executor::block_on(
-                            self.fused_solver.set_observer_location(lat, lon),
-                        );
+                        self.fused_solver.set_observer_location(lat, lon);
                         observer_location_set = true;
                     }
                 }
 
-                let solution = futures::executor::block_on(self.fused_solver.solve_from_centroids(&centroids_arr.slice(s![..min(40, centroids_arr.nrows()), ..]).to_owned(), size, solve_options, Some(img_timestamp)))
+                let sliced_batch: Vec<Array2<f64>> = centroids_batch
+                    .iter()
+                    .map(|a| a.slice(s![..min(40, a.nrows()), ..]).to_owned())
+                    .collect();
+                let solution = self.fused_solver.solve_from_centroids_batch(&sliced_batch, size, solve_options, Some(img_timestamp))
                     .expect("Critical Error: solver failed to execute during solving loop. Is the database accessible?");
 
                 let solve_time = solve_start.elapsed();
@@ -1613,13 +1664,13 @@ pub fn evaluate_focus(img_data: &[u8], width: usize, height: usize) -> f64 {
     let mut extractor = FastExtractor::new(width, height, options);
     let result = extractor.extract(&array_img);
 
-    let num_centroids = result.len();
+    let num_centroids = result.centroids.len();
     if num_centroids == 0 {
         return 0.0;
     }
 
     let mut centroids_arr = Array2::<f64>::zeros((num_centroids, 2));
-    for (i, c) in result.iter().enumerate() {
+    for (i, c) in result.centroids.iter().enumerate() {
         centroids_arr[[i, 0]] = c.y;
         centroids_arr[[i, 1]] = c.x;
     }

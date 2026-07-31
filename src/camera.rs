@@ -1,8 +1,6 @@
 // Required Notice: Copyright (c) 2026 Omair Kamil
 // See LICENSE file in root directory for license terms.
 
-use crate::{CameraConfig, CameraTrait, Image};
-
 #[cfg(target_os = "linux")]
 mod hardware {
     use super::*;
@@ -19,7 +17,6 @@ mod hardware {
         stream::StreamRole,
     };
     use log::info;
-    use rayon::prelude::*;
     #[cfg(target_arch = "aarch64")]
     use std::arch::aarch64::*;
     #[cfg(target_arch = "aarch64")]
@@ -361,9 +358,8 @@ mod hardware {
 
             if is_16_bit {
                 buf_data
-                    .par_chunks_exact(stride)
-                    .zip(image_data.par_chunks_exact_mut(width))
-                    .with_min_len(rows_per_core)
+                    .chunks_exact(stride)
+                    .zip(image_data.chunks_exact_mut(width))
                     .for_each(|(buf_row, pix_row)| {
                         #[cfg(target_arch = "aarch64")]
                         unsafe {
@@ -407,9 +403,8 @@ mod hardware {
                     image_data[..width * height].copy_from_slice(&buf_data[..width * height]);
                 } else {
                     buf_data
-                        .par_chunks_exact(stride)
-                        .zip(image_data.par_chunks_exact_mut(width))
-                        .with_min_len(rows_per_core)
+                        .chunks_exact(stride)
+                        .zip(image_data.chunks_exact_mut(width))
                         .for_each(|(buf_row, pix_row)| {
                             pix_row.copy_from_slice(&buf_row[..width]);
                         });
@@ -420,9 +415,8 @@ mod hardware {
                     let valid_buf_len = width * 5 / 4;
 
                     buf_data
-                        .par_chunks_exact(stride)
-                        .zip(image_data.par_chunks_exact_mut(width))
-                        .with_min_len(rows_per_core)
+                        .chunks_exact(stride)
+                        .zip(image_data.chunks_exact_mut(width))
                         .for_each(|(buf_row_full, pix_row_full)| {
                             let buf_slice = &buf_row_full[..valid_buf_len];
                             let pix_slice = &mut pix_row_full[..width];
@@ -516,9 +510,8 @@ mod hardware {
                     let valid_buf_len = width * 3 / 2;
 
                     buf_data
-                        .par_chunks_exact(stride)
-                        .zip(image_data.par_chunks_exact_mut(width))
-                        .with_min_len(rows_per_core)
+                        .chunks_exact(stride)
+                        .zip(image_data.chunks_exact_mut(width))
                         .for_each(|(buf_row_full, pix_row_full)| {
                             let buf_slice = &buf_row_full[..valid_buf_len];
                             let pix_slice = &mut pix_row_full[..width];

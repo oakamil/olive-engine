@@ -644,16 +644,16 @@ fn run_benchmark(state_mutex: Arc<Mutex<AppState>>, store: Arc<SharedImageStore>
             }
 
             let ext = extractor.as_mut().unwrap();
-            let result = ext.extract_sequential(&array_img);
+            let result = ext.extract(&array_img);
 
-            let num_centroids = result.len();
+            let num_centroids = result.centroids.len();
             recent_centroids.push_back(num_centroids);
             if recent_centroids.len() > 20 {
                 recent_centroids.pop_front();
             }
 
             let mut centroids_arr = Array2::<f64>::zeros((num_centroids, 2));
-            for (i, c) in result.iter().enumerate() {
+            for (i, c) in result.centroids.iter().enumerate() {
                 centroids_arr[[i, 0]] = c.y;
                 centroids_arr[[i, 1]] = c.x;
             }

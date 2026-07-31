@@ -13,13 +13,13 @@ use crate::engine::{BgMode, Engine, EngineConfig, EngineStateData, Extractor};
 use crate::uvc_camera::Camera as UvcCamera;
 
 #[pyfunction]
-#[pyo3(signature = (isp=false, bg_mode="line".to_string(), extractor_type="sequential".to_string(), rayon_threads=2, uvc=false, uvc_fps=None, uvc_mjpeg=false, gain=None, target_centroids=20, database_path=None, callback=None))]
+#[pyo3(signature = (isp=false, bg_mode="line".to_string(), extractor_type="approximate".to_string(), uvc=false, uvc_fps=None, uvc_mjpeg=false, gain=None, target_centroids=20, database_path=None, callback=None))]
 fn start_engine(
     py: Python,
     isp: bool,
     bg_mode: String,
     extractor_type: String,
-    rayon_threads: usize,
+
     uvc: bool,
     uvc_fps: Option<u32>,
     uvc_mjpeg: bool,
@@ -28,11 +28,6 @@ fn start_engine(
     database_path: Option<String>,
     callback: Option<PyObject>,
 ) -> PyResult<()> {
-    // Initialize Rayon thread pool (ignore if already initialized)
-    let _ = rayon::ThreadPoolBuilder::new()
-        .num_threads(rayon_threads)
-        .build_global();
-
     let db_path = database_path.unwrap_or_else(|| {
         let home = std::env::var("HOME").unwrap_or_default();
         format!("{}/data/default_database.npz", home)
@@ -41,7 +36,7 @@ fn start_engine(
     let ext_type = match extractor_type.to_lowercase().as_str() {
         "fast" => Extractor::Fast,
         "cedar" => Extractor::Cedar,
-        _ => Extractor::Sequential,
+        _ => Extractor::Approximate,
     };
 
     let bg_sub_mode = match bg_mode.to_lowercase().as_str() {

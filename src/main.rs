@@ -47,12 +47,8 @@ struct Args {
     bg_mode: olive_engine::engine::BgMode,
 
     /// Extractor type to use
-    #[arg(long, value_enum, default_value_t = olive_engine::engine::Extractor::Sequential)]
+    #[arg(long, value_enum, default_value_t = olive_engine::engine::Extractor::Approximate)]
     extractor_type: olive_engine::engine::Extractor,
-
-    /// Rayon threads configuration
-    #[arg(long, default_value_t = 2)]
-    rayon_threads: usize,
 
     /// IMU to use (none, bno085, bmi160)
     #[arg(long, default_value = "none")]
@@ -86,12 +82,6 @@ async fn main() {
         "none" => None,
         _ => panic!("Invalid IMU selected. Options are: none, bno085, bmi160"),
     };
-
-    // Initialize Rayon thread pool
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(args.rayon_threads)
-        .build_global()
-        .expect("Failed to initialize Rayon thread pool");
 
     // Resolve $HOME in database path if present
     let database_path = if args.database_path.starts_with("$HOME") {
@@ -153,7 +143,7 @@ async fn main() {
         None,
     )
     .await;
-    let _ = engine.fused_solver.start_imu().await;
+    let _ = engine.fused_solver.start_imu();
     let _ = engine.start();
 
     // Trap Ctrl-C to handle graceful shutdown
