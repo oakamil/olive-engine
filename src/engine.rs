@@ -1293,6 +1293,7 @@ impl Engine {
             Duration::ZERO,
         );
         let mut consecutive_failures = 0;
+        let mut consecutive_solves = 0;
         let mut observer_location_set = false;
 
         // Rolling average buffer to smooth out frame-to-frame scintillation dips
@@ -1417,8 +1418,20 @@ impl Engine {
                         Duration::ZERO,
                     );
 
-                    // Recovery check if we are lost
-                    if consecutive_failures > 3 {
+                    let actual_exp = exp_time.as_micros() as i32;
+                    let tolerance = (self.camera.get_exposure() as f32 * 0.01).max(500.0) as i32;
+                    let matches_current =
+                        (actual_exp - self.camera.get_exposure()).abs() <= tolerance;
+
+                    if matches_current {
+                        consecutive_failures += 1;
+                        consecutive_solves = 0;
+                    }
+
+                    if consecutive_failures == 4 {
+                        self.camera.restore_state();
+                        recent_centroids.clear();
+                    } else if consecutive_failures > 4 {
                         if mean_brightness < 20.0 {
                             if self.camera.adjust_sensitivity(1.5) {
                                 recent_centroids.clear();
@@ -1477,7 +1490,7 @@ impl Engine {
                     .iter()
                     .map(|a| a.slice(s![..min(40, a.nrows()), ..]).to_owned())
                     .collect();
-                let solution = self.fused_solver.solve_from_centroids_batch(&sliced_batch, size, solve_options, Some(img_timestamp))
+                let solution = self.fused_solver.solve_from_centroids_batch(&sliced_batch, size, solve_options.clone(), Some(img_timestamp))
                     .expect("Critical Error: solver failed to execute during solving loop. Is the database accessible?");
 
                 let solve_time = solve_start.elapsed();
@@ -1586,18 +1599,59 @@ impl Engine {
                 // Update our continuous failure tracker
                 if solved {
                     consecutive_failures = 0;
+                    consecutive_solves += 1;
+                    if consecutive_solves == 3 {
+                        self.camera.save_state();
+                    }
                 } else if matches_current {
                     consecutive_failures += 1;
+                    consecutive_solves = 0;
+                }
+
+                if consecutive_failures == 4 {
+                    self.camera.restore_state();
+                    recent_centroids.clear();
+                } else if consecutive_failures > 4 {
+                    if mean_brightness < 20.0 {
+                        if self.camera.adjust_sensitivity(1.5) {
+                            recent_centroids.clear();
+                        }
+                    } else if mean_brightness > 220.0 {
+                        if self.camera.adjust_sensitivity(0.5) {
+                            recent_centroids.clear();
+                        }
+                    }
                 }
 
                 // Continuous exposure/gain adjustment
                 if !self.config.bypass_calibration && matches_current {
                     let target = self.config.target_centroids as usize;
 
+                    let calibration_count = if solved {
+                        self.fused_solver
+                            .get_matches_for_centroids(
+                                &solution,
+                                &centroids_batch[0],
+                                size,
+                                &solve_options,
+                            )
+                            .unwrap()
+                            .len()
+                    } else {
+                        if count < target {
+                            count
+                        } else {
+                            // If we have many centroids but fail to solve, it's likely an obstruction.
+                            // To gently increase exposure and "fish" for stars through the obstruction,
+                            // we provide a low count (0) to push the average down.
+                            0
+                        }
+                    };
+
                     if recent_centroids.len() >= 5 {
                         recent_centroids.remove(0);
                     }
-                    recent_centroids.push(count);
+                    recent_centroids.push(calibration_count);
 
                     if recent_centroids.len() >= 5 {
                         let avg_count = (recent_centroids.iter().sum::<usize>() as f64

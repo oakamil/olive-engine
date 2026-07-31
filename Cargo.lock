@@ -389,7 +389,7 @@ dependencies = [
  "bitflags 2.11.1",
  "cexpr",
  "clang-sys",
- "itertools 0.12.1",
+ "itertools 0.13.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -442,6 +442,20 @@ version = "1.1.0"
 source = "git+https://github.com/oakamil/bmi160-rs.git#a4c16646d5175817705f473879652c2092d1d58a"
 dependencies = [
  "embedded-hal",
+]
+
+[[package]]
+name = "bno055"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20ae371e0ae10daadee46116bcbf64ead594b5f83fb0e50f380eca3dcf5b853a"
+dependencies = [
+ "bitflags 2.11.1",
+ "byteorder",
+ "embedded-hal",
+ "mint",
+ "num-derive",
+ "num-traits",
 ]
 
 [[package]]
@@ -2305,6 +2319,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "mint"
+version = "0.5.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e53debba6bda7a793e5f99b8dacf19e626084f525f7829104ba9898f367d85ff"
+
+[[package]]
 name = "mio"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2726,6 +2746,7 @@ name = "olive-imu"
 version = "0.1.0"
 dependencies = [
  "bmi160",
+ "bno055",
  "bno080",
  "linux-embedded-hal",
  "log",

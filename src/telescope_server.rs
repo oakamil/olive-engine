@@ -954,8 +954,8 @@ mod tests {
 
     use super::*;
 
-    async fn setup_controller() -> (Lx200Controller, Arc<RwLock<SharedPosition>>) {
-        let shared_position = Arc::new(RwLock::new(SharedPosition::default()));
+    async fn setup_controller() -> (Lx200Controller, Arc<SharedPosition>) {
+        let shared_position = Arc::new(SharedPosition::default());
         let timescale = Arc::new(Timescale::default());
         let controller = Lx200Controller::new(shared_position.clone(), timescale);
         (controller, shared_position)
@@ -1047,12 +1047,12 @@ mod tests {
         // Set epoch to J2000 for no change
         controller.jnow_epoch = 2000.0;
 
-        let ra_j2000 = 1.5 * 15.0;
-        let dec_j2000 = 30.5;
+        let ra_j2000 = 1.5 * 15.0f64;
+        let dec_j2000 = 30.5f64;
 
         // Set position in a block to release the lock at the end
         {
-            let mut locked_position = position_arc.write().unwrap();
+            let locked_position = &position_arc;
             locked_position
                 .telescope_ra
                 .store(ra_j2000.to_bits(), Ordering::Relaxed);
@@ -1090,18 +1090,33 @@ mod tests {
 
         // Check shared position state
         {
-            let locked_position = position_arc.read().unwrap();
-            assert_approx_eq(locked_position.target_ra.unwrap(), 157.5);
-            assert_approx_eq(locked_position.target_dec.unwrap(), -15.5);
-            assert_eq!(locked_position.target_op, Some(TargetOp::Slew));
+            let locked_position = &position_arc;
+            assert_approx_eq(
+                locked_position
+                    .target_ra
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .unwrap(),
+                157.5,
+            );
+            assert_approx_eq(
+                locked_position
+                    .target_dec
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .unwrap(),
+                -15.5,
+            );
+            assert_eq!(
+                locked_position.target_op.load(Ordering::Relaxed),
+                Some(TargetOp::Slew)
+            );
         }
 
         let abort = controller.process_input(b":Q#");
         assert_eq!(abort, None);
 
         {
-            let locked_position = position_arc.read().unwrap();
-            assert!(locked_position.target_op.is_none());
+            let locked_position = &position_arc;
+            assert!(locked_position.target_op.load(Ordering::Relaxed).is_none());
         }
 
         // Slew should fail if no target
@@ -1125,10 +1140,25 @@ mod tests {
         sync = controller.process_input(b":CM#");
         assert_eq!(sync.as_deref(), Some(" M31 EX GAL MAG 3.5 SZ178.0'#"));
 
-        let locked_position = position_arc.read().unwrap();
-        assert_approx_eq(locked_position.target_ra.unwrap(), 15.0);
-        assert_approx_eq(locked_position.target_dec.unwrap(), 20.0);
-        assert_eq!(locked_position.target_op, Some(TargetOp::Sync));
+        let locked_position = &position_arc;
+        assert_approx_eq(
+            locked_position
+                .target_ra
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .unwrap(),
+            15.0,
+        );
+        assert_approx_eq(
+            locked_position
+                .target_dec
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .unwrap(),
+            20.0,
+        );
+        assert_eq!(
+            locked_position.target_op.load(Ordering::Relaxed),
+            Some(TargetOp::Sync)
+        );
     }
 
     // --- Location and Date Tests ---
@@ -1139,27 +1169,39 @@ mod tests {
         let set_lat_n = controller.process_input(b":St+37:46#");
         assert_eq!(set_lat_n.as_deref(), Some("1"));
         assert_eq!(controller.latitude, "+37:46");
-        let lat_n = position_arc.read().unwrap().site_latitude.unwrap();
+        let lat_n = position_arc
+            .site_latitude
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .unwrap();
         assert_approx_eq(lat_n, 37.7667);
 
         let set_lat_s = controller.process_input(b":St-37:46#");
         assert_eq!(set_lat_s.as_deref(), Some("1"));
         assert_eq!(controller.latitude, "-37:46");
-        let lat_s = position_arc.read().unwrap().site_latitude.unwrap();
+        let lat_s = position_arc
+            .site_latitude
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .unwrap();
         assert_approx_eq(lat_s, -37.7667);
 
         // Less than 180 is West for longitude
         let set_lon_w = controller.process_input(b":Sg122:25#");
         assert_eq!(set_lon_w.as_deref(), Some("1"));
         assert_eq!(controller.longitude, "122:25");
-        let lon_w = position_arc.read().unwrap().site_longitude.unwrap();
+        let lon_w = position_arc
+            .site_longitude
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .unwrap();
         assert_approx_eq(lon_w, -122.4167);
 
         // Longitude values are > 180 for East
         let set_lon_e = controller.process_input(b":Sg300:00#");
         assert_eq!(set_lon_e.as_deref(), Some("1"));
         assert_eq!(controller.longitude, "300:00");
-        let lon_e = position_arc.read().unwrap().site_longitude.unwrap();
+        let lon_e = position_arc
+            .site_longitude
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .unwrap();
         // 360 - 300 = 60.0
         assert_approx_eq(lon_e, 60.0);
 
@@ -1198,10 +1240,12 @@ mod tests {
 
         // Check the SharedPositions time
         {
-            let locked_position = position_arc.read().unwrap();
+            let locked_position = &position_arc;
             assert_eq!(
-                locked_position.site_date,
-                Some(expected_dt.with_timezone(&Utc))
+                locked_position
+                    .site_date_ms
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                Some(expected_dt.timestamp_millis())
             );
         }
 
@@ -1246,15 +1290,19 @@ mod tests {
 
         // Set position in a block to release the lock at the end
         {
-            let mut locked_position = position_arc.write().unwrap();
-            locked_position.target_op = None;
+            let locked_position = &position_arc;
+            locked_position
+                .target_op
+                .store(None, std::sync::atomic::Ordering::Relaxed);
         }
         assert_eq!(controller.process_input(b":D#").as_deref(), Some("#"));
 
         // Set position in a block to release the lock at the end
         {
-            let mut locked_position = position_arc.write().unwrap();
-            locked_position.target_op = Some(TargetOp::Slew);
+            let locked_position = &position_arc;
+            locked_position
+                .target_op
+                .store(Some(TargetOp::Slew), std::sync::atomic::Ordering::Relaxed);
         }
         assert_eq!(controller.process_input(b":D#").as_deref(), Some("\x7f#"));
     }
@@ -1270,8 +1318,14 @@ mod tests {
         let (mut client_read, mut client_write) = tokio::io::split(client);
 
         let server_handle = tokio::spawn(async move {
-            Lx200Controller::handle_connection(controller_arc.clone(), server_read, server_write)
-                .await;
+            let is_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            Lx200Controller::handle_connection(
+                controller_arc.clone(),
+                server_read,
+                server_write,
+                is_running,
+            )
+            .await;
             controller_arc
         });
 
@@ -1302,7 +1356,14 @@ mod tests {
         let (mut client_read, mut client_write) = tokio::io::split(client);
 
         let server_handle = tokio::spawn(async move {
-            Lx200Controller::handle_connection(controller_arc, server_read, server_write).await;
+            let is_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            Lx200Controller::handle_connection(
+                controller_arc,
+                server_read,
+                server_write,
+                is_running,
+            )
+            .await;
         });
 
         // Stellarium sends a leading #
@@ -1330,7 +1391,14 @@ mod tests {
         let (mut client_read, mut client_write) = tokio::io::split(client);
 
         let server_handle = tokio::spawn(async move {
-            Lx200Controller::handle_connection(controller_arc, server_read, server_write).await;
+            let is_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            Lx200Controller::handle_connection(
+                controller_arc,
+                server_read,
+                server_write,
+                is_running,
+            )
+            .await;
         });
 
         // Send the first fragment of the command
@@ -1369,7 +1437,7 @@ mod tests {
 
         // Set position in a block to release the lock at the end
         {
-            let mut locked_position = position_arc.write().unwrap();
+            let locked_position = &position_arc;
             locked_position
                 .telescope_ra
                 .store(0.0f64.to_bits(), Ordering::Relaxed);
@@ -1383,7 +1451,14 @@ mod tests {
         let (mut client_read, mut client_write) = tokio::io::split(client);
 
         let server_handle = tokio::spawn(async move {
-            Lx200Controller::handle_connection(controller_arc, server_read, server_write).await;
+            let is_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            Lx200Controller::handle_connection(
+                controller_arc,
+                server_read,
+                server_write,
+                is_running,
+            )
+            .await;
         });
 
         // SkySafari in Bluetooth mode sets slew rate and gets RA together
@@ -1409,11 +1484,11 @@ mod tests {
         controller.is_stellarium = true;
 
         // Use 10h RA (150 degrees) and +45d Dec
-        let internal_ra = 150.0;
-        let internal_dec = 45.0;
+        let internal_ra = 150.0f64;
+        let internal_dec = 45.0f64;
         // Set position in a block to release the lock at the end
         {
-            let mut locked_position = position_arc.write().unwrap();
+            let locked_position = &position_arc;
             locked_position
                 .telescope_ra
                 .store(internal_ra.to_bits(), Ordering::Relaxed);
@@ -1439,10 +1514,27 @@ mod tests {
         // Check the SharedPositions time
         // Ensure no precessing for target
         {
-            let locked_position = position_arc.read().unwrap();
-            assert_eq!(locked_position.target_op, Some(TargetOp::Slew));
-            assert_approx_eq(locked_position.target_ra.unwrap(), 300.0);
-            assert_approx_eq(locked_position.target_dec.unwrap(), -30.0);
+            let locked_position = &position_arc;
+            assert_eq!(
+                locked_position
+                    .target_op
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                Some(TargetOp::Slew)
+            );
+            assert_approx_eq(
+                locked_position
+                    .target_ra
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .unwrap(),
+                300.0,
+            );
+            assert_approx_eq(
+                locked_position
+                    .target_dec
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .unwrap(),
+                -30.0,
+            );
         }
     }
 }
