@@ -61,11 +61,11 @@ impl Default for EngineConfig {
 pub struct IntermediateResult {
     pub count: usize,
     pub exp_time: Duration,
+    pub phys_exp_time: Duration,
     pub pp_time: Duration,
     pub extract_time: Duration,
     pub centroids_batch: Vec<(Array2<f64>, Option<tetra3::extractor::Crop>)>,
     pub timestamp: SystemTime,
-    pub mean_brightness: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default, clap::ValueEnum, Serialize, Deserialize)]
@@ -859,22 +859,6 @@ impl Engine {
                     }
                 }
 
-                let target = config_ext.target_centroids as usize;
-                let needs_brightness =
-                    num_centroids < 4 || num_centroids < (target as f64 * 0.75) as usize;
-                let mean_brightness = if needs_brightness {
-                    let step = 256;
-                    let count = final_img_data.len() / step;
-                    if count > 0 {
-                        let sum: u64 = final_img_data.iter().step_by(step).map(|&p| p as u64).sum();
-                        sum as f64 / count as f64
-                    } else {
-                        0.0
-                    }
-                } else {
-                    0.0
-                };
-
                 let extract_time = extract_start.elapsed();
 
                 // Calculate focus metric only when camera mode is active (manual focus).
@@ -928,11 +912,11 @@ impl Engine {
                 let intermediate = IntermediateResult {
                     count: num_centroids,
                     exp_time: Duration::from_micros(virtual_exposure_us as u64),
+                    phys_exp_time: Duration::from_micros(exposure_us as u64),
                     pp_time: post_process_time,
                     extract_time,
                     centroids_batch,
                     timestamp: img_timestamp,
-                    mean_brightness,
                 };
 
                 let (lock, cvar) = &*shared_res_ext;
@@ -975,7 +959,7 @@ impl Engine {
         Duration,
         Vec<(Array2<f64>, Option<tetra3::extractor::Crop>)>,
         SystemTime,
-        f64,
+        Duration,
     )> {
         let (lock, cvar) = &*self.shared_result;
         let mut inner = lock.lock().unwrap();
@@ -993,7 +977,7 @@ impl Engine {
                 res.extract_time,
                 res.centroids_batch,
                 res.timestamp,
-                res.mean_brightness,
+                res.phys_exp_time,
             ))
         } else {
             None
@@ -1046,7 +1030,7 @@ impl Engine {
                 extract_time,
                 centroids_batch,
                 img_timestamp,
-                _mean_brightness,
+                phys_exp_time,
             )) = self.wait_for_extraction()
             {
                 let mut pending_sync = None;
@@ -1146,7 +1130,8 @@ impl Engine {
 
                 let mut solve_options = SolveOptions::default();
                 if let Some(fov) = self.fov {
-                    solve_options.solve_timeout_ms = Some(exp_time.as_secs_f64() * 1000.0 * 0.90);
+                    solve_options.solve_timeout_ms =
+                        Some(phys_exp_time.as_secs_f64() * 1000.0 * 0.90);
                     solve_options.fov_estimate = Some(fov);
                     solve_options.fov_max_error = Some(1.5); // Provide a generous constraint based on locked FOV
                 }
