@@ -10,6 +10,7 @@ pub mod control_server;
 pub mod engine;
 #[cfg(not(target_os = "android"))]
 pub mod python;
+pub mod stacker;
 
 pub mod alpaca_server;
 pub mod dummy_camera;

@@ -1,6 +1,8 @@
 // Required Notice: Copyright (c) 2026 Omair Kamil
 // See LICENSE file in root directory for license terms.
 
+use crate::{CameraConfig, CameraTrait, Image};
+
 #[cfg(target_os = "linux")]
 mod hardware {
     use super::*;
@@ -353,8 +355,6 @@ mod hardware {
             let is_10_bit = config.bit_depth == 10;
             let is_12_bit = config.bit_depth == 12;
             let is_16_bit = config.bit_depth == 16;
-
-            let rows_per_core = height / 2;
 
             if is_16_bit {
                 buf_data

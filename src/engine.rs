@@ -3,13 +3,12 @@
 
 use std::sync::atomic::Ordering;
 use std::{
-    cmp::min,
     sync::{Arc, RwLock},
     time::{Duration, Instant, SystemTime},
 };
 
 use log::{debug, error, info, warn};
-use ndarray::{Array2, s};
+use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::Receiver;
 
@@ -22,8 +21,6 @@ use tetra3::{
 };
 
 pub const MIN_CENTROIDS: usize = 4;
-pub const CALIBRATION_INTERVAL: Duration = Duration::from_secs(10);
-pub const MAX_RETRIES: usize = 15; // Increased to allow downward floor probing
 
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
@@ -66,7 +63,7 @@ pub struct IntermediateResult {
     pub exp_time: Duration,
     pub pp_time: Duration,
     pub extract_time: Duration,
-    pub centroids_batch: Vec<Array2<f64>>,
+    pub centroids_batch: Vec<(Array2<f64>, Option<tetra3::extractor::Crop>)>,
     pub timestamp: SystemTime,
     pub mean_brightness: f64,
 }
@@ -156,6 +153,8 @@ impl Default for EngineStateData {
     }
 }
 
+const MAX_STACKED_FRAMES: u32 = 10;
+
 #[allow(dead_code)]
 pub struct Engine {
     camera: Arc<dyn CameraTrait>,
@@ -181,6 +180,7 @@ pub struct Engine {
         std::sync::Condvar,
     )>,
     pub is_running: Arc<std::sync::atomic::AtomicBool>,
+    pub clear_stacker: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn angle_diff_deg(a: f64, b: f64) -> f64 {
@@ -377,6 +377,8 @@ impl Engine {
             tokio::spawn(polling_task);
         }
 
+        let clear_stacker = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         Self {
             camera,
             config,
@@ -392,6 +394,7 @@ impl Engine {
             solve_timestamps: std::collections::VecDeque::with_capacity(60),
             shared_result: Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new())),
             is_running,
+            clear_stacker,
             telescope_server_handle: Some(telescope_server_handle),
             alpaca_server_handle: Some(alpaca_server_handle),
             rt_handle,
@@ -466,14 +469,18 @@ impl Engine {
         let engine_state_ext = self.engine_state.clone();
         let is_running_ext = self.is_running.clone();
         let client_connected_ext = self.client_connected.clone();
+        let clear_stacker_ext = self.clear_stacker.clone();
+        let fused_solver_ext = self.fused_solver.clone();
 
         let t1 = std::thread::spawn(move || {
+            let mut stacker = crate::stacker::Stacker::new(0, 0, !config_ext.bypass_calibration);
             let mut extractor: Option<FastExtractor> = None;
             let mut last_processed_timestamp = None;
             let mut active_max_area = 150;
             let mut fov_locked_in = false;
             let mut hfr_history: std::collections::VecDeque<(std::time::SystemTime, f64)> =
                 std::collections::VecDeque::new();
+            let mut stack_start_position: Option<olive_solve::Position> = None;
 
             loop {
                 if !is_running_ext.load(std::sync::atomic::Ordering::Relaxed) {
@@ -528,13 +535,67 @@ impl Engine {
                     Err(arc) => arc.data.clone(),
                 };
 
+                let virtual_exposure_us;
+                let final_img_data = {
+                    let mut moved = false;
+
+                    if let Some(motion) = fused_solver_ext.get_motion_state() {
+                        if motion == olive_imu::MotionState::Moving {
+                            moved = true;
+                        }
+                    }
+
+                    let current_pos = fused_solver_ext.get_latest_position();
+
+                    if !moved {
+                        if let (Some(start_pos), Some(curr_pos)) =
+                            (&stack_start_position, &current_pos)
+                        {
+                            let d_ra = angle_diff_deg(start_pos.ra, curr_pos.ra)
+                                * start_pos.dec.to_radians().cos();
+                            let d_dec = angle_diff_deg(start_pos.dec, curr_pos.dec);
+                            let dist_sq = d_ra * d_ra + d_dec * d_dec;
+
+                            // 0.05 degrees threshold (3 arcminutes)
+                            if dist_sq > (0.05 * 0.05) {
+                                moved = true;
+                            }
+                        }
+                    }
+
+                    if clear_stacker_ext.swap(false, std::sync::atomic::Ordering::Relaxed)
+                        || stacker.stacked_frames >= MAX_STACKED_FRAMES
+                        || moved
+                    {
+                        if moved {
+                            log::info!(
+                                "Movement detected by IMU / position delta, resetting stacker!"
+                            );
+                        }
+                        stacker.reset();
+                        stack_start_position = current_pos;
+                    } else if stack_start_position.is_none() {
+                        stack_start_position = current_pos;
+                    }
+
+                    if !stacker.enabled {
+                        virtual_exposure_us = exposure_us as i32;
+                        stacker.stacked_frames = 1;
+                        img_data.clone()
+                    } else {
+                        let active = stacker.add_frame(&img_data, exposure_us as u32).to_vec();
+                        virtual_exposure_us = stacker.virtual_exposure_us as i32;
+                        active
+                    }
+                };
+
                 let cam_config = camera_ext.get_config().expect("Camera config missing");
                 let width = cam_config.width as usize;
                 let height = cam_config.height as usize;
 
                 {
                     let mut state = engine_state_ext.write().unwrap();
-                    state.exposure_us = exposure_us;
+                    state.exposure_us = virtual_exposure_us;
                 }
 
                 if do_capture {
@@ -578,7 +639,7 @@ impl Engine {
                 match config_ext.extractor_type {
                     Extractor::Approximate | Extractor::Fast => {
                         let array_img =
-                            match Array2::from_shape_vec((height, width), img_data.clone()) {
+                            match Array2::from_shape_vec((height, width), final_img_data.clone()) {
                                 Ok(arr) => arr,
                                 Err(e) => {
                                     error!("Failed to create Array2 from image data: {}", e);
@@ -601,15 +662,49 @@ impl Engine {
                             }
                         }
 
-                        if extractor.is_none() {
-                            let final_crop = config_ext
-                                .crop
-                                .or(cam_config.crop.map(|(w, h)| (w as usize, h as usize)));
-                            let (proc_width, proc_height) = match final_crop {
-                                Some((cw, ch)) => (cw.min(width), ch.min(height)),
-                                None => (width, height),
-                            };
+                        let final_crop = config_ext
+                            .crop
+                            .or(cam_config.crop.map(|(w, h)| (w as usize, h as usize)));
+                        let (proc_width, proc_height) = match final_crop {
+                            Some((cw, ch)) => (cw.min(width), ch.min(height)),
+                            None => (width, height),
+                        };
 
+                        let mut virtual_crops = Vec::new();
+                        if final_crop.is_none() {
+                            virtual_crops = vec![
+                                tetra3::extractor::Crop::Region {
+                                    height: proc_height / 2,
+                                    width: proc_width / 2,
+                                    offset_y: 0,
+                                    offset_x: 0,
+                                },
+                                tetra3::extractor::Crop::Region {
+                                    height: proc_height / 2,
+                                    width: proc_width / 2,
+                                    offset_y: 0,
+                                    offset_x: (proc_width / 2) as isize,
+                                },
+                                tetra3::extractor::Crop::Region {
+                                    height: proc_height / 2,
+                                    width: proc_width / 2,
+                                    offset_y: (proc_height / 2) as isize,
+                                    offset_x: 0,
+                                },
+                                tetra3::extractor::Crop::Region {
+                                    height: proc_height / 2,
+                                    width: proc_width / 2,
+                                    offset_y: (proc_height / 2) as isize,
+                                    offset_x: (proc_width / 2) as isize,
+                                },
+                                tetra3::extractor::Crop::Center {
+                                    width: proc_width / 2,
+                                    height: proc_height / 2,
+                                },
+                            ];
+                        }
+
+                        if extractor.is_none() {
                             let downsample = match config_ext.downsample {
                                 4 => FastDownsample::X4,
                                 2 => FastDownsample::X2,
@@ -636,6 +731,7 @@ impl Engine {
 
                             let approximate_background =
                                 config_ext.extractor_type == Extractor::Approximate;
+
                             let options = FastExtractOptions {
                                 sigma: active_sigma,
                                 approximate_background,
@@ -645,20 +741,7 @@ impl Engine {
                                 min_area: Some(2),
                                 max_area: Some(active_max_area),
                                 crop: final_crop,
-                                virtual_crops: Some(vec![
-                                    tetra3::extractor::Crop::Center {
-                                        width: proc_width / 4,
-                                        height: proc_height / 4,
-                                    },
-                                    tetra3::extractor::Crop::Center {
-                                        width: proc_width / 2,
-                                        height: proc_height / 2,
-                                    },
-                                    tetra3::extractor::Crop::Center {
-                                        width: proc_width * 2 / 3,
-                                        height: proc_height * 2 / 3,
-                                    },
-                                ]),
+                                virtual_crops: Some(virtual_crops.clone()),
                                 //centroid_window: Some(3),
                                 ..FastExtractOptions::default()
                             };
@@ -676,18 +759,21 @@ impl Engine {
 
                         num_centroids = result.centroids.len();
 
-                        let mut batch = Vec::new();
+                        let mut batch: Vec<(Array2<f64>, Option<tetra3::extractor::Crop>)> =
+                            Vec::new();
                         let target_c = config_ext.target_centroids as f64 * 0.5;
 
                         if let Some(vc) = result.virtual_crop_centroids {
-                            for crop_cents in vc {
+                            for (i, crop_cents) in vc.iter().enumerate() {
                                 if (crop_cents.len() as f64) >= target_c {
                                     let mut arr = Array2::<f64>::zeros((crop_cents.len(), 2));
-                                    for (i, c) in crop_cents.iter().enumerate() {
-                                        arr[[i, 0]] = c.y;
-                                        arr[[i, 1]] = c.x;
+                                    for (j, c) in crop_cents.iter().enumerate() {
+                                        arr[[j, 0]] = c.y;
+                                        arr[[j, 1]] = c.x;
                                     }
-                                    batch.push(arr);
+                                    // Map the virtual_crop offset properly if available
+                                    let crop = virtual_crops.get(i).cloned();
+                                    batch.push((arr, crop));
                                 }
                             }
                         }
@@ -697,7 +783,7 @@ impl Engine {
                             arr[[i, 0]] = c.y;
                             arr[[i, 1]] = c.x;
                         }
-                        batch.push(arr);
+                        batch.push((arr, None));
 
                         centroids_batch = batch;
                     }
@@ -721,11 +807,11 @@ impl Engine {
                             for y in crop_y..(crop_y + crop_h) {
                                 let start = y * width + crop_x;
                                 let end = start + crop_w;
-                                cropped.extend_from_slice(&img_data[start..end]);
+                                cropped.extend_from_slice(&final_img_data[start..end]);
                             }
                             cropped
                         } else {
-                            img_data.clone()
+                            final_img_data.clone()
                         };
 
                         if let Some(gray_img) = image::ImageBuffer::from_raw(
@@ -765,7 +851,7 @@ impl Engine {
                                 arr[[i, 0]] = c.centroid_y + crop_y as f64;
                                 arr[[i, 1]] = c.centroid_x + crop_x as f64;
                             }
-                            centroids_batch = vec![arr];
+                            centroids_batch = vec![(arr, None)];
                         } else {
                             error!("Failed to create ImageBuffer from image data");
                             continue;
@@ -778,9 +864,9 @@ impl Engine {
                     num_centroids < 4 || num_centroids < (target as f64 * 0.75) as usize;
                 let mean_brightness = if needs_brightness {
                     let step = 256;
-                    let count = img_data.len() / step;
+                    let count = final_img_data.len() / step;
                     if count > 0 {
-                        let sum: u64 = img_data.iter().step_by(step).map(|&p| p as u64).sum();
+                        let sum: u64 = final_img_data.iter().step_by(step).map(|&p| p as u64).sum();
                         sum as f64 / count as f64
                     } else {
                         0.0
@@ -798,10 +884,10 @@ impl Engine {
                     || is_paused
                 {
                     calculate_hfr(
-                        &img_data,
+                        &final_img_data,
                         width,
                         height,
-                        centroids_batch.last().unwrap(),
+                        &centroids_batch.last().unwrap().0,
                         30,
                     )
                 } else {
@@ -841,7 +927,7 @@ impl Engine {
 
                 let intermediate = IntermediateResult {
                     count: num_centroids,
-                    exp_time: Duration::from_micros(exposure_us as u64),
+                    exp_time: Duration::from_micros(virtual_exposure_us as u64),
                     pp_time: post_process_time,
                     extract_time,
                     centroids_batch,
@@ -887,7 +973,7 @@ impl Engine {
         Duration,
         Duration,
         Duration,
-        Vec<Array2<f64>>,
+        Vec<(Array2<f64>, Option<tetra3::extractor::Crop>)>,
         SystemTime,
         f64,
     )> {
@@ -914,371 +1000,6 @@ impl Engine {
         }
     }
 
-    pub fn run_calibration_loop(&mut self) {
-        info!("Starting auto-calibration loop...");
-        self.update_status("Calibration");
-
-        info!("Waiting for stream initialization...");
-        while self.wait_for_extraction().is_none() {
-            if !self.is_running.load(std::sync::atomic::Ordering::Relaxed) {
-                return;
-            }
-        }
-
-        // Apply static hardware settings ONCE at startup
-        let initial_gain = self.config.gain;
-        if let Some(g) = initial_gain {
-            info!("Setting base hardware settings...");
-            self.camera.set_gain(g);
-        }
-
-        if self.config.bypass_calibration {
-            info!("Bypassing calibration loop based on configuration.");
-            return;
-        }
-
-        let target_min = self.config.target_centroids;
-        let target_max = (self.config.target_centroids as f64 * 1.25).round() as usize;
-
-        let mut was_connected = false;
-
-        loop {
-            if !self.is_running.load(std::sync::atomic::Ordering::Relaxed) {
-                return;
-            }
-            if self.engine_state.read().unwrap().paused {
-                self.update_status("Camera Mode");
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                continue;
-            }
-            if self
-                .client_connected
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
-                was_connected = true;
-                self.update_status("Camera Mode");
-                std::thread::sleep(Duration::from_millis(500));
-                continue;
-            } else if was_connected {
-                info!("Client disconnected. Restarting calibration hardware reset.");
-                was_connected = false;
-                self.camera.restore_state();
-                let g = initial_gain.unwrap_or(self.camera.get_gain_range().2);
-                self.camera.set_gain(g);
-            }
-
-            // Immediate UI update for exposure and status
-            self.update_status("Calibration");
-            self.update_solve_stats(
-                false,
-                0,
-                None,
-                None,
-                self.camera.get_exposure(), // Pull actual starting exposure
-                Duration::ZERO,
-                Duration::ZERO,
-                Duration::ZERO,
-            );
-
-            let mut calibrated = false;
-            let mut has_saved_state = false;
-
-            for retry in 0..MAX_RETRIES {
-                if self
-                    .client_connected
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    break;
-                }
-
-                self.update_status(&format!(
-                    "Calibration (Attempt {}/{})",
-                    retry + 1,
-                    MAX_RETRIES
-                ));
-
-                info!(
-                    "Calibration attempt {}/{} (Sensitivity State -> Exp: {} us, Gain: {:.2})",
-                    retry + 1,
-                    MAX_RETRIES,
-                    self.camera.get_exposure(),
-                    self.camera.get_gain()
-                );
-
-                let mut total_centroids = 0;
-                let mut last_centroids_batch = None;
-                let mut valid_samples = 0;
-                let required_samples = if self.camera.get_exposure() < 500_000 {
-                    3
-                } else {
-                    1
-                };
-
-                // Fetch frames until we verify the hardware has applied our new setting
-                while valid_samples < required_samples {
-                    if !self.is_running.load(std::sync::atomic::Ordering::Relaxed) {
-                        return;
-                    }
-                    if self
-                        .client_connected
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        break;
-                    }
-
-                    if let Some((
-                        count,
-                        exp_time,
-                        pp_time,
-                        extract_time,
-                        arr,
-                        _timestamp,
-                        _mean_brightness,
-                    )) = self.wait_for_extraction()
-                    {
-                        self.update_solve_stats(
-                            false,
-                            count,
-                            self.target_ra,
-                            self.target_dec,
-                            self.camera.get_exposure(),
-                            pp_time,
-                            extract_time,
-                            Duration::ZERO,
-                        );
-
-                        let actual_exp = exp_time.as_micros() as i32;
-
-                        // Hardware quantization tolerance (5% or 100us, whichever is larger)
-                        let tolerance =
-                            (self.camera.get_exposure() as f32 * 0.05).max(100.0) as i32;
-
-                        if (actual_exp - self.camera.get_exposure()).abs() > tolerance {
-                            // Frame is from the old exposure pipeline. Skip it without spamming the logs.
-                            continue;
-                        }
-
-                        total_centroids += count;
-                        last_centroids_batch = Some(arr);
-                        valid_samples += 1;
-                    } else {
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
-                }
-
-                if self
-                    .client_connected
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    break;
-                }
-
-                // Use floating point math to prevent truncation (e.g. 11.8 becoming 11)
-                let avg_centroids =
-                    (total_centroids as f64 / valid_samples as f64).round() as usize;
-                info!(
-                    "Averaged {} centroids over {} images. (Target: {}-{})",
-                    avg_centroids, valid_samples, target_min, target_max
-                );
-
-                let mut needs_standard_adjustment = true;
-
-                // Sanity check: If we have at least the minimum centroids, make sure it actually solves
-                if avg_centroids >= target_min {
-                    info!(
-                        "Centroid count >= min ({}). Running sanity check...",
-                        avg_centroids
-                    );
-
-                    let camera_config = self.camera.get_config().unwrap();
-                    let size = (camera_config.height as f64, camera_config.width as f64);
-
-                    if let Some(batch) = &last_centroids_batch {
-                        let solve_start = Instant::now();
-                        let sliced_batch: Vec<Array2<f64>> = batch
-                            .iter()
-                            .map(|a| a.slice(s![..min(40, a.nrows()), ..]).to_owned())
-                            .collect();
-                        let solution = self.fused_solver.solve_from_centroids_batch(&sliced_batch, size, SolveOptions::default(), None)
-                            .expect("Critical Error: solver failed to execute during calibration. Is the database path valid?");
-                        let solve_time = solve_start.elapsed();
-
-                        if matches!(solution.status, SolveStatus::MatchFound) {
-                            self.fov = solution.fov;
-                            self.update_solve_stats(
-                                true,
-                                0,
-                                None,
-                                None,
-                                self.camera.get_exposure(),
-                                Duration::ZERO,
-                                Duration::ZERO,
-                                solve_time,
-                            );
-                            info!("Sanity check passed! FOV: {:?}", self.fov);
-
-                            // Now check if we are below the ceiling
-                            if avg_centroids <= target_max {
-                                // Save current optimal state
-                                self.camera.save_state();
-                                has_saved_state = true;
-                                info!(
-                                    "Target range reached and verified. Testing a 10% lower sensitivity to find the optimal floor..."
-                                );
-
-                                let applied = self.camera.adjust_sensitivity(0.9);
-                                if !applied {
-                                    info!(
-                                        "Sensitivity cannot be lowered further. Calibration complete."
-                                    );
-                                    calibrated = true;
-                                    break;
-                                }
-                                needs_standard_adjustment = false;
-                            } else {
-                                if retry == MAX_RETRIES - 1 {
-                                    info!(
-                                        "Centroid count {} is high but sanity check passed. Max retries reached, accepting current state as calibration.",
-                                        avg_centroids
-                                    );
-                                    calibrated = true;
-                                    break;
-                                } else {
-                                    info!(
-                                        "Centroid count {} is too high (max {}). Scaling down sensitivity...",
-                                        avg_centroids, target_max
-                                    );
-                                    // Let it fall through to standard downward adjustment logic
-                                }
-                            }
-                        } else {
-                            warn!(
-                                "Sanity check failed (Status: {:?}). Camera may not be pointing at the sky.",
-                                solution.status
-                            );
-
-                            if has_saved_state {
-                                info!(
-                                    "Sanity check failed after step-down. Reverting to optimal floor state. Calibration complete."
-                                );
-                                self.camera.restore_state();
-                                calibrated = true;
-                                break;
-                            } else {
-                                break; // Normal failure, escape the retry loop
-                            }
-                        }
-                    }
-                } else {
-                    // avg_centroids < target_min
-                    if has_saved_state {
-                        info!(
-                            "Centroid count {} fell below target minimum ({}). Reverting to optimal floor state. Calibration complete.",
-                            avg_centroids, target_min
-                        );
-                        self.camera.restore_state();
-                        calibrated = true;
-                        break;
-                    }
-                }
-
-                if needs_standard_adjustment {
-                    // Finer Adjustment: We only move 33% of the way to the "ideal" mathematical factor.
-                    // This dampens the change so we creep up on the target range and settle lower.
-                    let raw_factor =
-                        self.config.target_centroids as f64 / (avg_centroids.max(1)) as f64;
-                    let factor = 1.0 + (raw_factor - 1.0) * 0.33;
-
-                    let applied = self.camera.adjust_sensitivity(factor);
-
-                    if !applied {
-                        info!("Sensitivity limit reached. Checking if it solves...");
-                        let camera_config = self.camera.get_config().unwrap();
-                        let size = (camera_config.height as f64, camera_config.width as f64);
-
-                        if let Some(batch) = &last_centroids_batch {
-                            let sliced_batch: Vec<Array2<f64>> = batch
-                                .iter()
-                                .map(|a| a.slice(s![..min(40, a.nrows()), ..]).to_owned())
-                                .collect();
-                            let solution = self
-                                .fused_solver
-                                .solve_from_centroids_batch(
-                                    &sliced_batch,
-                                    size,
-                                    SolveOptions::default(),
-                                    None,
-                                )
-                                .expect(
-                                    "Critical Error: solver failed to execute during calibration.",
-                                );
-
-                            if matches!(solution.status, SolveStatus::MatchFound) {
-                                self.fov = solution.fov;
-                                info!(
-                                    "Solves at limit! FOV: {:?}. Calibration complete.",
-                                    self.fov
-                                );
-                                calibrated = true;
-                                break;
-                            }
-                        }
-
-                        warn!(
-                            "Hardware/config limits reached and still outside target range. Aborting attempt."
-                        );
-                        break; // We hit our limits, break the retry loop and sleep
-                    }
-                }
-            }
-
-            // If we exhausted all retries but had successfully verified a state, use it!
-            if !calibrated {
-                if has_saved_state {
-                    info!(
-                        "Max retries reached during floor search. Reverting to optimal floor state. Calibration complete."
-                    );
-                    self.camera.restore_state();
-                    calibrated = true;
-                }
-            }
-
-            if calibrated {
-                break;
-            }
-
-            if self
-                .client_connected
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
-                continue;
-            }
-
-            info!(
-                "Calibration failed or in progress, waiting {:?}...",
-                CALIBRATION_INTERVAL
-            );
-
-            // Responsive wait that checks for connections
-            let wait_start = Instant::now();
-            while wait_start.elapsed() < CALIBRATION_INTERVAL {
-                if !self.is_running.load(std::sync::atomic::Ordering::Relaxed) {
-                    return;
-                }
-                if !self.is_running.load(std::sync::atomic::Ordering::Relaxed) {
-                    return;
-                }
-                if self
-                    .client_connected
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(250));
-            }
-        }
-    }
-
     pub fn run_solving_loop(&mut self) {
         info!("Entering solving loop...");
 
@@ -1292,12 +1013,7 @@ impl Engine {
             Duration::ZERO,
             Duration::ZERO,
         );
-        let mut consecutive_failures = 0;
-        let mut consecutive_solves = 0;
         let mut observer_location_set = false;
-
-        // Rolling average buffer to smooth out frame-to-frame scintillation dips
-        let mut recent_centroids: Vec<usize> = Vec::with_capacity(5);
         let mut was_connected = false;
 
         loop {
@@ -1330,7 +1046,7 @@ impl Engine {
                 extract_time,
                 centroids_batch,
                 img_timestamp,
-                mean_brightness,
+                _mean_brightness,
             )) = self.wait_for_extraction()
             {
                 let mut pending_sync = None;
@@ -1418,31 +1134,6 @@ impl Engine {
                         Duration::ZERO,
                     );
 
-                    let actual_exp = exp_time.as_micros() as i32;
-                    let tolerance = (self.camera.get_exposure() as f32 * 0.01).max(500.0) as i32;
-                    let matches_current =
-                        (actual_exp - self.camera.get_exposure()).abs() <= tolerance;
-
-                    if matches_current {
-                        consecutive_failures += 1;
-                        consecutive_solves = 0;
-                    }
-
-                    if consecutive_failures == 4 {
-                        self.camera.restore_state();
-                        recent_centroids.clear();
-                    } else if consecutive_failures > 4 {
-                        if mean_brightness < 20.0 {
-                            if self.camera.adjust_sensitivity(1.5) {
-                                recent_centroids.clear();
-                            }
-                        } else if mean_brightness > 220.0 {
-                            if self.camera.adjust_sensitivity(0.5) {
-                                recent_centroids.clear();
-                            }
-                        }
-                    }
-
                     continue;
                 }
 
@@ -1457,7 +1148,7 @@ impl Engine {
                 if let Some(fov) = self.fov {
                     solve_options.solve_timeout_ms = Some(exp_time.as_secs_f64() * 1000.0 * 0.90);
                     solve_options.fov_estimate = Some(fov);
-                    solve_options.fov_max_error = Some(0.5); // Provide a reasonable constraint based on FOV
+                    solve_options.fov_max_error = Some(1.5); // Provide a generous constraint based on locked FOV
                 }
                 // Check for pending sync or slew already processed above
 
@@ -1486,10 +1177,18 @@ impl Engine {
                     }
                 }
 
-                let sliced_batch: Vec<Array2<f64>> = centroids_batch
-                    .iter()
-                    .map(|a| a.slice(s![..min(40, a.nrows()), ..]).to_owned())
-                    .collect();
+                let sliced_batch: Vec<(Array2<f64>, Option<tetra3::extractor::Crop>)> =
+                    centroids_batch
+                        .iter()
+                        .map(|(a, c)| {
+                            (
+                                a.slice(ndarray::s![..std::cmp::min(80, a.nrows()), ..])
+                                    .to_owned(),
+                                c.clone(),
+                            )
+                        })
+                        .collect();
+
                 let solution = self.fused_solver.solve_from_centroids_batch(&sliced_batch, size, solve_options.clone(), Some(img_timestamp))
                     .expect("Critical Error: solver failed to execute during solving loop. Is the database accessible?");
 
@@ -1554,9 +1253,12 @@ impl Engine {
                             solve_time
                         );
 
-                        // Update FOV if available
-                        if let Some(new_fov) = solution.fov {
-                            self.fov = Some(new_fov);
+                        // Lock in the FOV after the first successful solve (if not provided by config)
+                        if self.fov.is_none() {
+                            if let Some(new_fov) = solution.fov {
+                                self.fov = Some(new_fov);
+                                log::info!("Locked solver FOV estimate to {:.2} degrees", new_fov);
+                            }
                         }
                         solved = true;
 
@@ -1565,7 +1267,7 @@ impl Engine {
                             count,
                             self.target_ra,
                             self.target_dec,
-                            self.camera.get_exposure(),
+                            exp_time.as_micros() as i32,
                             pp_time,
                             extract_time,
                             solve_time,
@@ -1577,7 +1279,7 @@ impl Engine {
                             count,
                             self.target_ra,
                             self.target_dec,
-                            self.camera.get_exposure(),
+                            exp_time.as_micros() as i32,
                             pp_time,
                             extract_time,
                             solve_time,
@@ -1589,101 +1291,9 @@ impl Engine {
                     }
                 }
 
-                let actual_exp = exp_time.as_micros() as i32;
-                // Tighter 1% tolerance prevents overlapping with our 5% adjustment steps (stops ratcheting)
-                let tolerance = (self.camera.get_exposure() as f32 * 0.01).max(500.0) as i32;
-
-                // For UVC, actual_exp will match get_exposure() immediately since it is static, passing naturally.
-                let matches_current = (actual_exp - self.camera.get_exposure()).abs() <= tolerance;
-
-                // Update our continuous failure tracker
                 if solved {
-                    consecutive_failures = 0;
-                    consecutive_solves += 1;
-                    if consecutive_solves == 3 {
-                        self.camera.save_state();
-                    }
-                } else if matches_current {
-                    consecutive_failures += 1;
-                    consecutive_solves = 0;
-                }
-
-                if consecutive_failures == 4 {
-                    self.camera.restore_state();
-                    recent_centroids.clear();
-                } else if consecutive_failures > 4 {
-                    if mean_brightness < 20.0 {
-                        if self.camera.adjust_sensitivity(1.5) {
-                            recent_centroids.clear();
-                        }
-                    } else if mean_brightness > 220.0 {
-                        if self.camera.adjust_sensitivity(0.5) {
-                            recent_centroids.clear();
-                        }
-                    }
-                }
-
-                // Continuous exposure/gain adjustment
-                if !self.config.bypass_calibration && matches_current {
-                    let target = self.config.target_centroids as usize;
-
-                    let calibration_count = if solved {
-                        self.fused_solver
-                            .get_matches_for_centroids(
-                                &solution,
-                                &centroids_batch[0],
-                                size,
-                                &solve_options,
-                            )
-                            .unwrap()
-                            .len()
-                    } else {
-                        if count < target {
-                            count
-                        } else {
-                            // If we have many centroids but fail to solve, it's likely an obstruction.
-                            // To gently increase exposure and "fish" for stars through the obstruction,
-                            // we provide a low count (0) to push the average down.
-                            0
-                        }
-                    };
-
-                    if recent_centroids.len() >= 5 {
-                        recent_centroids.remove(0);
-                    }
-                    recent_centroids.push(calibration_count);
-
-                    if recent_centroids.len() >= 5 {
-                        let avg_count = (recent_centroids.iter().sum::<usize>() as f64
-                            / recent_centroids.len() as f64)
-                            .round() as usize;
-
-                        let lower_bound = (target as f64 * 0.75) as usize;
-                        let upper_bound = (target as f64 * 1.5) as usize;
-
-                        let mut factor: Option<f64> = None;
-
-                        if avg_count < lower_bound {
-                            let f = target as f64 / avg_count.max(1) as f64;
-                            factor = Some(f.min(1.5)); // max 50% increase
-                        } else if avg_count > upper_bound {
-                            let f = target as f64 / avg_count as f64;
-                            factor = Some(f.max(0.5)); // max 50% decrease
-                        }
-
-                        if let Some(mut f) = factor {
-                            // Bright sky check
-                            if f > 1.0 && mean_brightness > 200.0 {
-                                f = 1.0;
-                            }
-                            if f != 1.0 {
-                                let applied = self.camera.adjust_sensitivity(f);
-                                if applied {
-                                    recent_centroids.clear();
-                                }
-                            }
-                        }
-                    }
+                    self.clear_stacker
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             } else {
                 std::thread::sleep(Duration::from_millis(100));
