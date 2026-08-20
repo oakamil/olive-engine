@@ -35,6 +35,7 @@ pub struct EngineConfig {
     pub bypass_calibration: bool,
     pub noise_filter: bool,
     pub initial_fov: Option<f32>,
+    pub use_observer_location: bool,
 }
 
 impl Default for EngineConfig {
@@ -54,6 +55,7 @@ impl Default for EngineConfig {
             bypass_calibration: false,
             noise_filter: false,
             initial_fov: None,
+            use_observer_location: true,
         }
     }
 }
@@ -66,6 +68,7 @@ pub struct IntermediateResult {
     pub extract_time: Duration,
     pub centroids_batch: Vec<(Array2<f64>, Option<tetra3::extractor::Crop>)>,
     pub timestamp: SystemTime,
+    pub stacked_frames: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default, clap::ValueEnum, Serialize, Deserialize)]
@@ -111,10 +114,12 @@ pub struct EngineStateData {
     pub offset_angle: Option<f64>,
     pub current_sigma: Option<f32>,
     pub fov: Option<f64>,
+    pub distortion: Option<f64>,
     pub requested_target_ra: Option<f64>,
     pub requested_target_dec: Option<f64>,
     pub requested_align_target_pixel: Option<(f64, f64)>,
     pub is_imu_estimate: bool,
+    pub strict_match: bool,
 }
 
 impl Default for EngineStateData {
@@ -145,15 +150,18 @@ impl Default for EngineStateData {
             offset_angle: None,
             current_sigma: None,
             fov: None,
+            distortion: None,
             requested_target_ra: None,
             requested_target_dec: None,
             requested_align_target_pixel: None,
             is_imu_estimate: false,
+            strict_match: false,
         }
     }
 }
 
 const MAX_STACKED_FRAMES: u32 = 10;
+const MAX_VIRTUAL_EXPOSURE_US: u32 = 3_000_000;
 
 #[allow(dead_code)]
 pub struct Engine {
@@ -161,6 +169,7 @@ pub struct Engine {
     config: EngineConfig,
     pub fused_solver: Arc<olive_solve::FusedSolver>,
     fov: Option<f64>,
+    distortion: Option<f64>,
 
     shared_position: Arc<SharedPosition>,
     pub telescope_server_handle: Option<tokio::task::JoinHandle<()>>,
@@ -181,6 +190,7 @@ pub struct Engine {
     )>,
     pub is_running: Arc<std::sync::atomic::AtomicBool>,
     pub clear_stacker: Arc<std::sync::atomic::AtomicBool>,
+    timescale: Arc<starfield::time::Timescale>,
 }
 
 fn angle_diff_deg(a: f64, b: f64) -> f64 {
@@ -290,16 +300,29 @@ impl Engine {
             (t_handle, a_handle)
         };
 
+        let clear_stacker = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         let engine_state_clone = engine_state.clone();
         let shared_pos_clone = shared_position.clone();
         let fused_solver_clone = fused_solver.clone();
         let is_running_clone = is_running.clone();
         let timescale_clone = timescale.clone();
+        let clear_stacker_clone = clear_stacker.clone();
 
         let polling_task = async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(33));
             while is_running_clone.load(std::sync::atomic::Ordering::Relaxed) {
                 interval.tick().await;
+
+                // High-cadence IMU motion distribution
+                if let Some(motion) = fused_solver_clone.get_motion_state() {
+                    let is_moving = motion == olive_imu::MotionState::Moving;
+
+                    if is_moving {
+                        clear_stacker_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+
                 if let Some(pos) = fused_solver_clone.get_latest_position() {
                     let ra = pos.ra;
                     let dec = pos.dec;
@@ -377,13 +400,12 @@ impl Engine {
             tokio::spawn(polling_task);
         }
 
-        let clear_stacker = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
         Self {
             camera,
             config,
             fused_solver,
             fov: config_fov,
+            distortion: None,
             shared_position,
             target_ra: None,
             target_dec: None,
@@ -399,6 +421,7 @@ impl Engine {
             alpaca_server_handle: Some(alpaca_server_handle),
             rt_handle,
             lx200_controller,
+            timescale,
         }
     }
 
@@ -460,6 +483,7 @@ impl Engine {
         state.solve_ms = solve.as_secs_f64() * 1000.0;
         state.solve_rate_hz = solve_rate_hz;
         state.fov = self.fov;
+        state.distortion = self.distortion;
     }
 
     pub fn start(self) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
@@ -470,7 +494,6 @@ impl Engine {
         let is_running_ext = self.is_running.clone();
         let client_connected_ext = self.client_connected.clone();
         let clear_stacker_ext = self.clear_stacker.clone();
-        let fused_solver_ext = self.fused_solver.clone();
 
         let t1 = std::thread::spawn(move || {
             let mut stacker = crate::stacker::Stacker::new(0, 0, !config_ext.bypass_calibration);
@@ -480,7 +503,6 @@ impl Engine {
             let mut fov_locked_in = false;
             let mut hfr_history: std::collections::VecDeque<(std::time::SystemTime, f64)> =
                 std::collections::VecDeque::new();
-            let mut stack_start_position: Option<olive_solve::Position> = None;
 
             loop {
                 if !is_running_ext.load(std::sync::atomic::Ordering::Relaxed) {
@@ -535,47 +557,26 @@ impl Engine {
                     Err(arc) => arc.data.clone(),
                 };
 
+                let cam_config = camera_ext.get_config().expect("Camera config missing");
+                let width = cam_config.width as usize;
+                let height = cam_config.height as usize;
+
                 let virtual_exposure_us;
                 let final_img_data = {
-                    let mut moved = false;
-
-                    if let Some(motion) = fused_solver_ext.get_motion_state() {
-                        if motion == olive_imu::MotionState::Moving {
-                            moved = true;
-                        }
-                    }
-
-                    let current_pos = fused_solver_ext.get_latest_position();
-
-                    if !moved {
-                        if let (Some(start_pos), Some(curr_pos)) =
-                            (&stack_start_position, &current_pos)
-                        {
-                            let d_ra = angle_diff_deg(start_pos.ra, curr_pos.ra)
-                                * start_pos.dec.to_radians().cos();
-                            let d_dec = angle_diff_deg(start_pos.dec, curr_pos.dec);
-                            let dist_sq = d_ra * d_ra + d_dec * d_dec;
-
-                            // 0.05 degrees threshold (3 arcminutes)
-                            if dist_sq > (0.05 * 0.05) {
-                                moved = true;
-                            }
-                        }
-                    }
-
-                    if clear_stacker_ext.swap(false, std::sync::atomic::Ordering::Relaxed)
+                    let should_reset = clear_stacker_ext
+                        .swap(false, std::sync::atomic::Ordering::Relaxed)
                         || stacker.stacked_frames >= MAX_STACKED_FRAMES
-                        || moved
-                    {
-                        if moved {
+                        || stacker.virtual_exposure_us >= MAX_VIRTUAL_EXPOSURE_US;
+
+                    if should_reset {
+                        if stacker.stacked_frames >= MAX_STACKED_FRAMES
+                            || stacker.virtual_exposure_us >= MAX_VIRTUAL_EXPOSURE_US
+                        {
                             log::info!(
-                                "Movement detected by IMU / position delta, resetting stacker!"
+                                "Engine: Stacker reached max frames or max virtual exposure, resetting"
                             );
                         }
                         stacker.reset();
-                        stack_start_position = current_pos;
-                    } else if stack_start_position.is_none() {
-                        stack_start_position = current_pos;
                     }
 
                     if !stacker.enabled {
@@ -583,20 +584,12 @@ impl Engine {
                         stacker.stacked_frames = 1;
                         img_data.clone()
                     } else {
+                        stacker.resize_if_needed(width, height);
                         let active = stacker.add_frame(&img_data, exposure_us as u32).to_vec();
                         virtual_exposure_us = stacker.virtual_exposure_us as i32;
                         active
                     }
                 };
-
-                let cam_config = camera_ext.get_config().expect("Camera config missing");
-                let width = cam_config.width as usize;
-                let height = cam_config.height as usize;
-
-                {
-                    let mut state = engine_state_ext.write().unwrap();
-                    state.exposure_us = virtual_exposure_us;
-                }
 
                 if do_capture {
                     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -670,39 +663,36 @@ impl Engine {
                             None => (width, height),
                         };
 
-                        let mut virtual_crops = Vec::new();
-                        if final_crop.is_none() {
-                            virtual_crops = vec![
-                                tetra3::extractor::Crop::Region {
-                                    height: proc_height / 2,
-                                    width: proc_width / 2,
-                                    offset_y: 0,
-                                    offset_x: 0,
-                                },
-                                tetra3::extractor::Crop::Region {
-                                    height: proc_height / 2,
-                                    width: proc_width / 2,
-                                    offset_y: 0,
-                                    offset_x: (proc_width / 2) as isize,
-                                },
-                                tetra3::extractor::Crop::Region {
-                                    height: proc_height / 2,
-                                    width: proc_width / 2,
-                                    offset_y: (proc_height / 2) as isize,
-                                    offset_x: 0,
-                                },
-                                tetra3::extractor::Crop::Region {
-                                    height: proc_height / 2,
-                                    width: proc_width / 2,
-                                    offset_y: (proc_height / 2) as isize,
-                                    offset_x: (proc_width / 2) as isize,
-                                },
-                                tetra3::extractor::Crop::Center {
-                                    width: proc_width / 2,
-                                    height: proc_height / 2,
-                                },
-                            ];
-                        }
+                        let virtual_crops = vec![
+                            tetra3::extractor::Crop::Region {
+                                height: proc_height / 2,
+                                width: proc_width / 2,
+                                offset_y: 0,
+                                offset_x: 0,
+                            },
+                            tetra3::extractor::Crop::Region {
+                                height: proc_height / 2,
+                                width: proc_width / 2,
+                                offset_y: 0,
+                                offset_x: (proc_width / 2) as isize,
+                            },
+                            tetra3::extractor::Crop::Region {
+                                height: proc_height / 2,
+                                width: proc_width / 2,
+                                offset_y: (proc_height / 2) as isize,
+                                offset_x: 0,
+                            },
+                            tetra3::extractor::Crop::Region {
+                                height: proc_height / 2,
+                                width: proc_width / 2,
+                                offset_y: (proc_height / 2) as isize,
+                                offset_x: (proc_width / 2) as isize,
+                            },
+                            tetra3::extractor::Crop::Center {
+                                width: proc_width / 2,
+                                height: proc_height / 2,
+                            },
+                        ];
 
                         if extractor.is_none() {
                             let downsample = match config_ext.downsample {
@@ -906,7 +896,6 @@ impl Engine {
                 {
                     let mut state = engine_state_ext.write().unwrap();
                     state.hfr = hfr;
-                    state.centroids = num_centroids;
                 }
 
                 let intermediate = IntermediateResult {
@@ -917,6 +906,7 @@ impl Engine {
                     extract_time,
                     centroids_batch,
                     timestamp: img_timestamp,
+                    stacked_frames: stacker.stacked_frames,
                 };
 
                 let (lock, cvar) = &*shared_res_ext;
@@ -960,6 +950,7 @@ impl Engine {
         Vec<(Array2<f64>, Option<tetra3::extractor::Crop>)>,
         SystemTime,
         Duration,
+        u32,
     )> {
         let (lock, cvar) = &*self.shared_result;
         let mut inner = lock.lock().unwrap();
@@ -978,6 +969,7 @@ impl Engine {
                 res.centroids_batch,
                 res.timestamp,
                 res.phys_exp_time,
+                res.stacked_frames,
             ))
         } else {
             None
@@ -1004,6 +996,88 @@ impl Engine {
             if !self.is_running.load(std::sync::atomic::Ordering::Relaxed) {
                 return;
             }
+
+            // 1. Process Local UI Requests (JNI/Push-To GoTo & Pixel Align)
+            if let Ok(mut st) = self.engine_state.write() {
+                if let (Some(ra), Some(dec)) = (st.requested_target_ra, st.requested_target_dec) {
+                    self.target_ra = Some(ra);
+                    self.target_dec = Some(dec);
+                    st.target_ra = Some(ra);
+                    st.target_dec = Some(dec);
+                    st.requested_target_ra = None;
+                    st.requested_target_dec = None;
+
+                    self.shared_position
+                        .target_op
+                        .store(Some(TargetOp::Slew), std::sync::atomic::Ordering::Relaxed);
+                    self.shared_position
+                        .is_slewing
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    info!("Engine received UI target request: RA={}, Dec={}", ra, dec);
+                }
+                if let Some((x, y)) = st.requested_align_target_pixel {
+                    self.target_pixel = Some((x, y));
+                    self.save_target_pixel(self.target_pixel);
+                    st.requested_align_target_pixel = None;
+                    info!("Engine received align target pixel request: ({}, {})", x, y);
+                }
+            }
+
+            // 2. Process External Client & State Flags (Alpaca/LX200)
+            let target_op = self
+                .shared_position
+                .target_op
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let target_ra = self
+                .shared_position
+                .target_ra
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let target_dec = self
+                .shared_position
+                .target_dec
+                .load(std::sync::atomic::Ordering::Relaxed);
+
+            if target_op == Some(TargetOp::Abort) {
+                self.target_ra = None;
+                self.target_dec = None;
+                if let Ok(mut st) = self.engine_state.write() {
+                    st.target_ra = None;
+                    st.target_dec = None;
+                }
+                self.shared_position
+                    .target_op
+                    .store(None, std::sync::atomic::Ordering::Relaxed);
+                self.shared_position
+                    .is_slewing
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            } else if target_op == Some(TargetOp::Slew)
+                && target_ra.is_some()
+                && target_dec.is_some()
+            {
+                let t_ra = target_ra.unwrap();
+                let t_dec = target_dec.unwrap();
+                self.target_ra = Some(t_ra);
+                self.target_dec = Some(t_dec);
+                if let Ok(mut st) = self.engine_state.write() {
+                    st.target_ra = Some(t_ra);
+                    st.target_dec = Some(t_dec);
+                }
+                self.shared_position
+                    .target_op
+                    .store(None, std::sync::atomic::Ordering::Relaxed);
+                self.shared_position
+                    .is_slewing
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+
+                // Consume it so we don't repeatedly trigger it
+                self.shared_position
+                    .target_ra
+                    .store(None, std::sync::atomic::Ordering::Relaxed);
+                self.shared_position
+                    .target_dec
+                    .store(None, std::sync::atomic::Ordering::Relaxed);
+            }
+
             if self.engine_state.read().unwrap().paused {
                 self.update_status("Camera Mode");
                 std::thread::sleep(std::time::Duration::from_millis(500));
@@ -1030,76 +1104,31 @@ impl Engine {
                 extract_time,
                 centroids_batch,
                 img_timestamp,
-                phys_exp_time,
+                _phys_exp_time,
+                stacked_frames,
             )) = self.wait_for_extraction()
             {
                 let mut pending_sync = None;
+
+                // 3. Process Sync Request (Requires active frame)
+                let sync_target_op = self
+                    .shared_position
+                    .target_op
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let sync_target_ra = self
+                    .shared_position
+                    .target_ra
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let sync_target_dec = self
+                    .shared_position
+                    .target_dec
+                    .load(std::sync::atomic::Ordering::Relaxed);
+
+                if sync_target_op == Some(TargetOp::Sync)
+                    && sync_target_ra.is_some()
+                    && sync_target_dec.is_some()
                 {
-                    if let Ok(mut st) = self.engine_state.write() {
-                        if let (Some(ra), Some(dec)) =
-                            (st.requested_target_ra, st.requested_target_dec)
-                        {
-                            self.target_ra = Some(ra);
-                            self.target_dec = Some(dec);
-                            st.requested_target_ra = None;
-                            st.requested_target_dec = None;
-
-                            // Let the shared position know we are slewing so external clients get updated state if any
-                            self.shared_position
-                                .target_op
-                                .store(Some(TargetOp::Slew), std::sync::atomic::Ordering::Relaxed);
-                            self.shared_position
-                                .is_slewing
-                                .store(true, std::sync::atomic::Ordering::Relaxed);
-                            info!("Engine received target request: RA={}, Dec={}", ra, dec);
-                        }
-
-                        if let Some((x, y)) = st.requested_align_target_pixel {
-                            self.target_pixel = Some((x, y));
-                            self.save_target_pixel(self.target_pixel);
-                            st.requested_align_target_pixel = None;
-                            info!("Engine received align target pixel request: ({}, {})", x, y);
-                        }
-                    }
-
-                    let target_op = self
-                        .shared_position
-                        .target_op
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let target_ra = self
-                        .shared_position
-                        .target_ra
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let target_dec = self
-                        .shared_position
-                        .target_dec
-                        .load(std::sync::atomic::Ordering::Relaxed);
-
-                    if target_op == Some(TargetOp::Abort) {
-                        self.target_ra = None;
-                        self.target_dec = None;
-                        self.shared_position
-                            .target_op
-                            .store(None, std::sync::atomic::Ordering::Relaxed);
-                        self.shared_position
-                            .is_slewing
-                            .store(false, std::sync::atomic::Ordering::Relaxed);
-                    } else if target_ra.is_some() && target_dec.is_some() {
-                        let t_ra = target_ra.unwrap();
-                        let t_dec = target_dec.unwrap();
-                        if target_op == Some(TargetOp::Sync) {
-                            pending_sync = Some((t_ra, t_dec));
-                        } else if target_op == Some(TargetOp::Slew) {
-                            self.target_ra = Some(t_ra);
-                            self.target_dec = Some(t_dec);
-                            self.shared_position
-                                .target_op
-                                .store(None, std::sync::atomic::Ordering::Relaxed);
-                            self.shared_position
-                                .is_slewing
-                                .store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
+                    pending_sync = Some((sync_target_ra.unwrap(), sync_target_dec.unwrap()));
                 }
 
                 if count < MIN_CENTROIDS {
@@ -1107,16 +1136,29 @@ impl Engine {
                         "Discarding frame: {} centroids (< {} min). Telescope might be moving.",
                         count, MIN_CENTROIDS
                     );
-                    self.update_solve_stats(
-                        false,
-                        count,
-                        self.target_ra,
-                        self.target_dec,
-                        exp_time.as_micros() as i32,
-                        Duration::ZERO,
-                        extract_time,
-                        Duration::ZERO,
-                    );
+                    if self.config.bypass_calibration
+                        || stacked_frames >= MAX_STACKED_FRAMES
+                        || exp_time.as_micros() as u32 >= MAX_VIRTUAL_EXPOSURE_US
+                    {
+                        self.update_solve_stats(
+                            false,
+                            count,
+                            self.target_ra,
+                            self.target_dec,
+                            exp_time.as_micros() as i32,
+                            Duration::ZERO,
+                            extract_time,
+                            Duration::ZERO,
+                        );
+                    } else {
+                        debug!(
+                            "Still stacking ({} / {} frames, {} / {} ms). Suppressing discard UI.",
+                            stacked_frames,
+                            MAX_STACKED_FRAMES,
+                            exp_time.as_millis(),
+                            MAX_VIRTUAL_EXPOSURE_US / 1000
+                        );
+                    }
 
                     continue;
                 }
@@ -1129,11 +1171,21 @@ impl Engine {
                 let size = (height, width);
 
                 let mut solve_options = SolveOptions::default();
+                // Force distortion calculation by providing a 0.0 baseline if None exists
+                solve_options.distortion = self.distortion.or(Some(0.0));
+
                 if let Some(fov) = self.fov {
+                    let zoom = self.camera.get_zoom().unwrap_or(1.0) as f64;
+                    // Mathematically project the Base FOV to the Zoomed FOV (rectilinear projection).
+                    let fov_rad = fov.to_radians();
+                    let zoomed_fov_rad = 2.0 * ((fov_rad / 2.0).tan() / zoom).atan();
+
                     solve_options.solve_timeout_ms =
-                        Some(phys_exp_time.as_secs_f64() * 1000.0 * 0.90);
-                    solve_options.fov_estimate = Some(fov);
-                    solve_options.fov_max_error = Some(1.5); // Provide a generous constraint based on locked FOV
+                        Some((exp_time.as_secs_f64() * 1000.0 * 0.90).max(200.0));
+                    solve_options.fov_estimate = Some(zoomed_fov_rad.to_degrees());
+                    // Provide a proportional constraint (5%) for wide-angle distortion shifts, with a minimum 0.1 degree floor for telescopes
+                    solve_options.fov_max_error =
+                        Some((zoomed_fov_rad.to_degrees() * 0.05).max(0.1));
                 }
                 // Check for pending sync or slew already processed above
 
@@ -1153,11 +1205,45 @@ impl Engine {
                 let lon_opt = engine_state
                     .client_longitude
                     .or(self.shared_position.site_longitude.load(Ordering::Relaxed));
+                let is_strict = engine_state.strict_match;
                 drop(engine_state);
+
+                if !is_strict {
+                    solve_options.match_max_error = 0.003; // Tighter tolerance since we have EMA distortion correction
+                    solve_options.match_threshold = 1e-4; // Keep Generous threshold for false positives
+                }
+
+                // Set Zenith limits to automatically reject patterns containing stars below the horizon
+                if let (Some(lat), Some(lon)) = (lat_opt, lon_opt) {
+                    if self.config.use_observer_location {
+                        let t = self.timescale.from_datetime(chrono::Utc::now());
+                        let gast_hours = t.gast();
+                        let lst_deg = (gast_hours * 15.0 + lon).rem_euclid(360.0);
+
+                        solve_options.observer_latitude = Some(lat);
+                        solve_options.observer_lst = Some(lst_deg);
+
+                        let max_fov = self.fov.unwrap_or(70.0);
+                        let offset_angle = if let Some(tp) = self.target_pixel {
+                            let center_x = width as f64 / 2.0;
+                            let center_y = height as f64 / 2.0;
+                            let dist_px =
+                                ((tp.0 - center_x).powi(2) + (tp.1 - center_y).powi(2)).sqrt();
+                            (dist_px / width as f64) * max_fov
+                        } else {
+                            0.0
+                        };
+
+                        let buffer = offset_angle + 1.0;
+                        solve_options.min_boresight_altitude = Some(-buffer);
+                    }
+                }
 
                 if !observer_location_set {
                     if let (Some(lat), Some(lon)) = (lat_opt, lon_opt) {
-                        self.fused_solver.set_observer_location(lat, lon);
+                        if self.config.use_observer_location {
+                            self.fused_solver.set_observer_location(lat, lon);
+                        }
                         observer_location_set = true;
                     }
                 }
@@ -1241,8 +1327,32 @@ impl Engine {
                         // Lock in the FOV after the first successful solve (if not provided by config)
                         if self.fov.is_none() {
                             if let Some(new_fov) = solution.fov {
-                                self.fov = Some(new_fov);
-                                log::info!("Locked solver FOV estimate to {:.2} degrees", new_fov);
+                                let zoom = self.camera.get_zoom().unwrap_or(1.0) as f64;
+                                // The solver returns the FOV of the zoomed (cropped) image.
+                                // We must reverse the rectilinear projection to find the camera's true 1.0x Base FOV.
+                                let solved_fov_rad = new_fov.to_radians();
+                                let base_fov_rad =
+                                    2.0 * ((solved_fov_rad / 2.0).tan() * zoom).atan();
+                                let base_fov = base_fov_rad.to_degrees();
+
+                                self.fov = Some(base_fov);
+                                log::info!(
+                                    "Locked base FOV to {:.2}° (Solved {:.2}° at {:.2}x zoom)",
+                                    base_fov,
+                                    new_fov,
+                                    zoom
+                                );
+                            }
+                        }
+
+                        // EMA update for distortion
+                        if let Some(new_dist) = solution.distortion {
+                            if let Some(old_dist) = self.distortion {
+                                // Exponential Moving Average (EMA).
+                                self.distortion = Some(0.9 * old_dist + 0.1 * new_dist);
+                            } else {
+                                self.distortion = Some(new_dist);
+                                log::info!("Locked initial distortion to {:.6}", new_dist);
                             }
                         }
                         solved = true;
@@ -1259,16 +1369,29 @@ impl Engine {
                         );
                     }
                     _ => {
-                        self.update_solve_stats(
-                            false,
-                            count,
-                            self.target_ra,
-                            self.target_dec,
-                            exp_time.as_micros() as i32,
-                            pp_time,
-                            extract_time,
-                            solve_time,
-                        );
+                        if self.config.bypass_calibration
+                            || stacked_frames >= MAX_STACKED_FRAMES
+                            || exp_time.as_micros() as u32 >= MAX_VIRTUAL_EXPOSURE_US
+                        {
+                            self.update_solve_stats(
+                                false,
+                                count,
+                                self.target_ra,
+                                self.target_dec,
+                                exp_time.as_micros() as i32,
+                                pp_time,
+                                extract_time,
+                                solve_time,
+                            );
+                        } else {
+                            debug!(
+                                "Still stacking ({} / {} frames, {} / {} ms). Suppressing failure UI.",
+                                stacked_frames,
+                                MAX_STACKED_FRAMES,
+                                exp_time.as_millis(),
+                                MAX_VIRTUAL_EXPOSURE_US / 1000
+                            );
+                        }
                         warn!(
                             "No Solution (Status: {:?}) | Centroids: {} | Exposure: {:?} | Post-Process: {:?} | Extract: {:?} | Solve: {:?}",
                             solution.status, count, exp_time, pp_time, extract_time, solve_time
@@ -1450,6 +1573,44 @@ mod tests {
         // Web converter reports Slit Alignment Position Angle: +96.77
         let position_angle: f64 = east_mid.atan2(north_mid).to_degrees();
         assert!((position_angle - 96.77).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_horizon_bounds_computation() {
+        let lat: f64 = 34.0;
+        let lon: f64 = -118.0;
+        let max_fov: f64 = 70.0;
+        let width: f64 = 1920.0;
+        let height: f64 = 1080.0;
+
+        let target_pixel: Option<(f64, f64)> = Some((1920.0, 540.0)); // Far right edge, middle Y
+
+        // Test offset math
+        let offset_angle = if let Some(tp) = target_pixel {
+            let center_x: f64 = width / 2.0;
+            let center_y: f64 = height / 2.0;
+            let dist_px = ((tp.0 - center_x).powi(2) + (tp.1 - center_y).powi(2)).sqrt();
+            (dist_px / width) * max_fov
+        } else {
+            0.0
+        };
+
+        // Center X = 960. dist_px = 960.
+        // 960 / 1920 = 0.5. 0.5 * 70 = 35.0.
+        assert!((offset_angle - 35.0).abs() < 0.01);
+
+        let buffer = offset_angle + 1.0;
+        assert!((buffer - 36.0).abs() < 0.01);
+
+        // Test LST math
+        let mut timescale = starfield::time::Timescale::default();
+        // Just checking it doesn't crash and returns reasonable bounds
+        let now = chrono::Utc::now();
+        let t = timescale.from_datetime(now);
+        let gast_hours = t.gast();
+        let lst_deg = (gast_hours * 15.0 + lon).rem_euclid(360.0);
+
+        assert!(lst_deg >= 0.0 && lst_deg < 360.0);
     }
 }
 
