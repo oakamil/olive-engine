@@ -25,7 +25,7 @@ use tokio::{
     net::TcpListener,
 };
 
-fn precess_coordinates(
+pub(crate) fn precess_coordinates(
     ra: f64,
     dec: f64,
     epoch_from_j: f64,

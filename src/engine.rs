@@ -117,6 +117,7 @@ pub struct EngineStateData {
     pub distortion: Option<f64>,
     pub requested_target_ra: Option<f64>,
     pub requested_target_dec: Option<f64>,
+    pub requested_target_epoch: Option<f64>,
     pub requested_align_target_pixel: Option<(f64, f64)>,
     pub is_imu_estimate: bool,
     pub strict_match: bool,
@@ -153,6 +154,7 @@ impl Default for EngineStateData {
             distortion: None,
             requested_target_ra: None,
             requested_target_dec: None,
+            requested_target_epoch: None,
             requested_align_target_pixel: None,
             is_imu_estimate: false,
             strict_match: false,
@@ -339,12 +341,14 @@ impl Engine {
                     let mut target_dec_opt = None;
                     let mut lat_opt_state = None;
                     let mut lon_opt_state = None;
+                    let mut client_date_opt = None;
 
                     if let Ok(state) = engine_state_clone.read() {
                         target_ra_opt = state.target_ra;
                         target_dec_opt = state.target_dec;
                         lat_opt_state = state.client_latitude;
                         lon_opt_state = state.client_longitude;
+                        client_date_opt = state.client_date;
                     }
 
                     let mut offset_ra = None;
@@ -360,7 +364,7 @@ impl Engine {
                         offset_dec = Some(d_dec);
 
                         if let (Some(lat), Some(lon)) = (lat_opt_state, lon_opt_state) {
-                            let time = chrono::Utc::now();
+                            let time = client_date_opt.unwrap_or_else(|| chrono::Utc::now());
                             let (cur_alt, cur_az) =
                                 calculate_alt_az(ra, dec, lat, lon, &time, &timescale_clone);
                             let (t_alt, t_az) =
@@ -473,6 +477,18 @@ impl Engine {
             .retain(|t| t.elapsed() <= Duration::from_secs(5));
         let solve_rate_hz = self.solve_timestamps.len() as f64 / 5.0;
 
+        let zoom = self.camera.get_zoom().unwrap_or(1.0) as f64;
+        let reported_fov = if let Some(fov) = self.fov {
+            if (zoom - 1.0).abs() > 0.01 {
+                let fov_rad = fov.to_radians();
+                Some(2.0 * ((fov_rad / 2.0).tan() / zoom).atan().to_degrees())
+            } else {
+                Some(fov)
+            }
+        } else {
+            None
+        };
+
         let mut state = self.engine_state.write().unwrap();
         state.centroids = centroids;
         state.target_ra = target_ra;
@@ -482,7 +498,7 @@ impl Engine {
         state.extract_ms = extract.as_secs_f64() * 1000.0;
         state.solve_ms = solve.as_secs_f64() * 1000.0;
         state.solve_rate_hz = solve_rate_hz;
-        state.fov = self.fov;
+        state.fov = reported_fov;
         state.distortion = self.distortion;
     }
 
@@ -500,7 +516,6 @@ impl Engine {
             let mut extractor: Option<FastExtractor> = None;
             let mut last_processed_timestamp = None;
             let mut active_max_area = 150;
-            let mut fov_locked_in = false;
             let mut hfr_history: std::collections::VecDeque<(std::time::SystemTime, f64)> =
                 std::collections::VecDeque::new();
 
@@ -640,21 +655,6 @@ impl Engine {
                                 }
                             };
 
-                        let active_sigma = state_sigma.unwrap_or(3.5);
-                        let mut update_max_area = None;
-                        if !fov_locked_in {
-                            let best_fov = state_fov.or(config_ext.initial_fov.map(|f| f as f64));
-                            if let Some(fov) = best_fov {
-                                if fov > 0.0 {
-                                    let ratio = (width as f64) / fov;
-                                    active_max_area =
-                                        (20.0 + 0.03 * (ratio * ratio)).round() as usize;
-                                    fov_locked_in = true;
-                                    update_max_area = Some(active_max_area);
-                                }
-                            }
-                        }
-
                         let final_crop = config_ext
                             .crop
                             .or(cam_config.crop.map(|(w, h)| (w as usize, h as usize)));
@@ -663,54 +663,123 @@ impl Engine {
                             None => (width, height),
                         };
 
-                        let virtual_crops = vec![
-                            tetra3::extractor::Crop::Region {
-                                height: proc_height / 2,
-                                width: proc_width / 2,
-                                offset_y: 0,
-                                offset_x: 0,
-                            },
-                            tetra3::extractor::Crop::Region {
-                                height: proc_height / 2,
-                                width: proc_width / 2,
-                                offset_y: 0,
-                                offset_x: (proc_width / 2) as isize,
-                            },
-                            tetra3::extractor::Crop::Region {
-                                height: proc_height / 2,
-                                width: proc_width / 2,
-                                offset_y: (proc_height / 2) as isize,
-                                offset_x: 0,
-                            },
-                            tetra3::extractor::Crop::Region {
-                                height: proc_height / 2,
-                                width: proc_width / 2,
-                                offset_y: (proc_height / 2) as isize,
-                                offset_x: (proc_width / 2) as isize,
-                            },
-                            tetra3::extractor::Crop::Center {
-                                width: proc_width / 2,
-                                height: proc_height / 2,
-                            },
-                        ];
+                        let downsample = match config_ext.downsample {
+                            4 => FastDownsample::X4,
+                            2 => FastDownsample::X2,
+                            1 => FastDownsample::None, // explicitly Off
+                            _ => {
+                                // 0 = Auto
+                                if proc_width * proc_height > 2_000_000 {
+                                    FastDownsample::X4
+                                } else if proc_width * proc_height > 1_000_000 {
+                                    FastDownsample::X2
+                                } else {
+                                    FastDownsample::None
+                                }
+                            }
+                        };
+
+                        let active_sigma = state_sigma.unwrap_or(3.5);
+                        let mut update_max_area = None;
+                        let best_fov = state_fov.or(config_ext.initial_fov.map(|f| f as f64));
+                        if let Some(fov) = best_fov {
+                            if fov > 0.0 {
+                                let ratio = (width as f64) / fov;
+                                let raw_max_area = 20.0 + 0.03 * (ratio * ratio);
+                                let ds_factor = match downsample {
+                                    FastDownsample::X4 => 4.0,
+                                    FastDownsample::X2 => 2.0,
+                                    FastDownsample::None => 1.0,
+                                };
+                                active_max_area =
+                                    (raw_max_area / (ds_factor * ds_factor)).round().max(10.0)
+                                        as usize;
+                                update_max_area = Some(active_max_area);
+                            }
+                        }
+
+                        let virtual_crops = if let Some(fov) = best_fov {
+                            if fov >= 13.5 {
+                                let fov_rad = fov.to_radians();
+                                let target_rad = 10.5f64.to_radians();
+                                let min_ratio = (target_rad / 2.0).tan() / (fov_rad / 2.0).tan();
+                                let scale = min_ratio.clamp(0.50, 0.75);
+
+                                let crop_w = (proc_width as f64 * scale).round() as usize;
+                                let crop_h = (proc_height as f64 * scale).round() as usize;
+
+                                let off_x = (proc_width as isize - crop_w as isize) / 2;
+                                let off_y = (proc_height as isize - crop_h as isize) / 2;
+
+                                Some(vec![
+                                    tetra3::extractor::Crop::Region {
+                                        height: crop_h,
+                                        width: crop_w,
+                                        offset_y: -off_y,
+                                        offset_x: -off_x,
+                                    },
+                                    tetra3::extractor::Crop::Region {
+                                        height: crop_h,
+                                        width: crop_w,
+                                        offset_y: -off_y,
+                                        offset_x: off_x,
+                                    },
+                                    tetra3::extractor::Crop::Region {
+                                        height: crop_h,
+                                        width: crop_w,
+                                        offset_y: off_y,
+                                        offset_x: -off_x,
+                                    },
+                                    tetra3::extractor::Crop::Region {
+                                        height: crop_h,
+                                        width: crop_w,
+                                        offset_y: off_y,
+                                        offset_x: off_x,
+                                    },
+                                    tetra3::extractor::Crop::Center {
+                                        width: crop_w,
+                                        height: crop_h,
+                                    },
+                                ])
+                            } else {
+                                None
+                            }
+                        } else {
+                            let off_x = proc_width as isize / 4;
+                            let off_y = proc_height as isize / 4;
+                            Some(vec![
+                                tetra3::extractor::Crop::Region {
+                                    height: proc_height / 2,
+                                    width: proc_width / 2,
+                                    offset_y: -off_y,
+                                    offset_x: -off_x,
+                                },
+                                tetra3::extractor::Crop::Region {
+                                    height: proc_height / 2,
+                                    width: proc_width / 2,
+                                    offset_y: -off_y,
+                                    offset_x: off_x,
+                                },
+                                tetra3::extractor::Crop::Region {
+                                    height: proc_height / 2,
+                                    width: proc_width / 2,
+                                    offset_y: off_y,
+                                    offset_x: -off_x,
+                                },
+                                tetra3::extractor::Crop::Region {
+                                    height: proc_height / 2,
+                                    width: proc_width / 2,
+                                    offset_y: off_y,
+                                    offset_x: off_x,
+                                },
+                                tetra3::extractor::Crop::Center {
+                                    width: proc_width / 2,
+                                    height: proc_height / 2,
+                                },
+                            ])
+                        };
 
                         if extractor.is_none() {
-                            let downsample = match config_ext.downsample {
-                                4 => FastDownsample::X4,
-                                2 => FastDownsample::X2,
-                                1 => FastDownsample::None, // explicitly Off
-                                _ => {
-                                    // 0 = Auto
-                                    if proc_width * proc_height > 2_000_000 {
-                                        FastDownsample::X4
-                                    } else if proc_width * proc_height > 1_000_000 {
-                                        FastDownsample::X2
-                                    } else {
-                                        FastDownsample::None
-                                    }
-                                }
-                            };
-
                             let bg_sub_mode = match config_ext.bg_mode {
                                 BgMode::Global => Some(FastBgSubMode::GlobalMedian),
                                 BgMode::Block => {
@@ -730,8 +799,9 @@ impl Engine {
                                 binary_open: config_ext.noise_filter,
                                 min_area: Some(2),
                                 max_area: Some(active_max_area),
+                                max_axis_ratio: Some(2.0),
                                 crop: final_crop,
-                                virtual_crops: Some(virtual_crops.clone()),
+                                virtual_crops: virtual_crops.clone(),
                                 //centroid_window: Some(3),
                                 ..FastExtractOptions::default()
                             };
@@ -742,6 +812,7 @@ impl Engine {
                         ext.update_options(tetra3::fast_extractor::FastExtractOptionsUpdate {
                             sigma: Some(active_sigma),
                             max_area: update_max_area,
+                            virtual_crops: Some(virtual_crops.clone()),
                             ..Default::default()
                         });
 
@@ -762,7 +833,8 @@ impl Engine {
                                         arr[[j, 1]] = c.x;
                                     }
                                     // Map the virtual_crop offset properly if available
-                                    let crop = virtual_crops.get(i).cloned();
+                                    let crop =
+                                        virtual_crops.as_ref().and_then(|vc| vc.get(i).cloned());
                                     batch.push((arr, crop));
                                 }
                             }
@@ -1000,12 +1072,25 @@ impl Engine {
             // 1. Process Local UI Requests (JNI/Push-To GoTo & Pixel Align)
             if let Ok(mut st) = self.engine_state.write() {
                 if let (Some(ra), Some(dec)) = (st.requested_target_ra, st.requested_target_dec) {
-                    self.target_ra = Some(ra);
-                    self.target_dec = Some(dec);
-                    st.target_ra = Some(ra);
-                    st.target_dec = Some(dec);
+                    let epoch = st.requested_target_epoch.unwrap_or(2000.0);
+                    let (ra_j2000, dec_j2000) = if (epoch - 2000.0).abs() > 0.001 {
+                        crate::telescope_server::precess_coordinates(
+                            ra,
+                            dec,
+                            epoch,
+                            2000.0,
+                            &self.timescale,
+                        )
+                    } else {
+                        (ra, dec)
+                    };
+                    self.target_ra = Some(ra_j2000);
+                    self.target_dec = Some(dec_j2000);
+                    st.target_ra = Some(ra_j2000);
+                    st.target_dec = Some(dec_j2000);
                     st.requested_target_ra = None;
                     st.requested_target_dec = None;
+                    st.requested_target_epoch = None;
 
                     self.shared_position
                         .target_op
@@ -1205,18 +1290,20 @@ impl Engine {
                 let lon_opt = engine_state
                     .client_longitude
                     .or(self.shared_position.site_longitude.load(Ordering::Relaxed));
+                let client_date_opt = engine_state.client_date;
                 let is_strict = engine_state.strict_match;
                 drop(engine_state);
 
                 if !is_strict {
-                    solve_options.match_max_error = 0.003; // Tighter tolerance since we have EMA distortion correction
-                    solve_options.match_threshold = 1e-4; // Keep Generous threshold for false positives
+                    solve_options.match_max_error = 0.005;
+                    solve_options.match_threshold = 1e-4;
                 }
 
                 // Set Zenith limits to automatically reject patterns containing stars below the horizon
                 if let (Some(lat), Some(lon)) = (lat_opt, lon_opt) {
                     if self.config.use_observer_location {
-                        let t = self.timescale.from_datetime(chrono::Utc::now());
+                        let now = client_date_opt.unwrap_or_else(|| chrono::Utc::now());
+                        let t = self.timescale.from_datetime(now);
                         let gast_hours = t.gast();
                         let lst_deg = (gast_hours * 15.0 + lon).rem_euclid(360.0);
 
@@ -1611,6 +1698,117 @@ mod tests {
         let lst_deg = (gast_hours * 15.0 + lon).rem_euclid(360.0);
 
         assert!(lst_deg >= 0.0 && lst_deg < 360.0);
+    }
+
+    #[test]
+    fn test_virtual_crops_quadrants() {
+        use tetra3::extractor::Crop;
+        use tetra3::fast_extractor::{FastExtractOptions, FastExtractor};
+
+        // Load image (using 2019-07-29T204726_Alt40_Azi135_Try1.jpg since it has a wide field of stars)
+        let bytes = include_bytes!(
+            "../../olive-solve/tetra3/tests/fixtures/sample_images/2019-07-29T204726_Alt40_Azi135_Try1.jpg"
+        );
+        let img = image::load_from_memory(bytes).unwrap().into_luma8();
+        let (width, height) = (img.width() as usize, img.height() as usize);
+
+        // Convert to Array2<u8> for FastExtractor
+        let mut array_img = ndarray::Array2::<u8>::zeros((height, width));
+        for (y, row) in img.enumerate_rows() {
+            for (x, _, pixel) in row {
+                array_img[[y as usize, x as usize]] = pixel.0[0];
+            }
+        }
+
+        // Mimic engine.rs logic for a 50% scale
+        let scale = 0.50;
+        let crop_w = (width as f64 * scale).round() as usize;
+        let crop_h = (height as f64 * scale).round() as usize;
+
+        let off_x = (width as isize - crop_w as isize) / 2;
+        let off_y = (height as isize - crop_h as isize) / 2;
+
+        let virtual_crops = vec![
+            Crop::Region {
+                height: crop_h,
+                width: crop_w,
+                offset_y: -off_y,
+                offset_x: -off_x,
+            },
+            Crop::Region {
+                height: crop_h,
+                width: crop_w,
+                offset_y: -off_y,
+                offset_x: off_x,
+            },
+            Crop::Region {
+                height: crop_h,
+                width: crop_w,
+                offset_y: off_y,
+                offset_x: -off_x,
+            },
+            Crop::Region {
+                height: crop_h,
+                width: crop_w,
+                offset_y: off_y,
+                offset_x: off_x,
+            },
+            Crop::Center {
+                width: crop_w,
+                height: crop_h,
+            },
+        ];
+
+        // Ensure the absolute bounds actually hit the very corners of the image perfectly
+        let (y1, y2, x1, x2) = virtual_crops[0].bounds(width, height);
+        assert_eq!(y1, 0, "Top-Left crop must start at y=0");
+        assert_eq!(x1, 0, "Top-Left crop must start at x=0");
+        assert_eq!(y2, crop_h, "Top-Left crop must be crop_h tall");
+        assert_eq!(x2, crop_w, "Top-Left crop must be crop_w wide");
+
+        let (y1, y2, x1, x2) = virtual_crops[3].bounds(width, height);
+        assert_eq!(y2, height, "Bottom-Right crop must end at image height");
+        assert_eq!(x2, width, "Bottom-Right crop must end at image width");
+
+        // Run extractor
+        let options = FastExtractOptions {
+            virtual_crops: Some(virtual_crops),
+            binary_open: false, // disable noise filter to ensure we get lots of centroids
+            ..Default::default()
+        };
+        let mut ext = FastExtractor::new(width, height, options);
+        let result = ext.extract(&array_img);
+
+        let vcrops_res = result
+            .virtual_crop_centroids
+            .expect("Should have virtual crop centroids");
+        assert_eq!(
+            vcrops_res.len(),
+            5,
+            "Expected 5 crop buckets (4 corners + 1 center)"
+        );
+
+        // Verify each quadrant actually extracted stars
+        assert!(
+            !vcrops_res[0].is_empty(),
+            "Expected stars in Top-Left quadrant"
+        );
+        assert!(
+            !vcrops_res[1].is_empty(),
+            "Expected stars in Top-Right quadrant"
+        );
+        assert!(
+            !vcrops_res[2].is_empty(),
+            "Expected stars in Bottom-Left quadrant"
+        );
+        assert!(
+            !vcrops_res[3].is_empty(),
+            "Expected stars in Bottom-Right quadrant"
+        );
+        assert!(
+            !vcrops_res[4].is_empty(),
+            "Expected stars in Center quadrant"
+        );
     }
 }
 
