@@ -503,12 +503,6 @@ impl Engine {
             None
         };
 
-        let final_solved_crop = if solved {
-            solved_crop
-        } else {
-            Some(SolvedCrop::Failed)
-        };
-
         if let Ok(mut state) = self.engine_state.write() {
             state.centroids = centroids;
             state.target_ra = target_ra;
@@ -520,9 +514,7 @@ impl Engine {
             state.solve_rate_hz = solve_rate_hz;
             state.fov = reported_fov;
             state.distortion = self.distortion;
-            if solved || state.status == "Stacking" {
-                state.solved_crop = final_solved_crop;
-            }
+            state.solved_crop = solved_crop;
         }
     }
 
@@ -1686,6 +1678,7 @@ pub fn calculate_hfr(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     #[test]
     fn test_offset_angle_conversion_math() {
         // Test offset math against web converter output for standard position angle offsets.
@@ -1865,6 +1858,106 @@ mod tests {
         assert!(
             !vcrops_res[4].is_empty(),
             "Expected stars in Bottom-Center edge"
+        );
+    }
+
+    #[test]
+    fn test_update_solve_stats_crop_status() {
+        let camera = Arc::new(crate::dummy_camera::DummyCamera::new());
+        let engine_state = Arc::new(RwLock::new(EngineStateData::default()));
+        let shared_position = Arc::new(SharedPosition::default());
+        let timescale = Arc::new(starfield::time::Timescale::default());
+        let mut server = Lx200WifiTelescope::new(
+            shared_position.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            timescale.clone(),
+        );
+        let lx200_controller = server.get_controller();
+        let fused_solver = Arc::new(
+            olive_solve::FusedSolver::new(
+                std::path::Path::new("../olive-solve/tetra3/tests/fixtures/default_database.npz"),
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+
+        let mut engine = Engine {
+            camera,
+            config: EngineConfig::default(),
+            fused_solver,
+            fov: Some(15.0),
+            distortion: None,
+            shared_position,
+            target_ra: None,
+            target_dec: None,
+            target_pixel: None,
+            storage: None,
+            client_connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            engine_state: engine_state.clone(),
+            solve_timestamps: std::collections::VecDeque::with_capacity(60),
+            shared_result: Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new())),
+            is_running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            clear_stacker: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            telescope_server_handle: None,
+            alpaca_server_handle: None,
+            rt_handle: None,
+            lx200_controller,
+            timescale,
+        };
+
+        // 1. Initial state has None
+        assert_eq!(engine_state.read().unwrap().solved_crop, None);
+
+        // 2. Successful solve updates solved_crop to the solved region (e.g. Full)
+        engine.update_solve_stats(
+            true,
+            25,
+            None,
+            None,
+            33000,
+            Duration::from_millis(5),
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+            Some(SolvedCrop::Full),
+        );
+        assert_eq!(
+            engine_state.read().unwrap().solved_crop,
+            Some(SolvedCrop::Full)
+        );
+
+        // 3. Failed solve updates solved_crop to Failed
+        engine.update_solve_stats(
+            false,
+            5,
+            None,
+            None,
+            330000,
+            Duration::from_millis(5),
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+            Some(SolvedCrop::Failed),
+        );
+        assert_eq!(
+            engine_state.read().unwrap().solved_crop,
+            Some(SolvedCrop::Failed)
+        );
+
+        // 4. Successful solve updates to Center
+        engine.update_solve_stats(
+            true,
+            30,
+            None,
+            None,
+            33000,
+            Duration::from_millis(5),
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+            Some(SolvedCrop::Center),
+        );
+        assert_eq!(
+            engine_state.read().unwrap().solved_crop,
+            Some(SolvedCrop::Center)
         );
     }
 }
