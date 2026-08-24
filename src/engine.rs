@@ -66,7 +66,7 @@ pub struct IntermediateResult {
     pub phys_exp_time: Duration,
     pub pp_time: Duration,
     pub extract_time: Duration,
-    pub centroids_batch: Vec<(Array2<f64>, Option<tetra3::extractor::Crop>)>,
+    pub centroids_batch: Vec<(Array2<f64>, Option<tetra3::extractor::Crop>, SolvedCrop)>,
     pub timestamp: SystemTime,
     pub stacked_frames: u32,
 }
@@ -89,11 +89,11 @@ pub enum BgMode {
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub enum SolvedCrop {
+    Center,
     Top,
-    Bottom,
     Left,
     Right,
-    Center,
+    Bottom,
     Full,
     Failed,
 }
@@ -722,7 +722,7 @@ impl Engine {
                             }
                         }
 
-                        let virtual_crops = if let Some(fov) = best_fov {
+                        let (virtual_crops, virtual_crop_labels) = if let Some(fov) = best_fov {
                             if fov >= 13.5 {
                                 let fov_rad = fov.to_radians();
                                 let target_rad = 10.5f64.to_radians();
@@ -735,72 +735,90 @@ impl Engine {
                                 let off_x = (proc_width as isize - crop_w as isize) / 2;
                                 let off_y = (proc_height as isize - crop_h as isize) / 2;
 
-                                Some(vec![
-                                    tetra3::extractor::Crop::Region {
-                                        height: crop_h,
-                                        width: crop_w,
-                                        offset_y: -off_y,
-                                        offset_x: 0,
-                                    },
-                                    tetra3::extractor::Crop::Region {
-                                        height: crop_h,
-                                        width: crop_w,
-                                        offset_y: off_y,
-                                        offset_x: 0,
-                                    },
-                                    tetra3::extractor::Crop::Region {
-                                        height: crop_h,
-                                        width: crop_w,
-                                        offset_y: 0,
-                                        offset_x: -off_x,
-                                    },
-                                    tetra3::extractor::Crop::Region {
-                                        height: crop_h,
-                                        width: crop_w,
-                                        offset_y: 0,
-                                        offset_x: off_x,
-                                    },
-                                    tetra3::extractor::Crop::Center {
-                                        width: crop_w,
-                                        height: crop_h,
-                                    },
-                                ])
+                                (
+                                    Some(vec![
+                                        tetra3::extractor::Crop::Center {
+                                            width: crop_w,
+                                            height: crop_h,
+                                        },
+                                        tetra3::extractor::Crop::Region {
+                                            height: crop_h,
+                                            width: crop_w,
+                                            offset_y: -off_y,
+                                            offset_x: 0,
+                                        },
+                                        tetra3::extractor::Crop::Region {
+                                            height: crop_h,
+                                            width: crop_w,
+                                            offset_y: 0,
+                                            offset_x: -off_x,
+                                        },
+                                        tetra3::extractor::Crop::Region {
+                                            height: crop_h,
+                                            width: crop_w,
+                                            offset_y: 0,
+                                            offset_x: off_x,
+                                        },
+                                        tetra3::extractor::Crop::Region {
+                                            height: crop_h,
+                                            width: crop_w,
+                                            offset_y: off_y,
+                                            offset_x: 0,
+                                        },
+                                    ]),
+                                    Some(vec![
+                                        SolvedCrop::Center,
+                                        SolvedCrop::Top,
+                                        SolvedCrop::Left,
+                                        SolvedCrop::Right,
+                                        SolvedCrop::Bottom,
+                                    ]),
+                                )
                             } else {
-                                None
+                                (None, None)
                             }
                         } else {
                             let off_x = proc_width as isize / 4;
                             let off_y = proc_height as isize / 4;
-                            Some(vec![
-                                tetra3::extractor::Crop::Region {
-                                    height: proc_height / 2,
-                                    width: proc_width / 2,
-                                    offset_y: -off_y,
-                                    offset_x: 0,
-                                },
-                                tetra3::extractor::Crop::Region {
-                                    height: proc_height / 2,
-                                    width: proc_width / 2,
-                                    offset_y: off_y,
-                                    offset_x: 0,
-                                },
-                                tetra3::extractor::Crop::Region {
-                                    height: proc_height / 2,
-                                    width: proc_width / 2,
-                                    offset_y: 0,
-                                    offset_x: -off_x,
-                                },
-                                tetra3::extractor::Crop::Region {
-                                    height: proc_height / 2,
-                                    width: proc_width / 2,
-                                    offset_y: 0,
-                                    offset_x: off_x,
-                                },
-                                tetra3::extractor::Crop::Center {
-                                    width: proc_width / 2,
-                                    height: proc_height / 2,
-                                },
-                            ])
+                            (
+                                Some(vec![
+                                    tetra3::extractor::Crop::Center {
+                                        width: proc_width / 2,
+                                        height: proc_height / 2,
+                                    },
+                                    tetra3::extractor::Crop::Region {
+                                        height: proc_height / 2,
+                                        width: proc_width / 2,
+                                        offset_y: -off_y,
+                                        offset_x: 0,
+                                    },
+                                    tetra3::extractor::Crop::Region {
+                                        height: proc_height / 2,
+                                        width: proc_width / 2,
+                                        offset_y: 0,
+                                        offset_x: -off_x,
+                                    },
+                                    tetra3::extractor::Crop::Region {
+                                        height: proc_height / 2,
+                                        width: proc_width / 2,
+                                        offset_y: 0,
+                                        offset_x: off_x,
+                                    },
+                                    tetra3::extractor::Crop::Region {
+                                        height: proc_height / 2,
+                                        width: proc_width / 2,
+                                        offset_y: off_y,
+                                        offset_x: 0,
+                                    },
+                                ]),
+                                Some(vec![
+                                    SolvedCrop::Center,
+                                    SolvedCrop::Top,
+                                    SolvedCrop::Left,
+                                    SolvedCrop::Right,
+                                    SolvedCrop::Bottom,
+                                ]),
+                            )
                         };
 
                         if extractor.is_none() {
@@ -844,8 +862,11 @@ impl Engine {
 
                         num_centroids = result.centroids.len();
 
-                        let mut batch: Vec<(Array2<f64>, Option<tetra3::extractor::Crop>)> =
-                            Vec::new();
+                        let mut batch: Vec<(
+                            Array2<f64>,
+                            Option<tetra3::extractor::Crop>,
+                            SolvedCrop,
+                        )> = Vec::new();
                         let target_c = config_ext.target_centroids as f64 * 0.5;
 
                         if let Some(vc) = result.virtual_crop_centroids {
@@ -856,10 +877,10 @@ impl Engine {
                                         arr[[j, 0]] = c.y;
                                         arr[[j, 1]] = c.x;
                                     }
-                                    // Map the virtual_crop offset properly if available
                                     let crop =
                                         virtual_crops.as_ref().and_then(|vc| vc.get(i).cloned());
-                                    batch.push((arr, crop));
+                                    let label = virtual_crop_labels.as_ref().unwrap()[i].clone();
+                                    batch.push((arr, crop, label));
                                 }
                             }
                         }
@@ -869,7 +890,7 @@ impl Engine {
                             arr[[i, 0]] = c.y;
                             arr[[i, 1]] = c.x;
                         }
-                        batch.push((arr, None));
+                        batch.push((arr, None, SolvedCrop::Full));
 
                         centroids_batch = batch;
                     }
@@ -937,7 +958,7 @@ impl Engine {
                                 arr[[i, 0]] = c.centroid_y + crop_y as f64;
                                 arr[[i, 1]] = c.centroid_x + crop_x as f64;
                             }
-                            centroids_batch = vec![(arr, None)];
+                            centroids_batch = vec![(arr, None, SolvedCrop::Full)];
                         } else {
                             error!("Failed to create ImageBuffer from image data");
                             continue;
@@ -1043,7 +1064,7 @@ impl Engine {
         Duration,
         Duration,
         Duration,
-        Vec<(Array2<f64>, Option<tetra3::extractor::Crop>)>,
+        Vec<(Array2<f64>, Option<tetra3::extractor::Crop>, SolvedCrop)>,
         SystemTime,
         Duration,
         u32,
@@ -1363,7 +1384,7 @@ impl Engine {
                 let sliced_batch: Vec<(Array2<f64>, Option<tetra3::extractor::Crop>)> =
                     centroids_batch
                         .iter()
-                        .map(|(a, c)| {
+                        .map(|(a, c, _label)| {
                             (
                                 a.slice(ndarray::s![..std::cmp::min(80, a.nrows()), ..])
                                     .to_owned(),
@@ -1383,15 +1404,7 @@ impl Engine {
                 let mut solved_crop_enum = None;
 
                 if solution.status == SolveStatus::MatchFound {
-                    solved_crop_enum = match batch_solution.crop_index {
-                        0 => Some(SolvedCrop::Top),
-                        1 => Some(SolvedCrop::Bottom),
-                        2 => Some(SolvedCrop::Left),
-                        3 => Some(SolvedCrop::Right),
-                        4 => Some(SolvedCrop::Center),
-                        5 => Some(SolvedCrop::Full),
-                        _ => Some(SolvedCrop::Full), // Fallback
-                    };
+                    solved_crop_enum = Some(centroids_batch[batch_solution.crop_index].2.clone());
                 }
 
                 let solve_time = batch_solution.solve_time;
@@ -1774,16 +1787,14 @@ mod tests {
         let off_y = (height as isize - crop_h as isize) / 2;
 
         let virtual_crops = vec![
-            Crop::Region {
-                height: crop_h,
+            Crop::Center {
                 width: crop_w,
-                offset_y: -off_y,
-                offset_x: 0,
+                height: crop_h,
             },
             Crop::Region {
                 height: crop_h,
                 width: crop_w,
-                offset_y: off_y,
+                offset_y: -off_y,
                 offset_x: 0,
             },
             Crop::Region {
@@ -1798,24 +1809,26 @@ mod tests {
                 offset_y: 0,
                 offset_x: off_x,
             },
-            Crop::Center {
-                width: crop_w,
+            Crop::Region {
                 height: crop_h,
+                width: crop_w,
+                offset_y: off_y,
+                offset_x: 0,
             },
         ];
 
         // Ensure the absolute bounds actually hit the edges
-        let (y1, _y2, _x1, _x2) = virtual_crops[0].bounds(width, height);
+        let (y1, _y2, _x1, _x2) = virtual_crops[1].bounds(width, height);
         assert_eq!(y1, 0, "Top-Center crop must start at y=0");
-
-        let (_y1, y2, _x1, _x2) = virtual_crops[1].bounds(width, height);
-        assert_eq!(y2, height, "Bottom-Center crop must end at y=height");
 
         let (_y1, _y2, x1, _x2) = virtual_crops[2].bounds(width, height);
         assert_eq!(x1, 0, "Left-Center crop must start at x=0");
 
         let (_y1, _y2, _x1, x2) = virtual_crops[3].bounds(width, height);
         assert_eq!(x2, width, "Right-Center crop must end at x=width");
+
+        let (_y1, y2, _x1, _x2) = virtual_crops[4].bounds(width, height);
+        assert_eq!(y2, height, "Bottom-Center crop must end at y=height");
 
         // Run extractor
         let options = FastExtractOptions {
@@ -1832,17 +1845,14 @@ mod tests {
         assert_eq!(
             vcrops_res.len(),
             5,
-            "Expected 5 crop buckets (4 edges + 1 center)"
+            "Expected 5 crop buckets (1 center + 4 edges)"
         );
 
         // Verify each quadrant actually extracted stars
-        assert!(
-            !vcrops_res[0].is_empty(),
-            "Expected stars in Top-Center edge"
-        );
+        assert!(!vcrops_res[0].is_empty(), "Expected stars in Center");
         assert!(
             !vcrops_res[1].is_empty(),
-            "Expected stars in Bottom-Center edge"
+            "Expected stars in Top-Center edge"
         );
         assert!(
             !vcrops_res[2].is_empty(),
@@ -1852,7 +1862,10 @@ mod tests {
             !vcrops_res[3].is_empty(),
             "Expected stars in Right-Center edge"
         );
-        assert!(!vcrops_res[4].is_empty(), "Expected stars in Center");
+        assert!(
+            !vcrops_res[4].is_empty(),
+            "Expected stars in Bottom-Center edge"
+        );
     }
 }
 
