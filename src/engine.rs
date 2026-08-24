@@ -87,6 +87,17 @@ pub enum BgMode {
     Block,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub enum SolvedCrop {
+    Top,
+    Bottom,
+    Left,
+    Right,
+    Center,
+    Full,
+    Failed,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct EngineStateData {
     pub status: String,
@@ -121,6 +132,7 @@ pub struct EngineStateData {
     pub requested_align_target_pixel: Option<(f64, f64)>,
     pub is_imu_estimate: bool,
     pub strict_match: bool,
+    pub solved_crop: Option<SolvedCrop>,
 }
 
 impl Default for EngineStateData {
@@ -158,6 +170,7 @@ impl Default for EngineStateData {
             requested_align_target_pixel: None,
             is_imu_estimate: false,
             strict_match: false,
+            solved_crop: None,
         }
     }
 }
@@ -469,6 +482,7 @@ impl Engine {
         post_process: Duration,
         extract: Duration,
         solve: Duration,
+        solved_crop: Option<SolvedCrop>,
     ) {
         if solved {
             self.solve_timestamps.push_back(Instant::now());
@@ -489,17 +503,27 @@ impl Engine {
             None
         };
 
-        let mut state = self.engine_state.write().unwrap();
-        state.centroids = centroids;
-        state.target_ra = target_ra;
-        state.target_dec = target_dec;
-        state.exposure_us = exposure_us;
-        state.post_process_ms = post_process.as_secs_f64() * 1000.0;
-        state.extract_ms = extract.as_secs_f64() * 1000.0;
-        state.solve_ms = solve.as_secs_f64() * 1000.0;
-        state.solve_rate_hz = solve_rate_hz;
-        state.fov = reported_fov;
-        state.distortion = self.distortion;
+        let final_solved_crop = if solved {
+            solved_crop
+        } else {
+            Some(SolvedCrop::Failed)
+        };
+
+        if let Ok(mut state) = self.engine_state.write() {
+            state.centroids = centroids;
+            state.target_ra = target_ra;
+            state.target_dec = target_dec;
+            state.exposure_us = exposure_us;
+            state.post_process_ms = post_process.as_secs_f64() * 1000.0;
+            state.extract_ms = extract.as_secs_f64() * 1000.0;
+            state.solve_ms = solve.as_secs_f64() * 1000.0;
+            state.solve_rate_hz = solve_rate_hz;
+            state.fov = reported_fov;
+            state.distortion = self.distortion;
+            if solved || state.status == "Stacking" {
+                state.solved_crop = final_solved_crop;
+            }
+        }
     }
 
     pub fn start(self) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
@@ -716,24 +740,24 @@ impl Engine {
                                         height: crop_h,
                                         width: crop_w,
                                         offset_y: -off_y,
-                                        offset_x: -off_x,
-                                    },
-                                    tetra3::extractor::Crop::Region {
-                                        height: crop_h,
-                                        width: crop_w,
-                                        offset_y: -off_y,
-                                        offset_x: off_x,
+                                        offset_x: 0,
                                     },
                                     tetra3::extractor::Crop::Region {
                                         height: crop_h,
                                         width: crop_w,
                                         offset_y: off_y,
+                                        offset_x: 0,
+                                    },
+                                    tetra3::extractor::Crop::Region {
+                                        height: crop_h,
+                                        width: crop_w,
+                                        offset_y: 0,
                                         offset_x: -off_x,
                                     },
                                     tetra3::extractor::Crop::Region {
                                         height: crop_h,
                                         width: crop_w,
-                                        offset_y: off_y,
+                                        offset_y: 0,
                                         offset_x: off_x,
                                     },
                                     tetra3::extractor::Crop::Center {
@@ -752,24 +776,24 @@ impl Engine {
                                     height: proc_height / 2,
                                     width: proc_width / 2,
                                     offset_y: -off_y,
-                                    offset_x: -off_x,
-                                },
-                                tetra3::extractor::Crop::Region {
-                                    height: proc_height / 2,
-                                    width: proc_width / 2,
-                                    offset_y: -off_y,
-                                    offset_x: off_x,
+                                    offset_x: 0,
                                 },
                                 tetra3::extractor::Crop::Region {
                                     height: proc_height / 2,
                                     width: proc_width / 2,
                                     offset_y: off_y,
+                                    offset_x: 0,
+                                },
+                                tetra3::extractor::Crop::Region {
+                                    height: proc_height / 2,
+                                    width: proc_width / 2,
+                                    offset_y: 0,
                                     offset_x: -off_x,
                                 },
                                 tetra3::extractor::Crop::Region {
                                     height: proc_height / 2,
                                     width: proc_width / 2,
-                                    offset_y: off_y,
+                                    offset_y: 0,
                                     offset_x: off_x,
                                 },
                                 tetra3::extractor::Crop::Center {
@@ -1060,6 +1084,7 @@ impl Engine {
             Duration::ZERO,
             Duration::ZERO,
             Duration::ZERO,
+            None,
         );
         let mut observer_location_set = false;
         let mut was_connected = false;
@@ -1234,6 +1259,7 @@ impl Engine {
                             Duration::ZERO,
                             extract_time,
                             Duration::ZERO,
+                            Some(SolvedCrop::Failed),
                         );
                     } else {
                         debug!(
@@ -1249,7 +1275,6 @@ impl Engine {
                 }
 
                 let mut solved = false;
-                let solve_start = Instant::now();
                 let camera_config = self.camera.get_config().unwrap();
                 let width = camera_config.width as f64;
                 let height = camera_config.height as f64;
@@ -1347,10 +1372,29 @@ impl Engine {
                         })
                         .collect();
 
-                let solution = self.fused_solver.solve_from_centroids_batch(&sliced_batch, size, solve_options.clone(), Some(img_timestamp))
-                    .expect("Critical Error: solver failed to execute during solving loop. Is the database accessible?");
+                let batch_solution = self.fused_solver.solve_from_centroids_batch(
+                    &sliced_batch,
+                    size,
+                    solve_options.clone(),
+                    Some(img_timestamp),
+                ).expect("Critical Error: solver failed to execute during solving loop. Is the database accessible?");
 
-                let solve_time = solve_start.elapsed();
+                let solution = batch_solution.solution;
+                let mut solved_crop_enum = None;
+
+                if solution.status == SolveStatus::MatchFound {
+                    solved_crop_enum = match batch_solution.crop_index {
+                        0 => Some(SolvedCrop::Top),
+                        1 => Some(SolvedCrop::Bottom),
+                        2 => Some(SolvedCrop::Left),
+                        3 => Some(SolvedCrop::Right),
+                        4 => Some(SolvedCrop::Center),
+                        5 => Some(SolvedCrop::Full),
+                        _ => Some(SolvedCrop::Full), // Fallback
+                    };
+                }
+
+                let solve_time = batch_solution.solve_time;
 
                 match solution.status {
                     SolveStatus::MatchFound => {
@@ -1453,6 +1497,7 @@ impl Engine {
                             pp_time,
                             extract_time,
                             solve_time,
+                            solved_crop_enum.clone(),
                         );
                     }
                     _ => {
@@ -1469,6 +1514,7 @@ impl Engine {
                                 pp_time,
                                 extract_time,
                                 solve_time,
+                                Some(SolvedCrop::Failed),
                             );
                         } else {
                             debug!(
@@ -1699,9 +1745,8 @@ mod tests {
 
         assert!(lst_deg >= 0.0 && lst_deg < 360.0);
     }
-
     #[test]
-    fn test_virtual_crops_quadrants() {
+    fn test_virtual_crops_axes() {
         use tetra3::extractor::Crop;
         use tetra3::fast_extractor::{FastExtractOptions, FastExtractor};
 
@@ -1733,24 +1778,24 @@ mod tests {
                 height: crop_h,
                 width: crop_w,
                 offset_y: -off_y,
-                offset_x: -off_x,
-            },
-            Crop::Region {
-                height: crop_h,
-                width: crop_w,
-                offset_y: -off_y,
-                offset_x: off_x,
+                offset_x: 0,
             },
             Crop::Region {
                 height: crop_h,
                 width: crop_w,
                 offset_y: off_y,
+                offset_x: 0,
+            },
+            Crop::Region {
+                height: crop_h,
+                width: crop_w,
+                offset_y: 0,
                 offset_x: -off_x,
             },
             Crop::Region {
                 height: crop_h,
                 width: crop_w,
-                offset_y: off_y,
+                offset_y: 0,
                 offset_x: off_x,
             },
             Crop::Center {
@@ -1759,16 +1804,18 @@ mod tests {
             },
         ];
 
-        // Ensure the absolute bounds actually hit the very corners of the image perfectly
-        let (y1, y2, x1, x2) = virtual_crops[0].bounds(width, height);
-        assert_eq!(y1, 0, "Top-Left crop must start at y=0");
-        assert_eq!(x1, 0, "Top-Left crop must start at x=0");
-        assert_eq!(y2, crop_h, "Top-Left crop must be crop_h tall");
-        assert_eq!(x2, crop_w, "Top-Left crop must be crop_w wide");
+        // Ensure the absolute bounds actually hit the edges
+        let (y1, _y2, _x1, _x2) = virtual_crops[0].bounds(width, height);
+        assert_eq!(y1, 0, "Top-Center crop must start at y=0");
 
-        let (y1, y2, x1, x2) = virtual_crops[3].bounds(width, height);
-        assert_eq!(y2, height, "Bottom-Right crop must end at image height");
-        assert_eq!(x2, width, "Bottom-Right crop must end at image width");
+        let (_y1, y2, _x1, _x2) = virtual_crops[1].bounds(width, height);
+        assert_eq!(y2, height, "Bottom-Center crop must end at y=height");
+
+        let (_y1, _y2, x1, _x2) = virtual_crops[2].bounds(width, height);
+        assert_eq!(x1, 0, "Left-Center crop must start at x=0");
+
+        let (_y1, _y2, _x1, x2) = virtual_crops[3].bounds(width, height);
+        assert_eq!(x2, width, "Right-Center crop must end at x=width");
 
         // Run extractor
         let options = FastExtractOptions {
@@ -1785,30 +1832,27 @@ mod tests {
         assert_eq!(
             vcrops_res.len(),
             5,
-            "Expected 5 crop buckets (4 corners + 1 center)"
+            "Expected 5 crop buckets (4 edges + 1 center)"
         );
 
         // Verify each quadrant actually extracted stars
         assert!(
             !vcrops_res[0].is_empty(),
-            "Expected stars in Top-Left quadrant"
+            "Expected stars in Top-Center edge"
         );
         assert!(
             !vcrops_res[1].is_empty(),
-            "Expected stars in Top-Right quadrant"
+            "Expected stars in Bottom-Center edge"
         );
         assert!(
             !vcrops_res[2].is_empty(),
-            "Expected stars in Bottom-Left quadrant"
+            "Expected stars in Left-Center edge"
         );
         assert!(
             !vcrops_res[3].is_empty(),
-            "Expected stars in Bottom-Right quadrant"
+            "Expected stars in Right-Center edge"
         );
-        assert!(
-            !vcrops_res[4].is_empty(),
-            "Expected stars in Center quadrant"
-        );
+        assert!(!vcrops_res[4].is_empty(), "Expected stars in Center");
     }
 }
 

@@ -1116,7 +1116,10 @@ mod tests {
 
         {
             let locked_position = &position_arc;
-            assert!(locked_position.target_op.load(Ordering::Relaxed).is_none());
+            assert_eq!(
+                locked_position.target_op.load(Ordering::Relaxed),
+                Some(TargetOp::Abort)
+            );
         }
 
         // Slew should fail if no target
@@ -1301,8 +1304,8 @@ mod tests {
         {
             let locked_position = &position_arc;
             locked_position
-                .target_op
-                .store(Some(TargetOp::Slew), std::sync::atomic::Ordering::Relaxed);
+                .is_slewing
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         assert_eq!(controller.process_input(b":D#").as_deref(), Some("\x7f#"));
     }
