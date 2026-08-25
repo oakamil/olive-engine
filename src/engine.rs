@@ -1296,6 +1296,8 @@ impl Engine {
                 let mut solve_options = SolveOptions::default();
                 // Force distortion calculation by providing a 0.0 baseline if None exists
                 solve_options.distortion = self.distortion.or(Some(0.0));
+                let has_active_imu = self.fused_solver.get_motion_state().is_some();
+                solve_options.return_best_failed_match = has_active_imu;
 
                 if let Some(fov) = self.fov {
                     let zoom = self.camera.get_zoom().unwrap_or(1.0) as f64;
@@ -1716,7 +1718,6 @@ mod tests {
 
     #[test]
     fn test_horizon_bounds_computation() {
-        let lat: f64 = 34.0;
         let lon: f64 = -118.0;
         let max_fov: f64 = 70.0;
         let width: f64 = 1920.0;
@@ -1742,7 +1743,7 @@ mod tests {
         assert!((buffer - 36.0).abs() < 0.01);
 
         // Test LST math
-        let mut timescale = starfield::time::Timescale::default();
+        let timescale = starfield::time::Timescale::default();
         // Just checking it doesn't crash and returns reasonable bounds
         let now = chrono::Utc::now();
         let t = timescale.from_datetime(now);
@@ -1867,7 +1868,7 @@ mod tests {
         let engine_state = Arc::new(RwLock::new(EngineStateData::default()));
         let shared_position = Arc::new(SharedPosition::default());
         let timescale = Arc::new(starfield::time::Timescale::default());
-        let mut server = Lx200WifiTelescope::new(
+        let server = Lx200WifiTelescope::new(
             shared_position.clone(),
             Arc::new(std::sync::atomic::AtomicBool::new(true)),
             timescale.clone(),
@@ -1959,6 +1960,88 @@ mod tests {
             engine_state.read().unwrap().solved_crop,
             Some(SolvedCrop::Center)
         );
+    }
+
+    #[test]
+    fn test_active_imu_and_low_confidence_handling() {
+        let camera = Arc::new(crate::dummy_camera::DummyCamera::new());
+        let engine_state = Arc::new(RwLock::new(EngineStateData::default()));
+        let shared_position = Arc::new(SharedPosition::default());
+        let timescale = Arc::new(starfield::time::Timescale::default());
+        let server = Lx200WifiTelescope::new(
+            shared_position.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            timescale.clone(),
+        );
+        let lx200_controller = server.get_controller();
+        let fused_solver = Arc::new(
+            olive_solve::FusedSolver::new(
+                std::path::Path::new("../olive-solve/tetra3/tests/fixtures/default_database.npz"),
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+
+        let mut engine = Engine {
+            camera,
+            config: EngineConfig::default(),
+            fused_solver: fused_solver.clone(),
+            fov: Some(15.0),
+            distortion: None,
+            shared_position,
+            target_ra: None,
+            target_dec: None,
+            target_pixel: None,
+            storage: None,
+            client_connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            engine_state: engine_state.clone(),
+            solve_timestamps: std::collections::VecDeque::with_capacity(60),
+            shared_result: Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new())),
+            is_running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            clear_stacker: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            telescope_server_handle: None,
+            alpaca_server_handle: None,
+            rt_handle: None,
+            lx200_controller,
+            timescale,
+        };
+
+        // 1. When no IMU is running, get_motion_state() is None
+        let has_active_imu = engine.fused_solver.get_motion_state().is_some();
+        assert!(!has_active_imu, "IMU should not be active by default");
+
+        // 2. An unverified LowConfidenceMatch must not clear the stacker
+        engine
+            .clear_stacker
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let solved = false;
+        if solved {
+            engine
+                .clear_stacker
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        assert!(
+            !engine
+                .clear_stacker
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+
+        // 3. update_solve_stats on failed/unverified match updates stats with solved = false
+        engine.update_solve_stats(
+            false,
+            4,
+            None,
+            None,
+            33000,
+            Duration::from_millis(2),
+            Duration::from_millis(5),
+            Duration::from_millis(15),
+            Some(SolvedCrop::Failed),
+        );
+        let st = engine_state.read().unwrap();
+        assert_eq!(st.solved_crop, Some(SolvedCrop::Failed));
+        assert_eq!(st.centroids, 4);
     }
 }
 
