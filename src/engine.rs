@@ -22,6 +22,11 @@ use tetra3::{
 
 pub const MIN_CENTROIDS: usize = 4;
 
+const MULTIPLE_EXTRACTION_MIN_EXPOSURE_US: i32 = 100_000;
+const MULTIPLE_EXTRACTION_SIGMA: f32 = 2.6;
+const MULTIPLE_EXTRACTION_MIN_AREA: usize = 1;
+const MULTIPLE_EXTRACTION_NOISE_FILTER: bool = false;
+
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
     pub gain: Option<f32>,
@@ -654,6 +659,7 @@ impl Engine {
                 let extract_start = Instant::now();
                 let num_centroids;
                 let centroids_batch;
+                let mut baseline_full_centroids = None;
 
                 let (state_sigma, state_fov) = {
                     let st = engine_state_ext.read().unwrap();
@@ -850,9 +856,22 @@ impl Engine {
                             ..Default::default()
                         });
 
-                        let result = ext.extract(&array_img);
+                        let mut variants = vec![Default::default()];
 
-                        num_centroids = result.centroids.len();
+                        let do_multiple_variants = exposure_us
+                            >= MULTIPLE_EXTRACTION_MIN_EXPOSURE_US
+                            && !config_ext.bypass_calibration;
+
+                        if do_multiple_variants {
+                            variants.push(tetra3::fast_extractor::FastExtractOptionsUpdate {
+                                sigma: Some(MULTIPLE_EXTRACTION_SIGMA),
+                                min_area: Some(MULTIPLE_EXTRACTION_MIN_AREA),
+                                noise_filter: Some(MULTIPLE_EXTRACTION_NOISE_FILTER),
+                                ..Default::default()
+                            });
+                        }
+
+                        let results = ext.extract_variants(&array_img, &variants);
 
                         let mut batch: Vec<(
                             Array2<f64>,
@@ -861,29 +880,38 @@ impl Engine {
                         )> = Vec::new();
                         let target_c = config_ext.target_centroids as f64 * 0.5;
 
-                        if let Some(vc) = result.virtual_crop_centroids {
-                            for (i, crop_cents) in vc.iter().enumerate() {
-                                if (crop_cents.len() as f64) >= target_c {
-                                    let mut arr = Array2::<f64>::zeros((crop_cents.len(), 2));
-                                    for (j, c) in crop_cents.iter().enumerate() {
-                                        arr[[j, 0]] = c.y;
-                                        arr[[j, 1]] = c.x;
+                        for (v_idx, result) in results.iter().enumerate() {
+                            if let Some(vc) = &result.virtual_crop_centroids {
+                                for (i, crop_cents) in vc.iter().enumerate() {
+                                    if (crop_cents.len() as f64) >= target_c {
+                                        let mut arr = Array2::<f64>::zeros((crop_cents.len(), 2));
+                                        for (j, c) in crop_cents.iter().enumerate() {
+                                            arr[[j, 0]] = c.y;
+                                            arr[[j, 1]] = c.x;
+                                        }
+                                        let crop = virtual_crops
+                                            .as_ref()
+                                            .and_then(|vc| vc.get(i).cloned());
+                                        let label =
+                                            virtual_crop_labels.as_ref().unwrap()[i].clone();
+                                        batch.push((arr, crop, label));
                                     }
-                                    let crop =
-                                        virtual_crops.as_ref().and_then(|vc| vc.get(i).cloned());
-                                    let label = virtual_crop_labels.as_ref().unwrap()[i].clone();
-                                    batch.push((arr, crop, label));
                                 }
                             }
+
+                            let mut arr = Array2::<f64>::zeros((result.centroids.len(), 2));
+                            for (i, c) in result.centroids.iter().enumerate() {
+                                arr[[i, 0]] = c.y;
+                                arr[[i, 1]] = c.x;
+                            }
+                            if v_idx == 0 {
+                                baseline_full_centroids = Some(arr.clone());
+                            }
+                            batch.push((arr, None, SolvedCrop::Full));
                         }
 
-                        let mut arr = Array2::<f64>::zeros((num_centroids, 2));
-                        for (i, c) in result.centroids.iter().enumerate() {
-                            arr[[i, 0]] = c.y;
-                            arr[[i, 1]] = c.x;
-                        }
-                        batch.push((arr, None, SolvedCrop::Full));
-
+                        num_centroids =
+                            results.iter().map(|r| r.centroids.len()).max().unwrap_or(0);
                         centroids_batch = batch;
                     }
                     Extractor::Cedar => {
@@ -970,7 +998,9 @@ impl Engine {
                         &final_img_data,
                         width,
                         height,
-                        &centroids_batch.last().unwrap().0,
+                        baseline_full_centroids
+                            .as_ref()
+                            .unwrap_or(&centroids_batch.last().unwrap().0),
                         30,
                     )
                 } else {
