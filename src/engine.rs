@@ -74,6 +74,7 @@ pub struct IntermediateResult {
     pub centroids_batch: Vec<(Array2<f64>, Option<tetra3::extractor::Crop>, SolvedCrop)>,
     pub timestamp: SystemTime,
     pub stacked_frames: u32,
+    pub background_level: Option<f32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default, clap::ValueEnum, Serialize, Deserialize)]
@@ -182,11 +183,13 @@ impl Default for EngineStateData {
 
 const MAX_STACKED_FRAMES: u32 = 10;
 const MAX_VIRTUAL_EXPOSURE_US: u32 = 3_000_000;
+const GAIN_ADJUST_THROTTLE_MS: u64 = 10_000;
 
 #[allow(dead_code)]
 pub struct Engine {
     camera: Arc<dyn CameraTrait>,
     config: EngineConfig,
+    last_gain_adjust: Option<std::time::Instant>,
     pub fused_solver: Arc<olive_solve::FusedSolver>,
     fov: Option<f64>,
     distortion: Option<f64>,
@@ -425,6 +428,7 @@ impl Engine {
         Self {
             camera,
             config,
+            last_gain_adjust: None,
             fused_solver,
             fov: config_fov,
             distortion: None,
@@ -660,6 +664,7 @@ impl Engine {
                 let num_centroids;
                 let centroids_batch;
                 let mut baseline_full_centroids = None;
+                let mut final_bg_level: Option<f32> = None;
 
                 let (state_sigma, state_fov) = {
                     let st = engine_state_ext.read().unwrap();
@@ -872,6 +877,7 @@ impl Engine {
                         }
 
                         let results = ext.extract_variants(&array_img, &variants);
+                        final_bg_level = results.first().map(|r| r.background_level);
 
                         let mut batch: Vec<(
                             Array2<f64>,
@@ -1046,6 +1052,7 @@ impl Engine {
                     centroids_batch,
                     timestamp: img_timestamp,
                     stacked_frames: stacker.stacked_frames,
+                    background_level: final_bg_level,
                 };
 
                 let (lock, cvar) = &*shared_res_ext;
@@ -1079,18 +1086,7 @@ impl Engine {
         (t1, t2)
     }
 
-    fn wait_for_extraction(
-        &self,
-    ) -> Option<(
-        usize,
-        Duration,
-        Duration,
-        Duration,
-        Vec<(Array2<f64>, Option<tetra3::extractor::Crop>, SolvedCrop)>,
-        SystemTime,
-        Duration,
-        u32,
-    )> {
+    fn wait_for_extraction(&self) -> Option<IntermediateResult> {
         let (lock, cvar) = &*self.shared_result;
         let mut inner = lock.lock().unwrap();
 
@@ -1099,19 +1095,71 @@ impl Engine {
             .unwrap();
         inner = result.0;
 
-        if let Some(res) = inner.take() {
-            Some((
-                res.count,
-                res.exp_time,
-                res.pp_time,
-                res.extract_time,
-                res.centroids_batch,
-                res.timestamp,
-                res.phys_exp_time,
-                res.stacked_frames,
-            ))
-        } else {
-            None
+        inner.take()
+    }
+
+    /// Automatically adjusts camera gain based on the image's background brightness.
+    /// This prevents stars from being washed out in pre-dusk skies, while keeping the
+    /// sensor pegged at max gain during true dark skies.
+    ///
+    /// The function uses a simple proportional controller to target a background
+    /// brightness window. Changes are throttled (e.g. 10s) to give the camera's
+    /// exposure buffer time to flush and avoid oscillation.
+    ///
+    /// Skipped when `Extractor::Cedar` is in use, calibration is bypassed, or
+    /// when an explicit gain is provided in the configuration.
+    fn auto_adjust_gain(&mut self, bg_level: f32) {
+        if self.config.bypass_calibration
+            || self.config.gain.is_some()
+            || self.config.extractor_type == Extractor::Cedar
+        {
+            return;
+        }
+
+        let now = std::time::Instant::now();
+        if let Some(last_adj) = self.last_gain_adjust {
+            if now.duration_since(last_adj)
+                < std::time::Duration::from_millis(GAIN_ADJUST_THROTTLE_MS)
+            {
+                return;
+            }
+        }
+
+        // For highly sensitive sensors (e.g. SC2210) under dark skies, the background
+        // is naturally very low (5-15 ADU) even at max gain.
+        // Max 80.0 ensures we drop gain before twilight washes out the stars.
+        // Min 20.0 ensures we push gain back to max as the sky darkens.
+        let target_bg_max = 80.0;
+        let target_bg_min = 20.0;
+
+        let current_gain = self.camera.get_gain();
+        let (min_gain, max_gain, _) = self.camera.get_gain_range();
+
+        let absolute_max = max_gain;
+        let baseline_gain = min_gain + (max_gain - min_gain) * 0.1;
+        let lower_bound = baseline_gain.min(absolute_max).max(min_gain);
+
+        let mut new_gain = current_gain;
+        if bg_level > target_bg_max {
+            new_gain *= target_bg_max / bg_level;
+        } else if bg_level < target_bg_min {
+            new_gain *= target_bg_min / bg_level.max(1.0);
+        }
+
+        new_gain = new_gain.clamp(lower_bound, absolute_max);
+
+        if (new_gain - current_gain).abs() > 0.01 {
+            self.camera.set_gain(new_gain);
+            self.last_gain_adjust = Some(now);
+
+            let effective_gain = self.camera.get_gain();
+            if (effective_gain - current_gain).abs() > 0.01 {
+                log::info!(
+                    "Auto-adjusted gain to {:.2} (bg level: {:.1})",
+                    effective_gain,
+                    bg_level
+                );
+            }
         }
     }
 
@@ -1250,17 +1298,17 @@ impl Engine {
             }
             self.update_status("Solving");
 
-            if let Some((
-                count,
-                exp_time,
-                pp_time,
-                extract_time,
-                centroids_batch,
-                img_timestamp,
-                _phys_exp_time,
-                stacked_frames,
-            )) = self.wait_for_extraction()
-            {
+            if let Some(res) = self.wait_for_extraction() {
+                if let Some(bg) = res.background_level {
+                    self.auto_adjust_gain(bg);
+                }
+                let count = res.count;
+                let exp_time = res.exp_time;
+                let pp_time = res.pp_time;
+                let extract_time = res.extract_time;
+                let centroids_batch = res.centroids_batch;
+                let img_timestamp = res.timestamp;
+                let stacked_frames = res.stacked_frames;
                 let mut pending_sync = None;
 
                 // 3. Process Sync Request (Requires active frame)
@@ -1916,6 +1964,7 @@ mod tests {
         let mut engine = Engine {
             camera,
             config: EngineConfig::default(),
+            last_gain_adjust: None,
             fused_solver,
             fov: Some(15.0),
             distortion: None,
@@ -2016,6 +2065,7 @@ mod tests {
         let mut engine = Engine {
             camera,
             config: EngineConfig::default(),
+            last_gain_adjust: None,
             fused_solver: fused_solver.clone(),
             fov: Some(15.0),
             distortion: None,
