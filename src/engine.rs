@@ -102,6 +102,12 @@ pub enum SolvedCrop {
     Bottom,
     Full,
     Failed,
+    CenterHighSens,
+    TopHighSens,
+    LeftHighSens,
+    RightHighSens,
+    BottomHighSens,
+    FullHighSens,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -899,8 +905,18 @@ impl Engine {
                                         let crop = virtual_crops
                                             .as_ref()
                                             .and_then(|vc| vc.get(i).cloned());
-                                        let label =
+                                        let mut label =
                                             virtual_crop_labels.as_ref().unwrap()[i].clone();
+                                        if v_idx > 0 {
+                                            label = match label {
+                                                SolvedCrop::Center => SolvedCrop::CenterHighSens,
+                                                SolvedCrop::Top => SolvedCrop::TopHighSens,
+                                                SolvedCrop::Left => SolvedCrop::LeftHighSens,
+                                                SolvedCrop::Right => SolvedCrop::RightHighSens,
+                                                SolvedCrop::Bottom => SolvedCrop::BottomHighSens,
+                                                _ => label,
+                                            };
+                                        }
                                         batch.push((arr, crop, label));
                                     }
                                 }
@@ -915,7 +931,12 @@ impl Engine {
                             if v_idx == 0 {
                                 baseline_full_centroids = Some(arr.clone());
                             }
-                            batch.push((arr, None, SolvedCrop::Full));
+                            let label = if v_idx > 0 {
+                                SolvedCrop::FullHighSens
+                            } else {
+                                SolvedCrop::Full
+                            };
+                            batch.push((arr, None, label));
                         }
 
                         // Use the base variant's full image centroid count for the UI
