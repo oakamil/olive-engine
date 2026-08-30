@@ -37,7 +37,7 @@ pub struct EngineConfig {
     pub extractor_type: Extractor,
     pub crop: Option<(usize, usize)>,
     pub downsample: u8,
-    pub bypass_calibration: bool,
+    pub auto_mode: bool,
     pub noise_filter: bool,
     pub initial_fov: Option<f32>,
     pub use_observer_location: bool,
@@ -57,7 +57,7 @@ impl Default for EngineConfig {
             extractor_type: Extractor::Approximate,
             crop: None,
             downsample: 0,
-            bypass_calibration: false,
+            auto_mode: true,
             noise_filter: false,
             initial_fov: None,
             use_observer_location: true,
@@ -537,7 +537,7 @@ impl Engine {
         let clear_stacker_ext = self.clear_stacker.clone();
 
         let t1 = std::thread::spawn(move || {
-            let mut stacker = crate::stacker::Stacker::new(0, 0, !config_ext.bypass_calibration);
+            let mut stacker = crate::stacker::Stacker::new(0, 0, config_ext.auto_mode);
             let mut extractor: Option<FastExtractor> = None;
             let mut last_processed_timestamp = None;
             let mut active_max_area = 150;
@@ -865,7 +865,7 @@ impl Engine {
 
                         let do_multiple_variants = exposure_us
                             >= MULTIPLE_EXTRACTION_MIN_EXPOSURE_US
-                            && !config_ext.bypass_calibration;
+                            && config_ext.auto_mode;
 
                         if do_multiple_variants {
                             variants.push(tetra3::fast_extractor::FastExtractOptionsUpdate {
@@ -890,8 +890,9 @@ impl Engine {
                             if let Some(vc) = &result.virtual_crop_centroids {
                                 for (i, crop_cents) in vc.iter().enumerate() {
                                     if (crop_cents.len() as f64) >= target_c {
-                                        let mut arr = Array2::<f64>::zeros((crop_cents.len(), 2));
-                                        for (j, c) in crop_cents.iter().enumerate() {
+                                        let num_cents = crop_cents.len().min(80);
+                                        let mut arr = Array2::<f64>::zeros((num_cents, 2));
+                                        for (j, c) in crop_cents.iter().take(80).enumerate() {
                                             arr[[j, 0]] = c.y;
                                             arr[[j, 1]] = c.x;
                                         }
@@ -905,8 +906,9 @@ impl Engine {
                                 }
                             }
 
-                            let mut arr = Array2::<f64>::zeros((result.centroids.len(), 2));
-                            for (i, c) in result.centroids.iter().enumerate() {
+                            let num_cents = result.centroids.len().min(80);
+                            let mut arr = Array2::<f64>::zeros((num_cents, 2));
+                            for (i, c) in result.centroids.iter().take(80).enumerate() {
                                 arr[[i, 0]] = c.y;
                                 arr[[i, 1]] = c.x;
                             }
@@ -916,8 +918,8 @@ impl Engine {
                             batch.push((arr, None, SolvedCrop::Full));
                         }
 
-                        num_centroids =
-                            results.iter().map(|r| r.centroids.len()).max().unwrap_or(0);
+                        // Use the base variant's full image centroid count for the UI
+                        num_centroids = results.first().map(|r| r.centroids.len()).unwrap_or(0);
                         centroids_batch = batch;
                     }
                     Extractor::Cedar => {
@@ -1109,7 +1111,7 @@ impl Engine {
     /// Skipped when `Extractor::Cedar` is in use, calibration is bypassed, or
     /// when an explicit gain is provided in the configuration.
     fn auto_adjust_gain(&mut self, bg_level: f32) {
-        if self.config.bypass_calibration
+        if !self.config.auto_mode
             || self.config.gain.is_some()
             || self.config.extractor_type == Extractor::Cedar
         {
@@ -1133,10 +1135,10 @@ impl Engine {
         let target_bg_min = 20.0;
 
         let current_gain = self.camera.get_gain();
-        let (min_gain, max_gain, _) = self.camera.get_gain_range();
+        let (min_gain, _, true_max_analog_gain) = self.camera.get_gain_range();
 
-        let absolute_max = max_gain;
-        let baseline_gain = min_gain + (max_gain - min_gain) * 0.1;
+        let absolute_max = true_max_analog_gain;
+        let baseline_gain = min_gain + (absolute_max - min_gain) * 0.1;
         let lower_bound = baseline_gain.min(absolute_max).max(min_gain);
 
         let mut new_gain = current_gain;
@@ -1337,7 +1339,7 @@ impl Engine {
                         "Discarding frame: {} centroids (< {} min). Telescope might be moving.",
                         count, MIN_CENTROIDS
                     );
-                    if self.config.bypass_calibration
+                    if !self.config.auto_mode
                         || stacked_frames >= MAX_STACKED_FRAMES
                         || exp_time.as_micros() as u32 >= MAX_VIRTUAL_EXPOSURE_US
                     {
@@ -1456,13 +1458,7 @@ impl Engine {
                 let sliced_batch: Vec<(Array2<f64>, Option<tetra3::extractor::Crop>)> =
                     centroids_batch
                         .iter()
-                        .map(|(a, c, _label)| {
-                            (
-                                a.slice(ndarray::s![..std::cmp::min(80, a.nrows()), ..])
-                                    .to_owned(),
-                                c.clone(),
-                            )
-                        })
+                        .map(|(a, c, _label)| (a.clone(), c.clone()))
                         .collect();
 
                 let batch_solution = self.fused_solver.solve_from_centroids_batch(
@@ -1586,7 +1582,7 @@ impl Engine {
                         );
                     }
                     _ => {
-                        if self.config.bypass_calibration
+                        if !self.config.auto_mode
                             || stacked_frames >= MAX_STACKED_FRAMES
                             || exp_time.as_micros() as u32 >= MAX_VIRTUAL_EXPOSURE_US
                         {

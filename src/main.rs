@@ -58,9 +58,9 @@ struct Args {
     #[arg(long)]
     no_downsample: bool,
 
-    /// Bypass automatic calibration and start solving immediately
-    #[arg(long)]
-    bypass_calibration: bool,
+    /// Enable automatic tuning (gain, stacking, extraction)
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    auto_mode: bool,
 }
 
 #[tokio::main]
@@ -99,7 +99,7 @@ async fn main() {
         bg_mode: args.bg_mode,
         extractor_type: args.extractor_type,
         downsample: if args.no_downsample { 0 } else { 1 },
-        bypass_calibration: args.bypass_calibration,
+        auto_mode: args.auto_mode,
         ..Default::default()
     };
 
