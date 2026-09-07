@@ -575,7 +575,18 @@ impl Engine {
                 );
                 let img_arc = match img_opt {
                     Some(img) => img,
-                    None => continue,
+                    None => {
+                        if !is_running_ext.load(std::sync::atomic::Ordering::Relaxed) {
+                            log::info!(
+                                "Engine loop stopping due to is_running flag after None capture."
+                            );
+                            break;
+                        }
+                        // Sleep briefly before retrying to prevent thread thrashing and 100% CPU utilization
+                        // when the camera capture thread is paused, restarting, or has tripped the watchdog.
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
                 };
 
                 // We should also check is_running after waiting.

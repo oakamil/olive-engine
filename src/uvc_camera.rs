@@ -5,7 +5,7 @@ use crate::{CameraConfig, CameraTrait, Image};
 use log::{info, warn};
 use std::sync::{
     Arc, Condvar, Mutex,
-    atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     mpsc,
 };
 use std::thread::{self, JoinHandle};
@@ -57,6 +57,7 @@ pub struct UvcControls {
 struct CaptureStore {
     image: Mutex<Option<Arc<Image>>>,
     cvar: Condvar,
+    stopped: AtomicBool,
 }
 
 /// Commands sent from the main thread to the capture thread.
@@ -138,6 +139,7 @@ impl CameraTrait for Camera {
     }
     fn stop_capture(&self) {
         self.send_command(CaptureCommand::StopCaptureThread);
+        self.store.stopped.store(true, Ordering::Release);
         self.store.cvar.notify_all();
     }
 
@@ -212,23 +214,39 @@ impl CameraTrait for Camera {
 
     fn wait_for_next_capture(
         &self,
-        last_timestamp: Option<SystemTime>,
+        last_processed_timestamp: Option<SystemTime>,
         timeout: Option<Duration>,
     ) -> Option<Arc<Image>> {
-        let mut lock = self.store.image.lock().unwrap();
+        let store = self.store.clone();
+
+        if store.stopped.load(Ordering::Acquire) {
+            return None;
+        }
+
+        let mut lock = store.image.lock().unwrap();
         loop {
             if let Some(img) = &*lock {
-                if last_timestamp.is_none() || Some(img.timestamp) != last_timestamp {
+                if last_processed_timestamp.is_none()
+                    || Some(img.timestamp) != last_processed_timestamp
+                {
                     return Some(img.clone());
                 }
+            }
+            if store.stopped.load(Ordering::Acquire) {
+                return None;
             }
             if let Some(duration) = timeout {
                 let (new_lock, result) = self.store.cvar.wait_timeout(lock, duration).unwrap();
                 lock = new_lock;
+                if store.stopped.load(Ordering::Acquire) {
+                    return None;
+                }
                 if result.timed_out() {
                     // Check one last time before returning None
                     if let Some(img) = &*lock {
-                        if last_timestamp.is_none() || Some(img.timestamp) != last_timestamp {
+                        if last_processed_timestamp.is_none()
+                            || Some(img.timestamp) != last_processed_timestamp
+                        {
                             return Some(img.clone());
                         }
                     }
@@ -236,6 +254,9 @@ impl CameraTrait for Camera {
                 }
             } else {
                 lock = self.store.cvar.wait(lock).unwrap();
+                if store.stopped.load(Ordering::Acquire) {
+                    return None;
+                }
             }
         }
     }
@@ -316,6 +337,7 @@ impl Camera {
         let store = Arc::new(CaptureStore {
             image: Mutex::new(None),
             cvar: Condvar::new(),
+            stopped: AtomicBool::new(false),
         });
 
         let current_exposure = Arc::new(AtomicI32::new(33_000)); // Default 30fps = 33ms
@@ -367,30 +389,59 @@ impl Camera {
         descriptors: Option<Vec<u8>>,
         stack_count_config: Arc<AtomicUsize>,
     ) {
-        let ctx = uvc::Context::new().expect("Failed to create UVC context");
+        let ctx = match uvc::Context::new() {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("Failed to create UVC context: {:?}", e);
+                store.stopped.store(true, Ordering::Release);
+                store.cvar.notify_all();
+                return;
+            }
+        };
 
         let mut _dev_keep_alive = None;
         let devh = if let Some(fd) = fd {
             if let Some(ref d) = descriptors {
-                ctx.wrap_fd_with_descriptors(fd, d).unwrap_or_else(|e| {
-                    panic!(
-                        "Failed to open UVC device with descriptors. Error: {:?}, raw err code",
-                        e
-                    )
-                })
+                match ctx.wrap_fd_with_descriptors(fd, d) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        log::error!("Failed to open UVC device with descriptors: {:?}", e);
+                        store.stopped.store(true, Ordering::Release);
+                        store.cvar.notify_all();
+                        return;
+                    }
+                }
             } else {
-                ctx.wrap_fd(fd).expect("Failed to open UVC device with FD")
+                match ctx.wrap_fd(fd) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        log::error!("Failed to open UVC device with FD: {:?}", e);
+                        store.stopped.store(true, Ordering::Release);
+                        store.cvar.notify_all();
+                        return;
+                    }
+                }
             }
         } else {
-            let dev = ctx
-                .find_device(None, None, None)
-                .expect("Failed to find UVC device");
+            let dev = match ctx.find_device(None, None, None) {
+                Ok(d) => d,
+                Err(e) => {
+                    log::error!("Failed to find UVC device: {:?}", e);
+                    store.stopped.store(true, Ordering::Release);
+                    store.cvar.notify_all();
+                    return;
+                }
+            };
             _dev_keep_alive = Some(dev);
-            _dev_keep_alive
-                .as_ref()
-                .unwrap()
-                .open()
-                .expect("Failed to open UVC device")
+            match _dev_keep_alive.as_ref().unwrap().open() {
+                Ok(d) => d,
+                Err(e) => {
+                    log::error!("Failed to open UVC device: {:?}", e);
+                    store.stopped.store(true, Ordering::Release);
+                    store.cvar.notify_all();
+                    return;
+                }
+            }
         };
 
         // Find highest resolution format (format depends on the new mjpeg option) that exactly
@@ -506,12 +557,19 @@ impl Camera {
                 }
             }
         }
-        let stream_format = best_format.unwrap_or_else(|| {
-            panic!(
-                "Error: No format found matching exactly the specified fps of {} and mjpeg enabled: {}",
-                target_fps, mjpeg_enabled
-            );
-        });
+        let stream_format = match best_format {
+            Some(f) => f,
+            None => {
+                log::error!(
+                    "Error: No format found matching fps {} (mjpeg={})",
+                    target_fps,
+                    mjpeg_enabled
+                );
+                store.stopped.store(true, Ordering::Release);
+                store.cvar.notify_all();
+                return;
+            }
+        };
 
         info!("Selected UVC format: {:?}", stream_format);
 
@@ -556,7 +614,10 @@ impl Camera {
                 Err(e) => {
                     retry_count += 1;
                     if retry_count >= 3 {
-                        panic!("Failed to get stream handle after 3 attempts: {:?}", e);
+                        log::error!("Failed to get stream handle after 3 attempts: {:?}", e);
+                        store.stopped.store(true, Ordering::Release);
+                        store.cvar.notify_all();
+                        return;
                     }
                     std::thread::sleep(Duration::from_secs(1));
                 }
@@ -584,159 +645,199 @@ impl Camera {
         let stack_count_config_clone = Arc::clone(&stack_count_config);
         let current_exposure_atomic_clone = Arc::clone(&current_exposure_atomic);
 
+        struct SafeDecompressor(turbojpeg::Decompressor);
+        unsafe impl Send for SafeDecompressor {}
+        unsafe impl Sync for SafeDecompressor {}
+
         struct StreamContext {
             stacked_count: usize,
             accumulator: Vec<u8>,
+            scratch_buffer: Vec<u8>,
+            decompressor: Option<SafeDecompressor>,
         }
 
         let stream_context = StreamContext {
             stacked_count: 0,
             accumulator: Vec::new(),
+            scratch_buffer: Vec::new(),
+            decompressor: turbojpeg::Decompressor::new().ok().map(SafeDecompressor),
         };
 
-        let _stream_handle = streamh
-            .start_stream(
-                move |frame, ctx: &mut StreamContext| {
-                    log::info!(
-                        "UVC callback fired! format={:?}, len={}",
-                        frame.format(),
-                        frame.to_bytes().len()
-                    );
-                    log::info!(
-                        "Callback fired! Format={:?}, len={}",
-                        frame.format(),
-                        frame.to_bytes().len()
-                    );
+        let stream_start_instant = std::time::Instant::now();
+        let last_frame_ms = Arc::new(AtomicU64::new(0));
+        let last_frame_ms_clone = Arc::clone(&last_frame_ms);
 
-                    let receive_time = std::time::Instant::now();
+        let _stream_handle_result = streamh.start_stream(
+            move |frame, ctx: &mut StreamContext| {
+                log::debug!(
+                    "UVC callback fired! format={:?}, len={}",
+                    frame.format(),
+                    frame.to_bytes().len()
+                );
+                log::debug!(
+                    "Callback fired! Format={:?}, len={}",
+                    frame.format(),
+                    frame.to_bytes().len()
+                );
+                log::debug!(
+                    "UVC frame arrived: {}x{}, format={:?}",
+                    frame.width(),
+                    frame.height(),
+                    frame.format()
+                );
 
-                    let target_stack = stack_count_config_clone.load(Ordering::Relaxed);
-                    let current_exposure = current_exposure_atomic_clone.load(Ordering::Relaxed);
-                    let total_exposure_us = (current_exposure * target_stack.max(1) as i32) as u64;
-                    let half_exposure = std::time::Duration::from_micros(total_exposure_us / 2);
-                    let pipeline_latency = std::time::Duration::from_millis(30);
-                    let timestamp = SystemTime::now() - half_exposure - pipeline_latency;
+                last_frame_ms_clone.store(
+                    stream_start_instant.elapsed().as_millis() as u64,
+                    Ordering::Relaxed,
+                );
 
-                    let mut width = frame.width() as usize;
-                    let mut height = frame.height() as usize;
-                    let data = frame.to_bytes();
-                    log::info!(
-                        "UVC frame arrived: {}x{}, format={:?}",
-                        width,
-                        height,
-                        frame.format()
-                    );
+                let receive_time = std::time::Instant::now();
 
-                    let mut image_data = Vec::new();
-                    let mut direct_accumulate = false;
+                let target_stack = stack_count_config_clone.load(Ordering::Relaxed);
+                let current_exposure = current_exposure_atomic_clone.load(Ordering::Relaxed);
+                let total_exposure_us = (current_exposure * target_stack.max(1) as i32) as u64;
+                let half_exposure = std::time::Duration::from_micros(total_exposure_us / 2);
+                let pipeline_latency = std::time::Duration::from_millis(30);
+                let timestamp = SystemTime::now() - half_exposure - pipeline_latency;
 
-                    if frame.format() == FrameFormat::MJPEG {
-                        let mut decompressor = match turbojpeg::Decompressor::new() {
-                            Ok(d) => d,
-                            Err(e) => {
-                                log::error!("Failed to create turbojpeg decompressor: {:?}", e);
-                                return;
-                            }
-                        };
-                        let header = match decompressor.read_header(data) {
-                            Ok(h) => h,
-                            Err(e) => {
-                                log::error!("MJPEG header read failed: {:?}", e);
-                                return;
-                            }
-                        };
-                        width = header.width;
-                        height = header.height;
-                        image_data = vec![0u8; width * height];
-                        let image = turbojpeg::Image {
-                            pixels: image_data.as_mut_slice(),
-                            width,
-                            pitch: width,
-                            height,
-                            format: turbojpeg::PixelFormat::GRAY,
-                        };
-                        if let Err(e) = decompressor.decompress(data, image) {
-                            log::error!("MJPEG decompression failed: {:?}", e);
+                let mut width = frame.width() as usize;
+                let mut height = frame.height() as usize;
+                let data = frame.to_bytes();
+                log::debug!(
+                    "UVC frame arrived: {}x{}, format={:?}",
+                    width,
+                    height,
+                    frame.format()
+                );
+
+                let mut direct_accumulate = false;
+
+                if frame.format() == FrameFormat::MJPEG {
+                    let decompressor = match &mut ctx.decompressor {
+                        Some(d) => &mut d.0,
+                        None => {
+                            log::error!("No turbojpeg decompressor available");
                             return;
                         }
-                    } else {
-                        // Highly optimized loop for 8-bit mono extraction (Y from YUYV)
-                        // YUYV sequence: Y0, U0, Y1, V0... (2 bytes per pixel, even bytes are Y)
-                        if target_stack > 1
-                            && ctx.stacked_count > 0
-                            && ctx.accumulator.len() == width * height
-                        {
-                            direct_accumulate = true;
-                            unsafe {
-                                let mut j = 0;
-                                for i in (0..data.len()).step_by(2) {
-                                    if j < width * height {
-                                        let a = ctx.accumulator.get_unchecked_mut(j);
-                                        *a = a.saturating_add(*data.get_unchecked(i));
-                                        j += 1;
-                                    }
-                                }
-                            }
-                        } else {
-                            image_data = Vec::with_capacity(width * height);
-                            unsafe {
-                                image_data.set_len(width * height);
-                                let mut j = 0;
-                                // Manual loop unrolling or just a tight loop
-                                for i in (0..data.len()).step_by(2) {
-                                    if j < width * height {
-                                        *image_data.get_unchecked_mut(j) = *data.get_unchecked(i);
-                                        j += 1;
-                                    }
+                    };
+                    let header = match decompressor.read_header(data) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            log::error!("MJPEG header read failed: {:?}", e);
+                            return;
+                        }
+                    };
+                    width = header.width;
+                    height = header.height;
+                    if ctx.scratch_buffer.len() != width * height {
+                        ctx.scratch_buffer.resize(width * height, 0);
+                    }
+                    let image = turbojpeg::Image {
+                        pixels: ctx.scratch_buffer.as_mut_slice(),
+                        width,
+                        pitch: width,
+                        height,
+                        format: turbojpeg::PixelFormat::GRAY,
+                    };
+                    if let Err(e) = decompressor.decompress(data, image) {
+                        log::error!("MJPEG decompression failed: {:?}", e);
+                        return;
+                    }
+                } else {
+                    // Highly optimized loop for 8-bit mono extraction (Y from YUYV)
+                    // YUYV sequence: Y0, U0, Y1, V0... (2 bytes per pixel, even bytes are Y)
+                    if target_stack > 1
+                        && ctx.stacked_count > 0
+                        && ctx.accumulator.len() == width * height
+                    {
+                        direct_accumulate = true;
+                        unsafe {
+                            let mut j = 0;
+                            for i in (0..data.len()).step_by(2) {
+                                if j < width * height {
+                                    let a = ctx.accumulator.get_unchecked_mut(j);
+                                    *a = a.saturating_add(*data.get_unchecked(i));
+                                    j += 1;
                                 }
                             }
                         }
+                    } else {
+                        if ctx.scratch_buffer.len() != width * height {
+                            ctx.scratch_buffer.resize(width * height, 0);
+                        }
+                        let mut j = 0;
+                        for i in (0..data.len()).step_by(2) {
+                            if j < width * height {
+                                unsafe {
+                                    *ctx.scratch_buffer.get_unchecked_mut(j) =
+                                        *data.get_unchecked(i);
+                                }
+                                j += 1;
+                            }
+                        }
                     }
+                }
 
-                    let mut is_ready = false;
+                let mut is_ready = false;
 
-                    if target_stack <= 1 {
-                        ctx.accumulator = image_data;
+                if target_stack <= 1 {
+                    ctx.accumulator.clone_from(&ctx.scratch_buffer);
+                    is_ready = true;
+                    ctx.stacked_count = 0;
+                } else {
+                    if !direct_accumulate {
+                        if ctx.stacked_count == 0 || ctx.accumulator.len() != width * height {
+                            ctx.accumulator.clone_from(&ctx.scratch_buffer);
+                        } else {
+                            for (a, b) in ctx.accumulator.iter_mut().zip(ctx.scratch_buffer.iter())
+                            {
+                                *a = a.saturating_add(*b);
+                            }
+                        }
+                    }
+                    ctx.stacked_count += 1;
+                    if ctx.stacked_count >= target_stack {
                         is_ready = true;
                         ctx.stacked_count = 0;
-                    } else {
-                        if !direct_accumulate {
-                            if ctx.stacked_count == 0 || ctx.accumulator.len() != width * height {
-                                ctx.accumulator = image_data;
-                            } else {
-                                for (a, b) in ctx.accumulator.iter_mut().zip(image_data.iter()) {
-                                    *a = a.saturating_add(*b);
-                                }
-                            }
-                        }
-                        ctx.stacked_count += 1;
-                        if ctx.stacked_count >= target_stack {
-                            is_ready = true;
-                            ctx.stacked_count = 0;
-                        }
                     }
+                }
 
-                    if is_ready {
-                        let final_data = ctx.accumulator.clone();
-                        let post_process_time = receive_time.elapsed();
-                        let mut lock = store_clone.image.lock().unwrap();
-                        *lock = Some(Arc::new(Image {
-                            data: final_data,
-                            width: width as u32,
-                            height: height as u32,
-                            timestamp,
-                            exposure_time_us: current_exposure_atomic_clone.load(Ordering::Relaxed)
-                                * (target_stack.max(1) as i32),
-                            post_process_time,
-                        }));
-                        store_clone.cvar.notify_all();
-                    }
-                },
-                stream_context,
-            )
-            .expect("Failed to start stream");
+                if is_ready {
+                    let final_data = ctx.accumulator.clone();
+                    let post_process_time = receive_time.elapsed();
+                    let mut lock = store_clone.image.lock().unwrap();
+                    *lock = Some(Arc::new(Image {
+                        data: final_data,
+                        width: width as u32,
+                        height: height as u32,
+                        timestamp,
+                        exposure_time_us: current_exposure_atomic_clone.load(Ordering::Relaxed)
+                            * (target_stack.max(1) as i32),
+                        post_process_time,
+                    }));
+                    store_clone.cvar.notify_all();
+                }
+            },
+            stream_context,
+        );
+
+        let _stream_handle = match _stream_handle_result {
+            Ok(h) => h,
+            Err(e) => {
+                log::error!("Failed to start stream: {:?}", e);
+                store.stopped.store(true, Ordering::Release);
+                store.cvar.notify_all();
+                return;
+            }
+        };
+
         log::info!("UVC stream started successfully");
 
+        // CRITICAL HARDWARE QUIRK:
+        // We explicitly wait until *after* the stream is started to send EP0 control requests.
+        // If we send controls (like ae_mode or set_gain) before the isochronous endpoints are active,
+        // many UVC cameras will fail to correctly transition into manual / shutter-priority mode.
+        // We delay for 500ms to allow the hardware to settle and stabilize its capture pipeline.
         std::thread::sleep(Duration::from_millis(500));
 
         // Turn off auto-exposure
@@ -759,34 +860,37 @@ impl Camera {
         if let Some(range) = uvc_ranges.saturation {
             try_set_control!(
                 "saturation",
-                devh.set_saturation(range.default.try_into().unwrap())
+                devh.set_saturation(range.default.try_into().unwrap_or(0))
             );
         }
         if let Some(range) = uvc_ranges.contrast {
             try_set_control!(
                 "contrast",
-                devh.set_contrast(range.default.try_into().unwrap())
+                devh.set_contrast(range.default.try_into().unwrap_or(0))
             );
         }
         if let Some(range) = uvc_ranges.white_balance_temperature {
             try_set_control!(
                 "white_balance_temp",
-                devh.set_white_balance_temperature(range.default.try_into().unwrap())
+                devh.set_white_balance_temperature(range.default.try_into().unwrap_or(0))
             );
         }
         if let Some(range) = uvc_ranges.sharpness {
             try_set_control!(
                 "sharpness",
-                devh.set_sharpness(range.default.try_into().unwrap())
+                devh.set_sharpness(range.default.try_into().unwrap_or(0))
             );
         }
         if let Some(range) = uvc_ranges.brightness {
-            let def: i16 = range.default.try_into().unwrap();
+            let def: i16 = range.default.try_into().unwrap_or(0);
             try_set_control!("brightness", devh.set_brightness(def));
             current_brightness_atomic.store(range.default, Ordering::Relaxed);
         }
         if let Some(range) = uvc_ranges.gamma {
-            try_set_control!("gamma", devh.set_gamma(range.default.try_into().unwrap()));
+            try_set_control!(
+                "gamma",
+                devh.set_gamma(range.default.try_into().unwrap_or(0))
+            );
         }
 
         // Delaying to ensure that the camera fully transitions to manual / shutter priority mode
@@ -814,7 +918,12 @@ impl Camera {
 
         // Keep stream_handle alive for the duration of the loop
 
-        // Keep stream_handle alive for the duration of the loop
+        // Reset the watchdog timer immediately before entering the command loop
+        // so the 6-second grace period starts *after* hardware configuration finishes.
+        last_frame_ms.store(
+            stream_start_instant.elapsed().as_millis() as u64,
+            Ordering::Relaxed,
+        );
 
         loop {
             // Handle commands
@@ -895,7 +1004,24 @@ impl Camera {
 
                     *store.image.lock().unwrap() = None;
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let now_ms = stream_start_instant.elapsed().as_millis() as u64;
+                    let last_ms = last_frame_ms.load(Ordering::Relaxed);
+                    // 6-second grace period before first frame, 3-second timeout between consecutive frames
+                    // libuvc doesn't explicitly inform us if URB submissions fail in its background thread.
+                    // This watchdog detects a stalled endpoint and triggers a clean teardown, which causes
+                    // `store.stopped` to be set, notifying `engine.rs` to stop waiting and gracefully exit.
+                    let timeout_threshold_ms = if last_ms == 0 { 6000 } else { 3000 };
+                    if now_ms.saturating_sub(last_ms) > timeout_threshold_ms {
+                        log::error!(
+                            "UVC Watchdog: No frames received for >{}ms. Stream stalled. Exiting loop...",
+                            timeout_threshold_ms
+                        );
+                        store.stopped.store(true, Ordering::Release);
+                        store.cvar.notify_all();
+                        break;
+                    }
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
@@ -906,6 +1032,7 @@ impl Camera {
 impl Drop for Camera {
     fn drop(&mut self) {
         self.send_command(CaptureCommand::StopCaptureThread);
+        self.store.stopped.store(true, Ordering::Release);
         self.store.cvar.notify_all();
         if let Some(handle) = self.capture_thread.take() {
             let _ = handle.join();
