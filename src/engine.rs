@@ -27,6 +27,24 @@ const MULTIPLE_EXTRACTION_SIGMA: f32 = 2.6;
 const MULTIPLE_EXTRACTION_MIN_AREA: usize = 1;
 const MULTIPLE_EXTRACTION_NOISE_FILTER: bool = false;
 
+const MAX_STACKED_FRAMES: u32 = 10;
+const MAX_VIRTUAL_EXPOSURE_US: u32 = 3_000_000;
+const GAIN_ADJUST_THROTTLE_MS: u64 = 10_000;
+
+/// Minimum field of view in degrees required to enable virtual crop extraction.
+/// For FOVs below this threshold, full-frame solving is sufficiently free of obstructions,
+/// eliminating the overhead of 5 sub-crop evaluations per frame.
+pub const MIN_VIRTUAL_CROP_FOV: f64 = 25.0;
+
+/// The labels corresponding to the 5 virtual crop regions produced by [`generate_5_crop_layout`].
+pub const VIRTUAL_CROP_LABELS: [SolvedCrop; 5] = [
+    SolvedCrop::Center,
+    SolvedCrop::Top,
+    SolvedCrop::Left,
+    SolvedCrop::Right,
+    SolvedCrop::Bottom,
+];
+
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
     pub gain: Option<f32>,
@@ -187,9 +205,73 @@ impl Default for EngineStateData {
     }
 }
 
-const MAX_STACKED_FRAMES: u32 = 10;
-const MAX_VIRTUAL_EXPOSURE_US: u32 = 3_000_000;
-const GAIN_ADJUST_THROTTLE_MS: u64 = 10_000;
+/// Generates a 5-crop layout (Center, Top, Left, Right, Bottom) for wide-angle star extraction.
+/// Offsets place the edge crops directly flush against the image boundaries.
+pub fn generate_5_crop_layout(
+    crop_w: usize,
+    crop_h: usize,
+    off_x: isize,
+    off_y: isize,
+) -> Vec<tetra3::extractor::Crop> {
+    vec![
+        tetra3::extractor::Crop::Center {
+            width: crop_w,
+            height: crop_h,
+        },
+        tetra3::extractor::Crop::Region {
+            height: crop_h,
+            width: crop_w,
+            offset_y: -off_y,
+            offset_x: 0,
+        },
+        tetra3::extractor::Crop::Region {
+            height: crop_h,
+            width: crop_w,
+            offset_y: 0,
+            offset_x: -off_x,
+        },
+        tetra3::extractor::Crop::Region {
+            height: crop_h,
+            width: crop_w,
+            offset_y: 0,
+            offset_x: off_x,
+        },
+        tetra3::extractor::Crop::Region {
+            height: crop_h,
+            width: crop_w,
+            offset_y: off_y,
+            offset_x: 0,
+        },
+    ]
+}
+
+/// Helper to determine virtual crops and corresponding labels based on the current estimated FOV.
+/// Only activates when `best_fov >= MIN_VIRTUAL_CROP_FOV`.
+pub fn evaluate_virtual_crops(
+    best_fov: Option<f64>,
+    proc_width: usize,
+    proc_height: usize,
+) -> (
+    Option<Vec<tetra3::extractor::Crop>>,
+    Option<Vec<SolvedCrop>>,
+) {
+    if best_fov.is_some_and(|fov| fov >= MIN_VIRTUAL_CROP_FOV) {
+        let scale = 0.50;
+
+        let crop_w = (proc_width as f64 * scale).round() as usize;
+        let crop_h = (proc_height as f64 * scale).round() as usize;
+
+        let off_x = (proc_width as isize - crop_w as isize) / 2;
+        let off_y = (proc_height as isize - crop_h as isize) / 2;
+
+        (
+            Some(generate_5_crop_layout(crop_w, crop_h, off_x, off_y)),
+            Some(VIRTUAL_CROP_LABELS.to_vec()),
+        )
+    } else {
+        (None, None)
+    }
+}
 
 #[allow(dead_code)]
 pub struct Engine {
@@ -742,104 +824,8 @@ impl Engine {
                             }
                         }
 
-                        let (virtual_crops, virtual_crop_labels) = if let Some(fov) = best_fov {
-                            if fov >= 13.5 {
-                                let fov_rad = fov.to_radians();
-                                let target_rad = 10.5f64.to_radians();
-                                let min_ratio = (target_rad / 2.0).tan() / (fov_rad / 2.0).tan();
-                                let scale = min_ratio.clamp(0.50, 0.75);
-
-                                let crop_w = (proc_width as f64 * scale).round() as usize;
-                                let crop_h = (proc_height as f64 * scale).round() as usize;
-
-                                let off_x = (proc_width as isize - crop_w as isize) / 2;
-                                let off_y = (proc_height as isize - crop_h as isize) / 2;
-
-                                (
-                                    Some(vec![
-                                        tetra3::extractor::Crop::Center {
-                                            width: crop_w,
-                                            height: crop_h,
-                                        },
-                                        tetra3::extractor::Crop::Region {
-                                            height: crop_h,
-                                            width: crop_w,
-                                            offset_y: -off_y,
-                                            offset_x: 0,
-                                        },
-                                        tetra3::extractor::Crop::Region {
-                                            height: crop_h,
-                                            width: crop_w,
-                                            offset_y: 0,
-                                            offset_x: -off_x,
-                                        },
-                                        tetra3::extractor::Crop::Region {
-                                            height: crop_h,
-                                            width: crop_w,
-                                            offset_y: 0,
-                                            offset_x: off_x,
-                                        },
-                                        tetra3::extractor::Crop::Region {
-                                            height: crop_h,
-                                            width: crop_w,
-                                            offset_y: off_y,
-                                            offset_x: 0,
-                                        },
-                                    ]),
-                                    Some(vec![
-                                        SolvedCrop::Center,
-                                        SolvedCrop::Top,
-                                        SolvedCrop::Left,
-                                        SolvedCrop::Right,
-                                        SolvedCrop::Bottom,
-                                    ]),
-                                )
-                            } else {
-                                (None, None)
-                            }
-                        } else {
-                            let off_x = proc_width as isize / 4;
-                            let off_y = proc_height as isize / 4;
-                            (
-                                Some(vec![
-                                    tetra3::extractor::Crop::Center {
-                                        width: proc_width / 2,
-                                        height: proc_height / 2,
-                                    },
-                                    tetra3::extractor::Crop::Region {
-                                        height: proc_height / 2,
-                                        width: proc_width / 2,
-                                        offset_y: -off_y,
-                                        offset_x: 0,
-                                    },
-                                    tetra3::extractor::Crop::Region {
-                                        height: proc_height / 2,
-                                        width: proc_width / 2,
-                                        offset_y: 0,
-                                        offset_x: -off_x,
-                                    },
-                                    tetra3::extractor::Crop::Region {
-                                        height: proc_height / 2,
-                                        width: proc_width / 2,
-                                        offset_y: 0,
-                                        offset_x: off_x,
-                                    },
-                                    tetra3::extractor::Crop::Region {
-                                        height: proc_height / 2,
-                                        width: proc_width / 2,
-                                        offset_y: off_y,
-                                        offset_x: 0,
-                                    },
-                                ]),
-                                Some(vec![
-                                    SolvedCrop::Center,
-                                    SolvedCrop::Top,
-                                    SolvedCrop::Left,
-                                    SolvedCrop::Right,
-                                    SolvedCrop::Bottom,
-                                ]),
-                            )
-                        };
+                        let (virtual_crops, virtual_crop_labels) =
+                            evaluate_virtual_crops(best_fov, proc_width, proc_height);
 
                         if extractor.is_none() {
                             let bg_sub_mode = match config_ext.bg_mode {
@@ -1860,7 +1846,6 @@ mod tests {
     }
     #[test]
     fn test_virtual_crops_axes() {
-        use tetra3::extractor::Crop;
         use tetra3::fast_extractor::{FastExtractOptions, FastExtractor};
 
         // Load image (using 2019-07-29T204726_Alt40_Azi135_Try1.jpg since it has a wide field of stars)
@@ -1886,36 +1871,7 @@ mod tests {
         let off_x = (width as isize - crop_w as isize) / 2;
         let off_y = (height as isize - crop_h as isize) / 2;
 
-        let virtual_crops = vec![
-            Crop::Center {
-                width: crop_w,
-                height: crop_h,
-            },
-            Crop::Region {
-                height: crop_h,
-                width: crop_w,
-                offset_y: -off_y,
-                offset_x: 0,
-            },
-            Crop::Region {
-                height: crop_h,
-                width: crop_w,
-                offset_y: 0,
-                offset_x: -off_x,
-            },
-            Crop::Region {
-                height: crop_h,
-                width: crop_w,
-                offset_y: 0,
-                offset_x: off_x,
-            },
-            Crop::Region {
-                height: crop_h,
-                width: crop_w,
-                offset_y: off_y,
-                offset_x: 0,
-            },
-        ];
+        let virtual_crops = super::generate_5_crop_layout(crop_w, crop_h, off_x, off_y);
 
         // Ensure the absolute bounds actually hit the edges
         let (y1, _y2, _x1, _x2) = virtual_crops[1].bounds(width, height);
@@ -1966,6 +1922,40 @@ mod tests {
             !vcrops_res[4].is_empty(),
             "Expected stars in Bottom-Center edge"
         );
+    }
+
+    #[test]
+    fn test_virtual_crop_fov_threshold() {
+        let width = 1920;
+        let height = 1080;
+
+        // 1. None FOV -> no virtual crops
+        let (crops, labels) = super::evaluate_virtual_crops(None, width, height);
+        assert!(crops.is_none());
+        assert!(labels.is_none());
+
+        // 2. Sub-threshold FOV (e.g. 15.0°, 24.99°) -> no virtual crops
+        let (crops, labels) = super::evaluate_virtual_crops(Some(15.0), width, height);
+        assert!(crops.is_none());
+        assert!(labels.is_none());
+
+        let (crops, labels) = super::evaluate_virtual_crops(Some(24.99), width, height);
+        assert!(crops.is_none());
+        assert!(labels.is_none());
+
+        // 3. Exact threshold (25.0°) -> activates 5 virtual crops & labels
+        let (crops, labels) = super::evaluate_virtual_crops(Some(25.0), width, height);
+        let crops = crops.expect("Should produce virtual crops at 25.0°");
+        let labels = labels.expect("Should produce virtual crop labels at 25.0°");
+        assert_eq!(crops.len(), 5);
+        assert_eq!(labels, super::VIRTUAL_CROP_LABELS);
+
+        // 4. Wide-angle FOV (35.0°) -> activates 5 virtual crops & labels
+        let (crops, labels) = super::evaluate_virtual_crops(Some(35.0), width, height);
+        let crops = crops.expect("Should produce virtual crops at 35.0°");
+        let labels = labels.expect("Should produce virtual crop labels at 35.0°");
+        assert_eq!(crops.len(), 5);
+        assert_eq!(labels, super::VIRTUAL_CROP_LABELS);
     }
 
     #[test]
