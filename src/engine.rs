@@ -439,12 +439,7 @@ impl Engine {
                     let dec = pos.dec;
                     let eq_roll = pos.roll;
 
-                    shared_pos_clone
-                        .telescope_ra
-                        .store(ra.to_bits(), std::sync::atomic::Ordering::Relaxed);
-                    shared_pos_clone
-                        .telescope_dec
-                        .store(dec.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                    *shared_pos_clone.telescope_position.write().unwrap() = (ra, dec);
 
                     let mut target_ra_opt = None;
                     let mut target_dec_opt = None;

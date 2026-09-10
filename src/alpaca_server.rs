@@ -415,28 +415,20 @@ async fn handle_get(
         "canmoveaxis" => Json(AlpacaResponse::success(client_id, Some(false))).into_response(),
         "cansettracking" => Json(AlpacaResponse::success(client_id, Some(false))).into_response(),
         "rightascension" => {
-            let bits = server.shared_position.telescope_ra.load(Ordering::Relaxed);
-            let ra_deg = f64::from_bits(bits);
-            let dec_bits = server.shared_position.telescope_dec.load(Ordering::Relaxed);
-            server
-                .shared_position
-                .snapshot_dec
-                .store(Some(f64::from_bits(dec_bits)), Ordering::Relaxed);
-            Json(AlpacaResponse::success(client_id, Some(ra_deg / 15.0))).into_response()
+            let pos = *server.shared_position.telescope_position.read().unwrap();
+            *server.shared_position.snapshot_position.write().unwrap() = Some(pos);
+            Json(AlpacaResponse::success(client_id, Some(pos.0 / 15.0))).into_response()
         }
         "declination" => {
-            let dec_deg = if let Some(snap_dec) =
-                server.shared_position.snapshot_dec.load(Ordering::Relaxed)
-            {
-                server
-                    .shared_position
-                    .snapshot_dec
-                    .store(None, Ordering::Relaxed);
-                snap_dec
-            } else {
-                f64::from_bits(server.shared_position.telescope_dec.load(Ordering::Relaxed))
-            };
-            Json(AlpacaResponse::success(client_id, Some(dec_deg))).into_response()
+            let snap = server
+                .shared_position
+                .snapshot_position
+                .write()
+                .unwrap()
+                .take();
+            let pos =
+                snap.unwrap_or_else(|| *server.shared_position.telescope_position.read().unwrap());
+            Json(AlpacaResponse::success(client_id, Some(pos.1))).into_response()
         }
         "targetrightascension" => {
             if let Some(ra_deg) = server.shared_position.target_ra.load(Ordering::Relaxed) {

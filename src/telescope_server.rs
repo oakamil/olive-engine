@@ -159,11 +159,10 @@ pub struct SharedPosition {
     pub is_slewing: AtomicBool,
 
     // For reporting back to the client
-    pub telescope_ra: AtomicU64,
-    pub telescope_dec: AtomicU64,
+    pub telescope_position: RwLock<(f64, f64)>,
 
-    // Snapshot of Dec taken when RA is read to prevent tearing during sequential reads
-    pub snapshot_dec: AtomicOptionF64,
+    // Snapshot of position taken when RA is read to prevent tearing during sequential reads
+    pub snapshot_position: RwLock<Option<(f64, f64)>>,
 }
 
 impl Default for SharedPosition {
@@ -176,9 +175,8 @@ impl Default for SharedPosition {
             site_longitude: AtomicOptionF64::new(None),
             target_op: AtomicTargetOp::new(None),
             is_slewing: AtomicBool::new(false),
-            telescope_ra: AtomicU64::new(0f64.to_bits()),
-            telescope_dec: AtomicU64::new(0f64.to_bits()),
-            snapshot_dec: AtomicOptionF64::new(None),
+            telescope_position: RwLock::new((0.0, 0.0)),
+            snapshot_position: RwLock::new(None),
         }
     }
 }
@@ -375,31 +373,23 @@ impl Lx200Controller {
     }
 
     fn get_ra(&self) -> String {
-        let (tel_ra, tel_dec) = (
-            f64::from_bits(self.shared_position.telescope_ra.load(Ordering::Relaxed)),
-            f64::from_bits(self.shared_position.telescope_dec.load(Ordering::Relaxed)),
-        );
-        self.shared_position
-            .snapshot_dec
-            .store(Some(tel_dec), Ordering::Relaxed);
-        let (ra, _) = self.convert_to_jnow(tel_ra, tel_dec);
+        let pos = *self.shared_position.telescope_position.read().unwrap();
+        *self.shared_position.snapshot_position.write().unwrap() = Some(pos);
+        let (ra, _) = self.convert_to_jnow(pos.0, pos.1);
         let (h, m, s) = Self::to_hms((ra / 15.0).rem_euclid(24.0));
         format!("{h:02}:{m:02}:{s:02}#")
     }
 
     fn get_dec(&self) -> String {
-        let tel_ra = f64::from_bits(self.shared_position.telescope_ra.load(Ordering::Relaxed));
-        let tel_dec =
-            if let Some(snap_dec) = self.shared_position.snapshot_dec.load(Ordering::Relaxed) {
-                self.shared_position
-                    .snapshot_dec
-                    .store(None, Ordering::Relaxed);
-                snap_dec
-            } else {
-                f64::from_bits(self.shared_position.telescope_dec.load(Ordering::Relaxed))
-            };
+        let snap = self
+            .shared_position
+            .snapshot_position
+            .write()
+            .unwrap()
+            .take();
+        let pos = snap.unwrap_or_else(|| *self.shared_position.telescope_position.read().unwrap());
         let dec = {
-            let (_, dec) = self.convert_to_jnow(tel_ra, tel_dec);
+            let (_, dec) = self.convert_to_jnow(pos.0, pos.1);
             dec
         };
 
@@ -1053,12 +1043,7 @@ mod tests {
         // Set position in a block to release the lock at the end
         {
             let locked_position = &position_arc;
-            locked_position
-                .telescope_ra
-                .store(ra_j2000.to_bits(), Ordering::Relaxed);
-            locked_position
-                .telescope_dec
-                .store(dec_j2000.to_bits(), Ordering::Relaxed);
+            *locked_position.telescope_position.write().unwrap() = (ra_j2000, dec_j2000);
         }
 
         let result_ra = controller.process_input(b":GR#");
@@ -1441,12 +1426,7 @@ mod tests {
         // Set position in a block to release the lock at the end
         {
             let locked_position = &position_arc;
-            locked_position
-                .telescope_ra
-                .store(0.0f64.to_bits(), Ordering::Relaxed);
-            locked_position
-                .telescope_dec
-                .store(0.0f64.to_bits(), Ordering::Relaxed);
+            *locked_position.telescope_position.write().unwrap() = (0.0, 0.0);
         }
 
         let (client, server) = tokio::io::duplex(1024);
@@ -1492,12 +1472,7 @@ mod tests {
         // Set position in a block to release the lock at the end
         {
             let locked_position = &position_arc;
-            locked_position
-                .telescope_ra
-                .store(internal_ra.to_bits(), Ordering::Relaxed);
-            locked_position
-                .telescope_dec
-                .store(internal_dec.to_bits(), Ordering::Relaxed);
+            *locked_position.telescope_position.write().unwrap() = (internal_ra, internal_dec);
         }
 
         // Ensure no precessing for telescope position
