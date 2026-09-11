@@ -419,7 +419,7 @@ impl Lx200Controller {
     }
 
     fn set_target_dec(&mut self, cmd: &str) -> String {
-        if cmd.len() < 11 {
+        if cmd.len() < 12 {
             warn!("Unexpected dec length, cmd: {}", cmd);
             return Self::get_failure();
         }
