@@ -52,7 +52,7 @@ pub(crate) fn precess_coordinates(
     let v_precessed = rot_matrix * v_initial;
 
     let precessed_ra = v_precessed.y.atan2(v_precessed.x).rem_euclid(TAU);
-    let precessed_dec = v_precessed.z.asin();
+    let precessed_dec = v_precessed.z.clamp(-1.0, 1.0).asin();
 
     (precessed_ra.to_degrees(), precessed_dec.to_degrees())
 }
@@ -376,7 +376,7 @@ impl Lx200Controller {
         let pos = *self.shared_position.telescope_position.read().unwrap();
         *self.shared_position.snapshot_position.write().unwrap() = Some(pos);
         let (ra, _) = self.convert_to_jnow(pos.0, pos.1);
-        let (h, m, s) = Self::to_hms((ra / 15.0).rem_euclid(24.0));
+        let (h, m, s) = Self::to_hms(ra / 15.0);
         format!("{h:02}:{m:02}:{s:02}#")
     }
 
@@ -393,14 +393,14 @@ impl Lx200Controller {
             dec
         };
 
-        let (h, m, s) = Self::to_hms(dec);
-        let sign = if dec < 0.0 && (h != 0 || m != 0 || s != 0) {
+        let (d, m, s) = Self::to_dms(dec);
+        let sign = if dec < 0.0 && (d != 0 || m != 0 || s != 0) {
             "-"
         } else {
             "+"
         };
 
-        format!("{sign}{:02}*{m:02}'{s:02}#", h.abs())
+        format!("{sign}{:02}*{m:02}'{s:02}#", d.abs())
     }
 
     fn set_target_ra(&mut self, cmd: &str) -> String {
@@ -611,28 +611,37 @@ impl Lx200Controller {
         }
     }
 
-    fn to_hms(n: f64) -> (i64, i64, i64) {
-        let n_abs = n.abs();
-        let mut hours = n_abs.trunc() as i64;
-        let h_rem = n_abs.fract() * 60.0;
-        let mut minutes = h_rem.trunc() as i64;
-        let m_rem = h_rem.fract() * 60.0;
-        let mut seconds = m_rem.round() as i64;
-        if seconds == 60 {
-            seconds = 0;
-            minutes += 1;
-            if minutes == 60 {
-                minutes = 0;
-                hours += 1;
+    /// Converts degrees into degrees, minutes, and seconds.
+    ///
+    /// Note: If `deg` is in `(-1.0, 0.0)`, the returned `d` is `0` (since `i64` cannot represent `-0`).
+    /// Callers formatting signed coordinates (like `get_dec`) should check `deg < 0.0` directly.
+    fn to_dms(deg: f64) -> (i64, i64, i64) {
+        let n_abs = deg.abs();
+        let mut d = n_abs.trunc() as i64;
+        let d_rem = n_abs.fract() * 60.0;
+        let mut m = d_rem.trunc() as i64;
+        let m_rem = d_rem.fract() * 60.0;
+        let mut s = m_rem.round() as i64;
+        if s == 60 {
+            s = 0;
+            m += 1;
+            if m == 60 {
+                m = 0;
+                d += 1;
             }
         }
-        if hours == 24 {
-            hours = 0;
+        if deg < 0.0 {
+            d = -d;
         }
-        if n < 0.0 {
-            hours = -hours;
+        (d, m, s)
+    }
+
+    fn to_hms(hours: f64) -> (i64, i64, i64) {
+        let (mut h, m, s) = Self::to_dms(hours.rem_euclid(24.0));
+        if h == 24 {
+            h = 0;
         }
-        (hours, minutes, seconds)
+        (h, m, s)
     }
 
     fn parse_coordinates(d: &str, m: &str, s: &str) -> Option<f64> {
@@ -642,7 +651,7 @@ impl Lx200Controller {
                 warn!("Error parsing degrees: {:?}", e);
                 return None;
             }
-            Ok(deg) => deg < 0,
+            Ok(deg) => deg < 0 || d.trim_start().starts_with('-'),
         };
         let minutes: Result<i32, _> = m.parse();
         match minutes {
@@ -737,7 +746,7 @@ impl Lx200Controller {
                     }
                     if chunk.len() >= 3 && &chunk[0..3] == SKY_SAFARI_INIT {
                         buf_reader.consume(3);
-                        debug!("Received 35092$");
+                        debug!("Received $$$");
                         continue;
                     }
                 }
@@ -773,7 +782,7 @@ impl Lx200Controller {
                         return;
                     }
                 } else if buffer == SKY_SAFARI_INIT {
-                    debug!("Received 35092$");
+                    debug!("Received $$$");
                     buffer.clear();
                 }
             }
@@ -982,10 +991,22 @@ mod tests {
     }
 
     #[test]
+    fn test_to_dms() {
+        assert_eq!(Lx200Controller::to_dms(0.0), (0, 0, 0));
+        assert_eq!(Lx200Controller::to_dms(1.5), (1, 30, 0));
+        assert_eq!(Lx200Controller::to_dms(-10.5083), (-10, 30, 30));
+        assert_eq!(Lx200Controller::to_dms(23.99972), (23, 59, 59));
+        // Ensure 24 degrees and -24 degrees are preserved and not wrapped to 0
+        assert_eq!(Lx200Controller::to_dms(24.0), (24, 0, 0));
+        assert_eq!(Lx200Controller::to_dms(24.5), (24, 30, 0));
+        assert_eq!(Lx200Controller::to_dms(-24.5), (-24, 30, 0));
+        assert_eq!(Lx200Controller::to_dms(89.99972), (89, 59, 59));
+    }
+
+    #[test]
     fn test_to_hms() {
         assert_eq!(Lx200Controller::to_hms(0.0), (0, 0, 0));
         assert_eq!(Lx200Controller::to_hms(1.5), (1, 30, 0));
-        assert_eq!(Lx200Controller::to_hms(-10.5083), (-10, 30, 30));
         assert_eq!(Lx200Controller::to_hms(23.99972), (23, 59, 59));
         // Floating point math is hard
         assert_eq!(Lx200Controller::to_hms(10.1), (10, 6, 0));
@@ -994,8 +1015,9 @@ mod tests {
         // Checking 2 possible values due to floating point imprecision
         let v = Lx200Controller::to_hms(23.999861);
         assert!(v == (23, 59, 59) || v == (0, 0, 0), "Incorrect: {:?}", v);
+        // Ensure 24 hours wraps to 0 hours
         assert_eq!(Lx200Controller::to_hms(23.999862), (0, 0, 0));
-        assert_eq!(Lx200Controller::to_hms(-23.999999), (0, 0, 0));
+        assert_eq!(Lx200Controller::to_hms(24.0), (0, 0, 0));
     }
 
     #[test]
@@ -1011,6 +1033,14 @@ mod tests {
         assert_approx_eq(
             Lx200Controller::parse_coordinates("-15", "30", "45").unwrap(),
             -15.5125,
+        );
+        assert_approx_eq(
+            Lx200Controller::parse_coordinates("-00", "30", "00").unwrap(),
+            -0.5,
+        );
+        assert_approx_eq(
+            Lx200Controller::parse_coordinates("+00", "30", "00").unwrap(),
+            0.5,
         );
         // Invalid
         assert_eq!(Lx200Controller::parse_coordinates("xx", "30", "00"), None);
@@ -1051,6 +1081,63 @@ mod tests {
 
         let result_dec = controller.process_input(b":GD#");
         assert_eq!(result_dec.as_deref(), Some("+30*30'00#"));
+    }
+
+    #[tokio::test]
+    async fn test_get_dec_24_degrees() {
+        let (mut controller, position_arc) = setup_controller().await;
+        controller.jnow_epoch = 2000.0;
+
+        // Verify that +24° and -24° declination are not wrapped to 0
+        {
+            let locked_position = &position_arc;
+            *locked_position.telescope_position.write().unwrap() = (0.0, 24.5);
+        }
+        assert_eq!(
+            controller.process_input(b":GD#").as_deref(),
+            Some("+24*30'00#")
+        );
+
+        {
+            let locked_position = &position_arc;
+            *locked_position.telescope_position.write().unwrap() = (0.0, -24.25);
+        }
+        assert_eq!(
+            controller.process_input(b":GD#").as_deref(),
+            Some("-24*15'00#")
+        );
+
+        // Verify that negative zero degrees (e.g. -0.5°) is formatted as -00*30'00#
+        {
+            let locked_position = &position_arc;
+            *locked_position.telescope_position.write().unwrap() = (0.0, -0.5);
+        }
+        assert_eq!(
+            controller.process_input(b":GD#").as_deref(),
+            Some("-00*30'00#")
+        );
+    }
+
+    #[test]
+    fn test_precess_coordinates_pole() {
+        let ts = Timescale::default();
+        // At exactly north celestial pole (dec = 90.0) and south celestial pole (dec = -90.0)
+        let (ra_north, dec_north) = precess_coordinates(0.0, 90.0, 2000.0, 2026.5, &ts);
+        assert!(!ra_north.is_nan());
+        assert!(!dec_north.is_nan());
+        assert!(dec_north <= 90.0 && dec_north > 89.0);
+
+        // Round-trip back to J2000
+        let (_, dec_north_back) = precess_coordinates(ra_north, dec_north, 2026.5, 2000.0, &ts);
+        assert_approx_eq(dec_north_back, 90.0);
+
+        let (ra_south, dec_south) = precess_coordinates(0.0, -90.0, 2000.0, 2026.5, &ts);
+        assert!(!ra_south.is_nan());
+        assert!(!dec_south.is_nan());
+        assert!(dec_south >= -90.0 && dec_south < -89.0);
+
+        let (_, dec_south_back) = precess_coordinates(ra_south, dec_south, 2026.5, 2000.0, &ts);
+        assert_approx_eq(dec_south_back, -90.0);
     }
 
     // --- Sync/Slew Flow Tests ---

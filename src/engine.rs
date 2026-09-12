@@ -333,7 +333,7 @@ fn calculate_alt_az(
 
     // Altitude
     let sin_alt = dec_rad.sin() * lat_rad.sin() + dec_rad.cos() * lat_rad.cos() * ha_rad.cos();
-    let alt_rad = sin_alt.asin();
+    let alt_rad = sin_alt.clamp(-1.0, 1.0).asin();
 
     // Azimuth
     let cos_az = (dec_rad.sin() - alt_rad.sin() * lat_rad.sin()) / (alt_rad.cos() * lat_rad.cos());
@@ -2135,6 +2135,25 @@ mod tests {
         let st = engine_state.read().unwrap();
         assert_eq!(st.solved_crop, Some(SolvedCrop::Failed));
         assert_eq!(st.centroids, 4);
+    }
+
+    #[test]
+    fn test_calculate_alt_az_zenith() {
+        let ts = starfield::time::Timescale::default();
+        let time = chrono::Utc::now();
+        let t = ts.from_datetime(time);
+        let gast_hours = t.gast();
+        let lon_deg = 0.0;
+        let lst_deg = (gast_hours * 15.0 + lon_deg).rem_euclid(360.0);
+
+        // Target right at zenith: RA = LST (ha = 0), Dec = Lat
+        let lat_deg = 45.0;
+        let dec_deg = 45.0;
+        let ra_deg = lst_deg;
+
+        let (alt, _) = calculate_alt_az(ra_deg, dec_deg, lat_deg, lon_deg, &time, &ts);
+        assert!(!alt.is_nan());
+        assert!((alt - 90.0).abs() < 1e-4);
     }
 }
 
