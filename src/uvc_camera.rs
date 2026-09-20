@@ -86,8 +86,6 @@ pub struct Camera {
     target_fps: u32,
     mjpeg_enabled: bool,
     target_res: Option<(u32, u32)>,
-    fd: Option<i32>,
-    descriptors: Option<Vec<u8>>,
 }
 
 impl CameraTrait for Camera {
@@ -114,8 +112,6 @@ impl CameraTrait for Camera {
         let target_fps = self.target_fps;
         let mjpeg_enabled = self.mjpeg_enabled;
         let target_res = self.target_res;
-        let fd = self.fd;
-        let descriptors = self.descriptors.clone();
 
         self.capture_thread = Some(thread::spawn(move || {
             Self::capture_loop(
@@ -129,8 +125,6 @@ impl CameraTrait for Camera {
                 target_fps,
                 mjpeg_enabled,
                 target_res,
-                fd,
-                descriptors,
                 stack_count_config,
             );
         }));
@@ -305,31 +299,10 @@ impl Camera {
         allow_stacking: bool,
         initial_gain: Option<f32>,
     ) -> Self {
-        Self::with_fd(
-            target_fps,
-            mjpeg_enabled,
-            target_res,
-            None,
-            None,
-            allow_stacking,
-            initial_gain,
-        )
-    }
-
-    pub fn with_fd(
-        target_fps: u32,
-        mjpeg_enabled: bool,
-        target_res: Option<(u32, u32)>,
-        fd: Option<i32>,
-        descriptors: Option<Vec<u8>>,
-        allow_stacking: bool,
-        initial_gain: Option<f32>,
-    ) -> Self {
         log::info!(
-            "Initializing UvcCamera with_fd: target_fps={}, mjpeg={}, fd={:?}, allow_stacking={}, initial_gain={:?}",
+            "Initializing UvcCamera: target_fps={}, mjpeg={}, allow_stacking={}, initial_gain={:?}",
             target_fps,
             mjpeg_enabled,
-            fd,
             allow_stacking,
             initial_gain
         );
@@ -359,8 +332,6 @@ impl Camera {
             target_fps,
             mjpeg_enabled,
             target_res,
-            fd,
-            descriptors,
         }
     }
 
@@ -385,8 +356,6 @@ impl Camera {
         target_fps: u32,
         mjpeg_enabled: bool,
         target_res: Option<(u32, u32)>,
-        fd: Option<i32>,
-        descriptors: Option<Vec<u8>>,
         stack_count_config: Arc<AtomicUsize>,
     ) {
         let ctx = match uvc::Context::new() {
@@ -400,47 +369,23 @@ impl Camera {
         };
 
         let mut _dev_keep_alive = None;
-        let devh = if let Some(fd) = fd {
-            if let Some(ref d) = descriptors {
-                match ctx.wrap_fd_with_descriptors(fd, d) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        log::error!("Failed to open UVC device with descriptors: {:?}", e);
-                        store.stopped.store(true, Ordering::Release);
-                        store.cvar.notify_all();
-                        return;
-                    }
-                }
-            } else {
-                match ctx.wrap_fd(fd) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        log::error!("Failed to open UVC device with FD: {:?}", e);
-                        store.stopped.store(true, Ordering::Release);
-                        store.cvar.notify_all();
-                        return;
-                    }
-                }
+        let dev = match ctx.find_device(None, None, None) {
+            Ok(d) => d,
+            Err(e) => {
+                log::error!("Failed to find UVC device: {:?}", e);
+                store.stopped.store(true, Ordering::Release);
+                store.cvar.notify_all();
+                return;
             }
-        } else {
-            let dev = match ctx.find_device(None, None, None) {
-                Ok(d) => d,
-                Err(e) => {
-                    log::error!("Failed to find UVC device: {:?}", e);
-                    store.stopped.store(true, Ordering::Release);
-                    store.cvar.notify_all();
-                    return;
-                }
-            };
-            _dev_keep_alive = Some(dev);
-            match _dev_keep_alive.as_ref().unwrap().open() {
-                Ok(d) => d,
-                Err(e) => {
-                    log::error!("Failed to open UVC device: {:?}", e);
-                    store.stopped.store(true, Ordering::Release);
-                    store.cvar.notify_all();
-                    return;
-                }
+        };
+        _dev_keep_alive = Some(dev);
+        let devh = match _dev_keep_alive.as_ref().unwrap().open() {
+            Ok(d) => d,
+            Err(e) => {
+                log::error!("Failed to open UVC device: {:?}", e);
+                store.stopped.store(true, Ordering::Release);
+                store.cvar.notify_all();
+                return;
             }
         };
 
