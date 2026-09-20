@@ -21,7 +21,7 @@ tetra3 = { path = "../olive-solve/tetra3" }
 nalgebra = "0.32"
 ndarray = "0.17"
 
-uvc = { git = "https://github.com/oakamil/libuvc-rs", features = ["vendor", "wrap_fd"] }
+uvc = { git = "https://github.com/oakamil/libuvc-rs", features = ["vendor"] }
 async-trait = "0.1"
 chrono = "0.4"
 memchr = "2.7"
