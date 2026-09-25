@@ -1257,6 +1257,8 @@ impl Engine {
                     self.target_pixel = Some((x, y));
                     self.save_target_pixel(self.target_pixel);
                     st.requested_align_target_pixel = None;
+                    st.target_pixel_x = Some(x);
+                    st.target_pixel_y = Some(y);
                     info!("Engine received align target pixel request: ({}, {})", x, y);
                 }
                 if st.requested_sync {
