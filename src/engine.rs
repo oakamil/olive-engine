@@ -133,6 +133,8 @@ pub struct EngineStateData {
     pub status: String,
     pub ra: Option<f64>,
     pub dec: Option<f64>,
+    pub center_ra: Option<f64>,
+    pub center_dec: Option<f64>,
     pub roll: Option<f64>,
     pub centroids: usize,
     pub target_ra: Option<f64>,
@@ -163,6 +165,10 @@ pub struct EngineStateData {
     pub is_imu_estimate: bool,
     pub strict_match: bool,
     pub solved_crop: Option<SolvedCrop>,
+    pub requested_sync: bool,
+    pub target_pixel_x: Option<f64>,
+    pub target_pixel_y: Option<f64>,
+    pub requested_sync_coords: Option<(f64, f64)>,
 }
 
 impl Default for EngineStateData {
@@ -171,6 +177,8 @@ impl Default for EngineStateData {
             status: "Idle".to_string(),
             ra: None,
             dec: None,
+            center_ra: None,
+            center_dec: None,
             roll: None,
             centroids: 0,
             target_ra: None,
@@ -201,6 +209,10 @@ impl Default for EngineStateData {
             is_imu_estimate: false,
             strict_match: false,
             solved_crop: None,
+            requested_sync: false,
+            target_pixel_x: None,
+            target_pixel_y: None,
+            requested_sync_coords: None,
         }
     }
 }
@@ -508,6 +520,14 @@ impl Engine {
             tokio::spawn(polling_task);
         }
 
+        let target_pixel = Self::load_target_pixel(storage.as_deref());
+        if let Some((tx, ty)) = target_pixel {
+            if let Ok(mut state) = engine_state.write() {
+                state.target_pixel_x = Some(tx);
+                state.target_pixel_y = Some(ty);
+            }
+        }
+
         Self {
             camera,
             config,
@@ -518,7 +538,7 @@ impl Engine {
             shared_position,
             target_ra: None,
             target_dec: None,
-            target_pixel: Self::load_target_pixel(storage.as_deref()),
+            target_pixel,
             storage,
             client_connected,
             engine_state,
@@ -607,6 +627,8 @@ impl Engine {
             state.fov = reported_fov;
             state.distortion = self.distortion;
             state.solved_crop = solved_crop;
+            state.target_pixel_x = self.target_pixel.map(|p| p.0);
+            state.target_pixel_y = self.target_pixel.map(|p| p.1);
         }
     }
 
@@ -1237,6 +1259,30 @@ impl Engine {
                     st.requested_align_target_pixel = None;
                     info!("Engine received align target pixel request: ({}, {})", x, y);
                 }
+                if st.requested_sync {
+                    st.requested_sync = false;
+                    let coords = st
+                        .requested_sync_coords
+                        .take()
+                        .or(self.target_ra.zip(self.target_dec));
+                    if let Some((s_ra, s_dec)) = coords {
+                        self.shared_position
+                            .target_ra
+                            .store(Some(s_ra), std::sync::atomic::Ordering::Relaxed);
+                        self.shared_position
+                            .target_dec
+                            .store(Some(s_dec), std::sync::atomic::Ordering::Relaxed);
+                        self.shared_position
+                            .target_op
+                            .store(Some(TargetOp::Sync), std::sync::atomic::Ordering::Relaxed);
+                        info!(
+                            "Engine received UI sync request for target RA={}, Dec={}",
+                            s_ra, s_dec
+                        );
+                    } else {
+                        warn!("Engine received UI sync request but no target is set!");
+                    }
+                }
             }
 
             // 2. Process External Client & State Flags (Alpaca/LX200)
@@ -1504,12 +1550,21 @@ impl Engine {
                         };
 
                         // Sync logic: update target_pixel based on the solver's coordinate mapping
+                        if let Ok(mut state) = self.engine_state.write() {
+                            state.center_ra = solution.ra;
+                            state.center_dec = solution.dec;
+                        }
+
                         if let Some((t_ra, t_dec)) = pending_sync {
                             // The solver found the pixel coordinates for our requested sync RA/Dec
                             if let (Some(tx), Some(ty)) = (&solution.target_x, &solution.target_y) {
                                 if let (Some(x), Some(y)) = (tx[0], ty[0]) {
                                     self.target_pixel = Some((x, y));
                                     self.save_target_pixel(self.target_pixel);
+                                    if let Ok(mut state) = self.engine_state.write() {
+                                        state.target_pixel_x = Some(x);
+                                        state.target_pixel_y = Some(y);
+                                    }
                                     info!(
                                         "Synced to target RA/Dec: ({}, {}). New target pixel: {:?}",
                                         t_ra, t_dec, self.target_pixel
