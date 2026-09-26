@@ -372,6 +372,7 @@ impl Engine {
                 std::path::Path::new(&config.database_path),
                 imu_type,
                 storage.clone(),
+                false, // disable accelerometer
             )
             .expect("Failed to initialize FusedSolver"),
         );
