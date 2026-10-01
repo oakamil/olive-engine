@@ -161,6 +161,7 @@ pub struct EngineStateData {
     pub requested_target_ra: Option<f64>,
     pub requested_target_dec: Option<f64>,
     pub requested_target_epoch: Option<f64>,
+    pub requested_target_clear: bool,
     pub requested_align_target_pixel: Option<(f64, f64)>,
     pub is_imu_estimate: bool,
     pub strict_match: bool,
@@ -205,6 +206,7 @@ impl Default for EngineStateData {
             requested_target_ra: None,
             requested_target_dec: None,
             requested_target_epoch: None,
+            requested_target_clear: false,
             requested_align_target_pixel: None,
             is_imu_estimate: false,
             strict_match: false,
@@ -1225,6 +1227,14 @@ impl Engine {
 
             // 1. Process Local UI Requests (JNI/Push-To GoTo & Pixel Align)
             if let Ok(mut st) = self.engine_state.write() {
+                if st.requested_target_clear {
+                    self.target_ra = None;
+                    self.target_dec = None;
+                    st.target_ra = None;
+                    st.target_dec = None;
+                    st.requested_target_clear = false;
+                }
+
                 if let (Some(ra), Some(dec)) = (st.requested_target_ra, st.requested_target_dec) {
                     let epoch = st.requested_target_epoch.unwrap_or(2000.0);
                     let (ra_j2000, dec_j2000) = if (epoch - 2000.0).abs() > 0.001 {
