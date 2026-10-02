@@ -417,7 +417,10 @@ fn run_camera(
                         height: actual_height,
                         timestamp: SystemTime::now(),
                         exposure_time_us: 0,
+                        gain: 1.0,
                         post_process_time: Duration::from_millis(0),
+                        frame_interval_us: 0,
+                        metadata_valid: true,
                     }));
                     store_clone.cvar.notify_all();
                 },

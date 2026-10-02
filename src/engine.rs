@@ -56,6 +56,7 @@ pub struct EngineConfig {
     pub crop: Option<(usize, usize)>,
     pub downsample: u8,
     pub auto_mode: bool,
+    pub is_adaptive_camera: bool,
     pub noise_filter: bool,
     pub initial_fov: Option<f32>,
     pub use_observer_location: bool,
@@ -76,6 +77,7 @@ impl Default for EngineConfig {
             crop: None,
             downsample: 0,
             auto_mode: true,
+            is_adaptive_camera: false,
             noise_filter: false,
             initial_fov: None,
             use_observer_location: true,
@@ -85,6 +87,8 @@ impl Default for EngineConfig {
 
 pub struct IntermediateResult {
     pub count: usize,
+    pub per_crop_centroid_counts: Vec<usize>,
+    pub gain: f32,
     pub exp_time: Duration,
     pub phys_exp_time: Duration,
     pub pp_time: Duration,
@@ -93,6 +97,8 @@ pub struct IntermediateResult {
     pub timestamp: SystemTime,
     pub stacked_frames: u32,
     pub background_level: Option<f32>,
+    pub frame_interval_us: i64,
+    pub metadata_valid: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default, clap::ValueEnum, Serialize, Deserialize)]
@@ -645,7 +651,11 @@ impl Engine {
         let clear_stacker_ext = self.clear_stacker.clone();
 
         let t1 = std::thread::spawn(move || {
-            let mut stacker = crate::stacker::Stacker::new(0, 0, config_ext.auto_mode);
+            let mut stacker = crate::stacker::Stacker::new(
+                0,
+                0,
+                config_ext.auto_mode && !config_ext.is_adaptive_camera,
+            );
             let mut extractor: Option<FastExtractor> = None;
             let mut last_processed_timestamp = None;
             let mut active_max_area = 150;
@@ -708,8 +718,11 @@ impl Engine {
                 }
 
                 let exposure_us = img_arc.exposure_time_us;
+                let img_gain = img_arc.gain;
                 let post_process_time = img_arc.post_process_time;
                 let img_timestamp = img_arc.timestamp;
+                let frame_interval_us = img_arc.frame_interval_us;
+                let metadata_valid = img_arc.metadata_valid;
 
                 let img_data = match Arc::try_unwrap(img_arc) {
                     Ok(img) => img.data,
@@ -784,6 +797,7 @@ impl Engine {
                 let centroids_batch;
                 let mut baseline_full_centroids = None;
                 let mut final_bg_level: Option<f32> = None;
+                let mut per_crop_centroid_counts = Vec::new();
 
                 let (state_sigma, state_fov) = {
                     let st = engine_state_ext.read().unwrap();
@@ -901,6 +915,11 @@ impl Engine {
 
                         let results = ext.extract_variants(&array_img, &variants);
                         final_bg_level = results.first().map(|r| r.background_level);
+                        if let Some(res) = results.first() {
+                            if let Some(vc) = &res.virtual_crop_centroids {
+                                per_crop_centroid_counts = vc.iter().map(|c| c.len()).collect();
+                            }
+                        }
 
                         let mut batch: Vec<(
                             Array2<f64>,
@@ -1085,6 +1104,8 @@ impl Engine {
 
                 let intermediate = IntermediateResult {
                     count: num_centroids,
+                    per_crop_centroid_counts,
+                    gain: img_gain,
                     exp_time: Duration::from_micros(virtual_exposure_us as u64),
                     phys_exp_time: Duration::from_micros(exposure_us as u64),
                     pp_time: post_process_time,
@@ -1093,6 +1114,8 @@ impl Engine {
                     timestamp: img_timestamp,
                     stacked_frames: stacker.stacked_frames,
                     background_level: final_bg_level,
+                    frame_interval_us,
+                    metadata_valid,
                 };
 
                 let (lock, cvar) = &*shared_res_ext;
@@ -1150,6 +1173,7 @@ impl Engine {
     /// when an explicit gain is provided in the configuration.
     fn auto_adjust_gain(&mut self, bg_level: f32) {
         if !self.config.auto_mode
+            || self.config.is_adaptive_camera
             || self.config.gain.is_some()
             || self.config.extractor_type == Extractor::Cedar
         {
@@ -1217,6 +1241,21 @@ impl Engine {
             Duration::ZERO,
             None,
         );
+        let mut adaptive_controller = if self.config.is_adaptive_camera && self.config.auto_mode {
+            let config = self.camera.get_config().unwrap_or_default();
+            let (min_gain, _, _) = self.camera.get_gain_range();
+            let phases = self.camera.get_calibration_phases();
+            let exp_range = self.camera.get_exposure_range();
+            Some(crate::auto_controller::AdaptiveController::new(
+                config.model,
+                phases,
+                exp_range,
+                min_gain,
+                self.storage.clone(),
+            ))
+        } else {
+            None
+        };
         let mut observer_location_set = false;
         let mut was_connected = false;
 
@@ -1376,6 +1415,11 @@ impl Engine {
                 if let Some(bg) = res.background_level {
                     self.auto_adjust_gain(bg);
                 }
+                let per_crop_centroid_counts = res.per_crop_centroid_counts.clone();
+                let actual_gain = res.gain;
+                let actual_exposure_us = res.phys_exp_time.as_micros() as i32;
+                let bg_level = res.background_level;
+
                 let count = res.count;
                 let exp_time = res.exp_time;
                 let pp_time = res.pp_time;
@@ -1383,6 +1427,8 @@ impl Engine {
                 let centroids_batch = res.centroids_batch;
                 let img_timestamp = res.timestamp;
                 let stacked_frames = res.stacked_frames;
+                let frame_interval_us = res.frame_interval_us;
+                let metadata_valid = res.metadata_valid;
                 let mut pending_sync = None;
 
                 // 3. Process Sync Request (Requires active frame)
@@ -1406,6 +1452,49 @@ impl Engine {
                     pending_sync = Some((sync_target_ra.unwrap(), sync_target_dec.unwrap()));
                 }
 
+                if let Some(ac) = adaptive_controller.as_mut() {
+                    let obs = crate::auto_controller::FrameObservation {
+                        actual_exposure_us,
+                        actual_gain,
+                        centroid_counts_per_crop: per_crop_centroid_counts.clone(),
+                        full_frame_centroids: count,
+                        background_level: bg_level.unwrap_or(0.0),
+                        solve_succeeded: false, // We haven't solved yet
+                        match_ratio: None,      // We haven't solved yet
+                        solve_ra: None,
+                        solve_dec: None,
+                        motion_state: self.fused_solver.get_motion_state(),
+                        frame_interval_us,
+                        metadata_valid,
+                    };
+
+                    if count < MIN_CENTROIDS {
+                        // For low star counts, we let the controller see the failure before we discard.
+                        let actions = ac.on_frame(&obs);
+                        for action in actions {
+                            match action {
+                                crate::auto_controller::ControllerAction::NoChange => {}
+                                crate::auto_controller::ControllerAction::SetExposure(e) => {
+                                    self.camera.set_exposure(e);
+                                }
+                                crate::auto_controller::ControllerAction::SetGain(g) => {
+                                    self.camera.set_gain(g);
+                                }
+                                crate::auto_controller::ControllerAction::SetHotPixelMode(m) => {
+                                    self.camera.set_hot_pixel_mode(m);
+                                }
+                                crate::auto_controller::ControllerAction::SetNoiseReduction(m) => {
+                                    self.camera.set_noise_reduction(m);
+                                }
+                                crate::auto_controller::ControllerAction::SetSigma(s) => {
+                                    if let Ok(mut st) = self.engine_state.write() {
+                                        st.current_sigma = Some(s);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 if count < MIN_CENTROIDS {
                     warn!(
                         "Discarding frame: {} centroids (< {} min). Telescope might be moving.",
@@ -1697,6 +1786,55 @@ impl Engine {
                 if solved {
                     self.clear_stacker
                         .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                if let Some(ac) = adaptive_controller.as_mut() {
+                    let mut match_ratio = None;
+                    if solved {
+                        let num_crop_centroids = sliced_batch[batch_solution.crop_index].0.nrows();
+                        match_ratio = Some(
+                            solution.matches.unwrap_or(0) as f32 / num_crop_centroids.max(1) as f32,
+                        );
+                    }
+
+                    let obs = crate::auto_controller::FrameObservation {
+                        actual_exposure_us,
+                        actual_gain,
+                        centroid_counts_per_crop: per_crop_centroid_counts.clone(),
+                        full_frame_centroids: count,
+                        background_level: bg_level.unwrap_or(0.0),
+                        solve_succeeded: solved,
+                        match_ratio,
+                        solve_ra: solution.ra,
+                        solve_dec: solution.dec,
+                        motion_state: self.fused_solver.get_motion_state(),
+                        frame_interval_us,
+                        metadata_valid,
+                    };
+
+                    let actions = ac.on_frame(&obs);
+                    for action in actions {
+                        match action {
+                            crate::auto_controller::ControllerAction::NoChange => {}
+                            crate::auto_controller::ControllerAction::SetExposure(e) => {
+                                self.camera.set_exposure(e);
+                            }
+                            crate::auto_controller::ControllerAction::SetGain(g) => {
+                                self.camera.set_gain(g);
+                            }
+                            crate::auto_controller::ControllerAction::SetHotPixelMode(m) => {
+                                self.camera.set_hot_pixel_mode(m);
+                            }
+                            crate::auto_controller::ControllerAction::SetNoiseReduction(m) => {
+                                self.camera.set_noise_reduction(m);
+                            }
+                            crate::auto_controller::ControllerAction::SetSigma(s) => {
+                                if let Ok(mut st) = self.engine_state.write() {
+                                    st.current_sigma = Some(s);
+                                }
+                            }
+                        }
+                    }
                 }
             } else {
                 std::thread::sleep(Duration::from_millis(100));
@@ -2038,6 +2176,7 @@ mod tests {
                 std::path::Path::new("../olive-solve/tetra3/tests/fixtures/default_database.npz"),
                 None,
                 None,
+                false,
             )
             .unwrap(),
         );
@@ -2139,6 +2278,7 @@ mod tests {
                 std::path::Path::new("../olive-solve/tetra3/tests/fixtures/default_database.npz"),
                 None,
                 None,
+                false,
             )
             .unwrap(),
         );

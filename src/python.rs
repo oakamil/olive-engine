@@ -52,6 +52,7 @@ fn start_engine(
         isp,
         bg_mode: bg_sub_mode,
         extractor_type: ext_type,
+        is_adaptive_camera: !uvc,
         ..Default::default()
     };
 

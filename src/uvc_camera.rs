@@ -758,7 +758,10 @@ impl Camera {
                         timestamp,
                         exposure_time_us: current_exposure_atomic_clone.load(Ordering::Relaxed)
                             * (target_stack.max(1) as i32),
+                        gain: 1.0,
                         post_process_time,
+                        frame_interval_us: 0,
+                        metadata_valid: true,
                     }));
                     store_clone.cvar.notify_all();
                 }

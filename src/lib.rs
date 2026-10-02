@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+pub mod auto_controller;
 #[cfg(not(target_os = "android"))]
 pub mod camera;
 pub mod control_server;
@@ -18,6 +19,56 @@ pub mod dummy_camera;
 pub mod telescope_server;
 pub mod uvc_camera;
 
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HardwarePhase {
+    pub gain: f32,
+    pub hot_pixel_mode: u8,
+    pub noise_reduction_mode: u8,
+}
+
+pub fn build_isp_phases(
+    analog: f32,
+    max_gain: f32,
+    hp_supported: bool,
+    nr_modes: &[u8],
+) -> Vec<HardwarePhase> {
+    let mut phases = Vec::new();
+    let nr_off = *nr_modes
+        .iter()
+        .find(|&&m| m == 0 || m == 3 || m == 1)
+        .unwrap_or(&0);
+
+    let mut add_tier = |hp: u8, nr: u8| {
+        phases.push(HardwarePhase {
+            gain: analog,
+            hot_pixel_mode: hp,
+            noise_reduction_mode: nr,
+        });
+        let digital = (analog * 1.5).min(max_gain);
+        if digital > analog {
+            phases.push(HardwarePhase {
+                gain: digital,
+                hot_pixel_mode: hp,
+                noise_reduction_mode: nr,
+            });
+        }
+    };
+
+    add_tier(0, nr_off);
+    if hp_supported {
+        add_tier(1, nr_off);
+        if nr_modes.contains(&1) {
+            add_tier(1, 1);
+        }
+    }
+
+    // Deduplicate consecutive identical phases (e.g. if max_gain == analog)
+    phases.dedup();
+    phases
+}
+
 #[derive(Clone, Debug)]
 pub struct Image {
     pub data: Vec<u8>,
@@ -25,10 +76,13 @@ pub struct Image {
     pub height: u32,
     pub timestamp: SystemTime,
     pub exposure_time_us: i32,
+    pub gain: f32,
     pub post_process_time: Duration,
+    pub frame_interval_us: i64,
+    pub metadata_valid: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct CameraConfig {
     pub model: String,
     pub width: u32,
@@ -39,6 +93,16 @@ pub struct CameraConfig {
 }
 
 pub trait CameraTrait: Send + Sync {
+    fn get_calibration_phases(&self) -> Vec<HardwarePhase> {
+        vec![HardwarePhase {
+            gain: self.get_gain_range().2,
+            hot_pixel_mode: 0,
+            noise_reduction_mode: 0,
+        }]
+    }
+    fn get_exposure_range(&self) -> Option<(i32, i32)> {
+        None
+    }
     fn get_config(&self) -> Option<CameraConfig>;
     fn start_capture(&mut self) -> Result<(), String>;
     fn stop_capture(&self) {}
@@ -57,6 +121,19 @@ pub trait CameraTrait: Send + Sync {
     }
     fn set_focus(&self, _distance: f32) {}
     fn set_noise_reduction(&self, _mode: u8) {}
+    fn get_noise_reduction(&self) -> u8 {
+        0
+    }
+    fn set_hot_pixel_mode(&self, _mode: u8) {}
+    fn get_hot_pixel_mode(&self) -> u8 {
+        0
+    }
+    fn supports_hot_pixel_mode(&self) -> bool {
+        false
+    }
+    fn supports_noise_reduction(&self) -> bool {
+        false
+    }
     fn get_brightness_range(&self) -> Option<(i32, i32, i32)> {
         None
     }

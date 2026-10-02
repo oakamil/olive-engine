@@ -100,6 +100,7 @@ async fn main() {
         extractor_type: args.extractor_type,
         downsample: if args.no_downsample { 0 } else { 1 },
         auto_mode: args.auto_mode,
+        is_adaptive_camera: !args.uvc,
         ..Default::default()
     };
 

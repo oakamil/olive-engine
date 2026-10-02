@@ -1,8 +1,6 @@
 // Required Notice: Copyright (c) 2026 Omair Kamil
 // See LICENSE file in root directory for license terms.
 
-use crate::{CameraConfig, CameraTrait, Image};
-
 #[cfg(target_os = "linux")]
 mod hardware {
     use super::*;
@@ -36,7 +34,7 @@ mod hardware {
 
     // Internal sensitivity bounds for the Pi Camera
     const MIN_EXPOSURE_US: i32 = 16_667;
-    const MAX_EXPOSURE_US: i32 = 1_000_000;
+    const MAX_EXPOSURE_US: i32 = 5_000_000;
 
     // --- Data Structures ---
 
@@ -340,6 +338,7 @@ mod hardware {
             config: &LibCameraConfiguration,
             buf_data: &[u8],
             exposure_time_us: i32,
+            actual_gain: f32,
             timestamp: SystemTime,
             receive_time: std::time::Instant,
         ) {
@@ -590,7 +589,10 @@ mod hardware {
                 height: config.height,
                 timestamp,
                 exposure_time_us,
+                gain: actual_gain,
                 post_process_time,
+                frame_interval_us: frame_interval_us as i64,
+                metadata_valid: true,
             }));
             store.cvar.notify_all();
         }
@@ -602,7 +604,7 @@ mod hardware {
             let _ = controls.set(AeEnable(false));
             let _ = controls.set(AnalogueGain(gain));
             let _ = controls.set(ExposureTime(exposure_us));
-            let _ = controls.set(FrameDurationLimits([16667, 1000000]));
+            let _ = controls.set(FrameDurationLimits([16667, 5100000]));
         }
 
         /// Queues a command to the capture thread.
@@ -1034,6 +1036,12 @@ mod hardware {
                     // Drain the channel to ensure we drop older backlog frames.
                     // Re-queue older frames with the absolute latest controls applied.
                     while let Ok(newer_req) = req_rx.try_recv() {
+                        if let Some(meta) = latest_req
+                            .metadata()
+                            .get::<libcamera::controls::SensorTimestamp>()
+                        {
+                            prev_sensor_ts = meta.0;
+                        }
                         latest_req.reuse(ReuseFlag::REUSE_BUFFERS);
                         Self::apply_controls(
                             latest_req.controls_mut(),
@@ -1066,11 +1074,27 @@ mod hardware {
                         .map(|e| e.0)
                         .unwrap_or(16667);
 
+                    // Extract actual gain, fallback to 1.0 if unavailable
+                    let actual_gain = meta
+                        .get::<libcamera::controls::AnalogueGain>()
+                        .map(|g| g.0)
+                        .unwrap_or(1.0);
+
                     // Extract hardware sensor timestamp (in nanoseconds since boot)
                     let sensor_timestamp_ns = meta
                         .get::<libcamera::controls::SensorTimestamp>()
                         .map(|t| t.0)
                         .unwrap_or(0);
+
+                    let frame_interval_us =
+                        if prev_sensor_ts > 0 && sensor_timestamp_ns > prev_sensor_ts {
+                            (sensor_timestamp_ns - prev_sensor_ts) / 1000
+                        } else {
+                            0
+                        };
+                    if sensor_timestamp_ns > 0 {
+                        prev_sensor_ts = sensor_timestamp_ns;
+                    }
 
                     let capture_sys_time = if sensor_timestamp_ns > 0 {
                         // Calculate pipeline delay using CLOCK_MONOTONIC
@@ -1108,6 +1132,7 @@ mod hardware {
                             &cam_config,
                             &mapped_buffer.data()[0],
                             exposure_time_us,
+                            actual_gain,
                             capture_sys_time,
                             receive_time,
                         );

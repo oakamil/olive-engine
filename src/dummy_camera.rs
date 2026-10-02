@@ -136,7 +136,10 @@ impl CameraTrait for DummyCamera {
             height: self.heights[idx],
             timestamp: SystemTime::now(),
             exposure_time_us: 100_000,
+            gain: 1.0,
             post_process_time: Duration::from_millis(0),
+            frame_interval_us: 0,
+            metadata_valid: true,
         }))
     }
 
@@ -148,7 +151,10 @@ impl CameraTrait for DummyCamera {
             height: self.heights[idx],
             timestamp: SystemTime::now(),
             exposure_time_us: 100_000,
+            gain: 1.0,
             post_process_time: Duration::from_millis(0),
+            frame_interval_us: 0,
+            metadata_valid: true,
         }))
     }
 
