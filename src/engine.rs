@@ -1412,7 +1412,16 @@ impl Engine {
                 info!("Client disconnected. Returning to calibration mode.");
                 return;
             }
-            self.update_status("Solving");
+
+            let status = if adaptive_controller
+                .as_ref()
+                .map_or(false, |ac| ac.is_calibrating())
+            {
+                "Calibrating"
+            } else {
+                "Solving"
+            };
+            self.update_status(status);
 
             if let Some(res) = self.wait_for_extraction() {
                 if let Some(bg) = res.background_level {
@@ -1504,6 +1513,7 @@ impl Engine {
                         count, MIN_CENTROIDS
                     );
                     if !self.config.auto_mode
+                        || self.config.is_adaptive_camera
                         || stacked_frames >= MAX_STACKED_FRAMES
                         || exp_time.as_micros() as u32 >= MAX_VIRTUAL_EXPOSURE_US
                     {
@@ -1543,14 +1553,17 @@ impl Engine {
                 let has_active_imu = self.fused_solver.get_motion_state().is_some();
                 solve_options.return_best_failed_match = has_active_imu;
 
+                let num_crops = centroids_batch.len();
+                let total_budget_ms = (exp_time.as_secs_f64() * 1000.0 * 0.90).max(150.0);
+                let crop_budget_ms = (total_budget_ms / (num_crops as f64).max(1.0)).max(15.0);
+                solve_options.solve_timeout_ms = Some(crop_budget_ms);
+
                 if let Some(fov) = self.fov {
                     let zoom = self.camera.get_zoom().unwrap_or(1.0) as f64;
                     // Mathematically project the Base FOV to the Zoomed FOV (rectilinear projection).
                     let fov_rad = fov.to_radians();
                     let zoomed_fov_rad = 2.0 * ((fov_rad / 2.0).tan() / zoom).atan();
 
-                    solve_options.solve_timeout_ms =
-                        Some((exp_time.as_secs_f64() * 1000.0 * 0.90).max(200.0));
                     solve_options.fov_estimate = Some(zoomed_fov_rad.to_degrees());
                     // Provide a proportional constraint (5%) for wide-angle distortion shifts, with a minimum 0.1 degree floor for telescopes
                     solve_options.fov_max_error =
@@ -1756,6 +1769,7 @@ impl Engine {
                     }
                     _ => {
                         if !self.config.auto_mode
+                            || self.config.is_adaptive_camera
                             || stacked_frames >= MAX_STACKED_FRAMES
                             || exp_time.as_micros() as u32 >= MAX_VIRTUAL_EXPOSURE_US
                         {

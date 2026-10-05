@@ -190,6 +190,13 @@ impl AdaptiveController {
 
         if !self.is_settled(obs) {
             self.unsettled += 1;
+            if self.unsettled % 5 == 1 {
+                log::info!(
+                    "Waiting for camera to settle at {}us (measured {}us)",
+                    self.exposure_us,
+                    self.measured_exposure_us(obs)
+                );
+            }
             if self.unsettled < UNSETTLED_LIMIT {
                 return vec![ControllerAction::NoChange];
             }
@@ -391,9 +398,19 @@ impl AdaptiveController {
         if obs.solve_succeeded {
             cal.solves += 1;
             cal.failures = 0;
+            log::info!(
+                "Calibration testing {}us: Solved ({} total)",
+                self.exposure_us,
+                cal.solves
+            );
         } else {
             cal.failures += 1;
             cal.solves = 0;
+            log::info!(
+                "Calibration testing {}us: Failed ({} total)",
+                self.exposure_us,
+                cal.failures
+            );
         }
 
         if cal.solves >= Self::required_solves(self.exposure_us) {
