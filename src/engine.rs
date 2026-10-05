@@ -142,6 +142,7 @@ pub struct EngineStateData {
     pub center_ra: Option<f64>,
     pub center_dec: Option<f64>,
     pub roll: Option<f64>,
+    pub is_mirrored: Option<bool>,
     pub centroids: usize,
     pub target_ra: Option<f64>,
     pub target_dec: Option<f64>,
@@ -187,6 +188,7 @@ impl Default for EngineStateData {
             center_ra: None,
             center_dec: None,
             roll: None,
+            is_mirrored: None,
             centroids: 0,
             target_ra: None,
             target_dec: None,
@@ -511,6 +513,7 @@ impl Engine {
                         state.ra = Some(ra);
                         state.dec = Some(dec);
                         state.roll = Some(eq_roll);
+                        state.is_mirrored = Some(pos.is_mirrored);
                         state.is_imu_estimate = pos.source == olive_solve::PositionSource::Imu;
 
                         state.offset_ra = offset_ra;

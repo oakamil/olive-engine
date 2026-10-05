@@ -616,6 +616,9 @@ impl Lx200Controller {
     /// Note: If `deg` is in `(-1.0, 0.0)`, the returned `d` is `0` (since `i64` cannot represent `-0`).
     /// Callers formatting signed coordinates (like `get_dec`) should check `deg < 0.0` directly.
     fn to_dms(deg: f64) -> (i64, i64, i64) {
+        if deg.is_nan() {
+            return (0, 0, 0);
+        }
         let n_abs = deg.abs();
         let mut d = n_abs.trunc() as i64;
         let d_rem = n_abs.fract() * 60.0;
