@@ -220,18 +220,29 @@ impl AdaptiveController {
     /// Exposure is measured from the sensor frame interval, the ground truth (HAL metadata
     /// can report a new value before it applies). The interval is the *previous* frame's
     /// duration, so a frame passes only after one full frame at the new settings.
-    /// 0.8× rejects the old frame after a step up; 1.2× + 50 ms rejects it after a step down
-    /// (the 50 ms covers readout and minimum frame time).
+    ///
+    /// Calculates the acceptable deviation for a delivered frame interval.
+    /// We use a 5% relative tolerance so that gentle 10% EMA tuning steps (0.9x / 1.1x)
+    /// correctly reject stale pipeline frames. However, because we measure `frame_interval_us`
+    /// rather than relying on potentially dishonest hardware metadata, we inherit OS scheduler
+    /// jitter (±2-5ms) and framerate floors (e.g., 33ms at 30fps). The 10ms absolute floor
+    /// protects very short exposures from continuously failing the settling check due to this jitter.
+    fn settling_tolerance_us(&self, target_us: i64) -> i64 {
+        (target_us * 5 / 100).max(10_000)
+    }
+
     fn is_settled(&self, obs: &FrameObservation) -> bool {
         let measured = self.measured_exposure_us(obs);
         let target = self.exposure_us as i64;
 
+        let tolerance = self.settling_tolerance_us(target);
+
         // Step up check (new frame must be longer)
-        if measured < (target * 8 / 10) {
+        if measured < target - tolerance {
             return false;
         }
         // Step down check (new frame must be shorter)
-        if measured > (target * 12 / 10) + 50_000 {
+        if measured > target + tolerance {
             return false;
         }
 
@@ -260,13 +271,15 @@ impl AdaptiveController {
         let measured = self.measured_exposure_us(obs) as i32;
         let target = self.exposure_us;
 
+        let tolerance = self.settling_tolerance_us(target as i64) as i32;
+
         let mut limit_learned = false;
 
-        if measured < (target * 8 / 10) {
+        if measured < target - tolerance {
             self.limits.exposure_max = measured;
             limit_learned = true;
             info!("Learned exposure_max = {} us", measured);
-        } else if measured > (target * 12 / 10) + 50_000 {
+        } else if measured > target + tolerance {
             self.limits.exposure_min = measured;
             limit_learned = true;
             info!("Learned exposure_min = {} us", measured);
