@@ -90,6 +90,7 @@ struct Tracking {
     ema_solve_rate: Option<f32>,
     frames_since_change: u32,
     failures: u32,
+    successes: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -540,6 +541,7 @@ impl AdaptiveController {
                 ema_solve_rate: None,
                 frames_since_change: 0,
                 failures: 0,
+                successes: 0,
             };
             return (InternalState::Tracking(trk), actions);
         }
@@ -569,6 +571,7 @@ impl AdaptiveController {
                     ema_solve_rate: None,
                     frames_since_change: 0,
                     failures: 0,
+                    successes: 0,
                 };
                 return (InternalState::Tracking(trk), actions);
             }
@@ -597,8 +600,10 @@ impl AdaptiveController {
 
         if obs.solve_succeeded {
             trk.failures = 0;
+            trk.successes += 1;
         } else {
             trk.failures += 1;
+            trk.successes = 0;
         }
 
         let outcome = if obs.solve_succeeded { 1.0 } else { 0.0 };
@@ -621,6 +626,8 @@ impl AdaptiveController {
             next_gain = (self.gain * RESTORE_STEP).min(self.base_gain);
         } else if trk.failures >= 2 {
             next_exp = (self.exposure_us as f32 * 1.5) as i32;
+        } else if self.exposure_us > 1_000_000 && trk.successes >= 2 {
+            next_exp = (self.exposure_us as f32 * DIM_STEP) as i32;
         } else if trk.frames_since_change >= 5 {
             if bg >= BG_DARK && bg <= BG_BRIGHT {
                 if rate > 0.90 {
@@ -653,6 +660,7 @@ impl AdaptiveController {
             trk.ema_solve_rate = None;
             trk.frames_since_change = 0;
             trk.failures = 0;
+            trk.successes = 0;
         } else {
             actions.push(ControllerAction::NoChange);
         }
