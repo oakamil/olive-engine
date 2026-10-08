@@ -1594,6 +1594,9 @@ impl Engine {
                 if !is_strict {
                     solve_options.match_max_error = 0.005;
                     solve_options.match_threshold = 1e-4;
+                    solve_options.match_radius = 0.005;
+                } else {
+                    solve_options.match_radius = 0.003;
                 }
 
                 // Set Zenith limits to automatically reject patterns containing stars below the horizon
