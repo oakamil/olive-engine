@@ -20,8 +20,6 @@ use tetra3::{
     solver::{SolveOptions, SolveStatus},
 };
 
-pub const MIN_CENTROIDS: usize = 4;
-
 const MULTIPLE_EXTRACTION_MIN_EXPOSURE_US: i32 = 100_000;
 const MULTIPLE_EXTRACTION_SIGMA: f32 = 2.6;
 const MULTIPLE_EXTRACTION_MIN_AREA: usize = 1;
@@ -1462,83 +1460,6 @@ impl Engine {
                     && sync_target_dec.is_some()
                 {
                     pending_sync = Some((sync_target_ra.unwrap(), sync_target_dec.unwrap()));
-                }
-
-                if let Some(ac) = adaptive_controller.as_mut() {
-                    let obs = crate::auto_controller::FrameObservation {
-                        actual_exposure_us,
-                        actual_gain,
-                        centroid_counts_per_crop: per_crop_centroid_counts.clone(),
-                        full_frame_centroids: count,
-                        background_level: bg_level.unwrap_or(0.0),
-                        solve_succeeded: false, // We haven't solved yet
-                        match_ratio: None,      // We haven't solved yet
-                        solve_ra: None,
-                        solve_dec: None,
-                        motion_state: self.fused_solver.get_motion_state(),
-                        frame_interval_us,
-                        metadata_valid,
-                    };
-
-                    if count < MIN_CENTROIDS {
-                        // For low star counts, we let the controller see the failure before we discard.
-                        let actions = ac.on_frame(&obs);
-                        for action in actions {
-                            match action {
-                                crate::auto_controller::ControllerAction::NoChange => {}
-                                crate::auto_controller::ControllerAction::SetExposure(e) => {
-                                    self.camera.set_exposure(e);
-                                }
-                                crate::auto_controller::ControllerAction::SetGain(g) => {
-                                    self.camera.set_gain(g);
-                                }
-                                crate::auto_controller::ControllerAction::SetHotPixelMode(m) => {
-                                    self.camera.set_hot_pixel_mode(m);
-                                }
-                                crate::auto_controller::ControllerAction::SetNoiseReduction(m) => {
-                                    self.camera.set_noise_reduction(m);
-                                }
-                                crate::auto_controller::ControllerAction::SetSigma(s) => {
-                                    if let Ok(mut st) = self.engine_state.write() {
-                                        st.current_sigma = Some(s);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if count < MIN_CENTROIDS {
-                    warn!(
-                        "Discarding frame: {} centroids (< {} min). Telescope might be moving.",
-                        count, MIN_CENTROIDS
-                    );
-                    if !self.config.auto_mode
-                        || self.config.is_adaptive_camera
-                        || stacked_frames >= MAX_STACKED_FRAMES
-                        || exp_time.as_micros() as u32 >= MAX_VIRTUAL_EXPOSURE_US
-                    {
-                        self.update_solve_stats(
-                            false,
-                            count,
-                            self.target_ra,
-                            self.target_dec,
-                            exp_time.as_micros() as i32,
-                            Duration::ZERO,
-                            extract_time,
-                            Duration::ZERO,
-                            Some(SolvedCrop::Failed),
-                        );
-                    } else {
-                        debug!(
-                            "Still stacking ({} / {} frames, {} / {} ms). Suppressing discard UI.",
-                            stacked_frames,
-                            MAX_STACKED_FRAMES,
-                            exp_time.as_millis(),
-                            MAX_VIRTUAL_EXPOSURE_US / 1000
-                        );
-                    }
-
-                    continue;
                 }
 
                 let mut solved = false;

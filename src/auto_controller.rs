@@ -55,6 +55,7 @@ fn is_moving(obs: &FrameObservation) -> bool {
 
 /// Frames to wait for a setting to apply before calling it a hardware limit.
 /// Deeper than any HAL pipeline we've seen (4–6 frames).
+const MIN_CENTROIDS: usize = 4;
 const UNSETTLED_LIMIT: u32 = 8;
 /// First exposure of each sweep phase.
 const SWEEP_START_US: i32 = 250_000;
@@ -184,8 +185,11 @@ impl AdaptiveController {
             return self.start();
         }
 
-        // Moving, or settings unknown: this frame tells us nothing.
-        if is_moving(obs) || !obs.metadata_valid {
+        let is_starless_tracking = matches!(self.internal_state, InternalState::Tracking(_))
+            && obs.full_frame_centroids < MIN_CENTROIDS;
+
+        // Moving, settings unknown, or starless (likely slewing/obstruction): this frame tells us nothing.
+        if is_moving(obs) || !obs.metadata_valid || is_starless_tracking {
             return vec![ControllerAction::NoChange];
         }
 
@@ -297,6 +301,10 @@ impl AdaptiveController {
         }
 
         if limit_learned {
+            // Ensure min <= max
+            self.limits.exposure_min = self.limits.exposure_min.min(self.limits.exposure_max);
+            self.limits.gain_min = self.limits.gain_min.min(self.limits.gain_max);
+
             // Re-clamp current commands
             self.exposure_us = self
                 .exposure_us
