@@ -21,7 +21,6 @@ tetra3 = { path = "../olive-solve/tetra3" }
 nalgebra = "0.32"
 ndarray = "0.17"
 
-uvc = { git = "https://github.com/oakamil/libuvc-rs", features = ["vendor"] }
 async-trait = "0.1"
 chrono = "0.4"
 memchr = "2.7"
@@ -35,7 +34,10 @@ tower = { version = "0.4", features = ["util"] }
 socket2 = "0.6.4"
 serde_json = "1.0.151"
 
-[target.'cfg(not(target_os = "android"))'.dependencies]
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+uvc = { git = "https://github.com/oakamil/libuvc-rs", features = ["vendor"] }
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 pyo3 = { version = "0.21.2" }
 env_logger = "0.11"
 

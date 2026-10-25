@@ -5,11 +5,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 pub mod auto_controller;
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub mod camera;
 pub mod control_server;
 pub mod engine;
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub mod python;
 pub mod stacker;
 
@@ -17,6 +17,7 @@ pub mod alpaca_server;
 pub mod dummy_camera;
 
 pub mod telescope_server;
+#[cfg(not(target_os = "ios"))]
 pub mod uvc_camera;
 
 use serde::{Deserialize, Serialize};

@@ -830,9 +830,7 @@ impl Engine {
                             1 => FastDownsample::None, // explicitly Off
                             _ => {
                                 // 0 = Auto
-                                if proc_width * proc_height > 2_000_000 {
-                                    FastDownsample::X4
-                                } else if proc_width * proc_height > 1_000_000 {
+                                if proc_width * proc_height > 1_250_000 {
                                     FastDownsample::X2
                                 } else {
                                     FastDownsample::None
@@ -1025,9 +1023,7 @@ impl Engine {
                                     2 => 2,
                                     1 => 1,
                                     _ => {
-                                        if crop_w * crop_h > 2_000_000 {
-                                            4
-                                        } else if crop_w * crop_h > 1_000_000 {
+                                        if crop_w * crop_h > 1_250_000 {
                                             2
                                         } else {
                                             1
@@ -1646,18 +1642,16 @@ impl Engine {
                             solve_time
                         );
 
-                        // Lock in the FOV after the first successful solve (if not provided by config)
-                        if self.fov.is_none() {
-                            if let Some(new_fov) = solution.fov {
-                                let zoom = self.camera.get_zoom().unwrap_or(1.0) as f64;
-                                // The solver returns the FOV of the zoomed (cropped) image.
-                                // We must reverse the rectilinear projection to find the camera's true 1.0x Base FOV.
-                                let solved_fov_rad = new_fov.to_radians();
-                                let base_fov_rad =
-                                    2.0 * ((solved_fov_rad / 2.0).tan() * zoom).atan();
-                                let base_fov = base_fov_rad.to_degrees();
+                        // Update base FOV from the solver's astrometric solution
+                        if let Some(new_fov) = solution.fov {
+                            let zoom = self.camera.get_zoom().unwrap_or(1.0) as f64;
+                            // The solver returns the FOV of the zoomed (cropped) image.
+                            // We must reverse the rectilinear projection to find the camera's true 1.0x Base FOV.
+                            let solved_fov_rad = new_fov.to_radians();
+                            let base_fov_rad = 2.0 * ((solved_fov_rad / 2.0).tan() * zoom).atan();
+                            let base_fov = base_fov_rad.to_degrees();
 
-                                self.fov = Some(base_fov);
+                            if self.fov.is_none() {
                                 log::info!(
                                     "Locked base FOV to {:.2}° (Solved {:.2}° at {:.2}x zoom)",
                                     base_fov,
@@ -1665,6 +1659,7 @@ impl Engine {
                                     zoom
                                 );
                             }
+                            self.fov = Some(base_fov);
                         }
 
                         // EMA update for distortion
@@ -2303,6 +2298,84 @@ mod tests {
         let (alt, _) = calculate_alt_az(ra_deg, dec_deg, lat_deg, lon_deg, &time, &ts);
         assert!(!alt.is_nan());
         assert!((alt - 90.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_fov_updated_from_solver() {
+        let camera = Arc::new(crate::dummy_camera::DummyCamera::new());
+        let engine_state = Arc::new(RwLock::new(EngineStateData::default()));
+        let shared_position = Arc::new(SharedPosition::default());
+        let timescale = Arc::new(starfield::time::Timescale::default());
+        let server = Lx200WifiTelescope::new(
+            shared_position.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            timescale.clone(),
+        );
+        let lx200_controller = server.get_controller();
+        let fused_solver = Arc::new(
+            olive_solve::FusedSolver::new(
+                std::path::Path::new("../olive-solve/tetra3/tests/fixtures/default_database.npz"),
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+
+        let initial_fov = 58.0;
+        let mut engine = Engine {
+            camera,
+            config: EngineConfig {
+                initial_fov: Some(initial_fov as f32),
+                ..EngineConfig::default()
+            },
+            last_gain_adjust: None,
+            fused_solver,
+            fov: Some(initial_fov),
+            distortion: None,
+            shared_position,
+            target_ra: None,
+            target_dec: None,
+            target_pixel: None,
+            storage: None,
+            client_connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            engine_state: engine_state.clone(),
+            solve_timestamps: std::collections::VecDeque::with_capacity(60),
+            shared_result: Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new())),
+            is_running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            clear_stacker: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            telescope_server_handle: None,
+            alpaca_server_handle: None,
+            rt_handle: None,
+            lx200_controller,
+            timescale,
+        };
+
+        // Before solve: fov is initial seed
+        assert_eq!(engine.fov, Some(58.0));
+
+        // Simulate solver match returning 65.5° FOV
+        let solution_fov: f64 = 65.5;
+        let zoom = engine.camera.get_zoom().unwrap_or(1.0) as f64;
+        let solved_fov_rad = solution_fov.to_radians();
+        let base_fov_rad = 2.0 * ((solved_fov_rad / 2.0).tan() * zoom).atan();
+        let base_fov = base_fov_rad.to_degrees();
+        engine.fov = Some(base_fov);
+
+        engine.update_solve_stats(
+            true,
+            30,
+            None,
+            None,
+            33000,
+            Duration::from_millis(5),
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+            Some(SolvedCrop::Full),
+        );
+
+        let st = engine_state.read().unwrap();
+        assert_eq!(st.fov, Some(65.5));
     }
 }
 
