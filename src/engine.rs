@@ -14,7 +14,7 @@ use tokio::sync::mpsc::Receiver;
 
 use crate::alpaca_server::AlpacaServer;
 use crate::telescope_server::{Lx200Telescope, Lx200WifiTelescope, SharedPosition, TargetOp};
-use crate::{CameraConfig, CameraTrait};
+use crate::{CameraConfig, CameraTrait, CameraType};
 use tetra3::{
     fast_extractor::{FastBgSubMode, FastDownsample, FastExtractOptions, FastExtractor},
     solver::{SolveOptions, SolveStatus},
@@ -577,17 +577,15 @@ impl Engine {
     }
 
     pub fn get_target_pixel_key(cam_config: Option<&CameraConfig>) -> String {
-        if let Some(cfg) = cam_config {
-            if cfg.model.contains("Demo") {
-                "target_pixel_demo".to_string()
-            } else if cfg.model.starts_with("Android_Cam_") {
-                let id = cfg.model.trim_start_matches("Android_Cam_");
-                format!("target_pixel_internal_{}", id)
-            } else {
-                format!("target_pixel_external_{}x{}", cfg.width, cfg.height)
-            }
-        } else {
-            "target_pixel_demo".to_string()
+        match cam_config {
+            Some(cfg) => match &cfg.camera_type {
+                CameraType::Demo => "target_pixel_demo".to_string(),
+                CameraType::Internal { id } => format!("target_pixel_internal_{}", id),
+                CameraType::External => {
+                    format!("target_pixel_external_{}x{}", cfg.width, cfg.height)
+                }
+            },
+            None => "target_pixel_demo".to_string(),
         }
     }
 
@@ -2449,6 +2447,7 @@ mod tests {
     #[test]
     fn test_target_pixel_keys() {
         let demo_cfg = CameraConfig {
+            camera_type: CameraType::Demo,
             model: "Demo Camera".to_string(),
             width: 1280,
             height: 720,
@@ -2462,6 +2461,9 @@ mod tests {
         );
 
         let internal_cfg = CameraConfig {
+            camera_type: CameraType::Internal {
+                id: "0".to_string(),
+            },
             model: "Android_Cam_0".to_string(),
             width: 4032,
             height: 3024,
@@ -2475,6 +2477,7 @@ mod tests {
         );
 
         let uvc_cfg = CameraConfig {
+            camera_type: CameraType::External,
             model: "External UVC".to_string(),
             width: 1920,
             height: 1080,

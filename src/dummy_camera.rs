@@ -1,4 +1,4 @@
-use crate::{CameraConfig, CameraTrait, Image};
+use crate::{CameraConfig, CameraTrait, CameraType, Image};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -73,6 +73,7 @@ impl DummyCamera {
 impl CameraTrait for DummyCamera {
     fn get_config(&self) -> Option<CameraConfig> {
         Some(CameraConfig {
+            camera_type: CameraType::Demo,
             model: "Demo Camera".to_string(),
             width: self.widths[0],
             height: self.heights[0],

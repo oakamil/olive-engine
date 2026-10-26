@@ -109,6 +109,9 @@ mod hardware {
     impl CameraTrait for Camera {
         fn get_config(&self) -> Option<CameraConfig> {
             self.config.lock().unwrap().as_ref().map(|c| CameraConfig {
+                camera_type: crate::CameraType::Internal {
+                    id: c.model.clone(),
+                },
                 model: c.model.clone(),
                 width: c.width,
                 height: c.height,

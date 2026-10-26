@@ -1,7 +1,7 @@
 // Required Notice: Copyright (c) 2026 Omair Kamil
 // See LICENSE file in root directory for license terms.
 
-use crate::{CameraConfig, CameraTrait, Image};
+use crate::{CameraConfig, CameraTrait, CameraType, Image};
 use log::{info, warn};
 use std::sync::{
     Arc, Condvar, Mutex,
@@ -577,6 +577,7 @@ impl Camera {
         {
             let mut lock = config_store.lock().unwrap();
             *lock = Some(CameraConfig {
+                camera_type: CameraType::External,
                 model: "UVC Camera".to_string(),
                 width: stream_format.width,
                 height: stream_format.height,

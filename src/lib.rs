@@ -83,8 +83,19 @@ pub struct Image {
     pub metadata_valid: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum CameraType {
+    #[default]
+    Demo,
+    Internal {
+        id: String,
+    },
+    External,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct CameraConfig {
+    pub camera_type: CameraType,
     pub model: String,
     pub width: u32,
     pub height: u32,
