@@ -12,9 +12,9 @@ use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::Receiver;
 
-use crate::CameraTrait;
 use crate::alpaca_server::AlpacaServer;
 use crate::telescope_server::{Lx200Telescope, Lx200WifiTelescope, SharedPosition, TargetOp};
+use crate::{CameraConfig, CameraTrait};
 use tetra3::{
     fast_extractor::{FastBgSubMode, FastDownsample, FastExtractOptions, FastExtractor},
     solver::{SolveOptions, SolveStatus},
@@ -132,6 +132,12 @@ pub enum SolvedCrop {
     FullHighSens,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum TargetPixelCommand {
+    Set(f64, f64),
+    Clear,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct EngineStateData {
     pub status: String,
@@ -167,7 +173,8 @@ pub struct EngineStateData {
     pub requested_target_dec: Option<f64>,
     pub requested_target_epoch: Option<f64>,
     pub requested_target_clear: bool,
-    pub requested_align_target_pixel: Option<(f64, f64)>,
+    #[serde(skip)]
+    pub pending_target_pixel_cmd: Option<TargetPixelCommand>,
     pub is_imu_estimate: bool,
     pub strict_match: bool,
     pub solved_crop: Option<SolvedCrop>,
@@ -213,7 +220,7 @@ impl Default for EngineStateData {
             requested_target_dec: None,
             requested_target_epoch: None,
             requested_target_clear: false,
-            requested_align_target_pixel: None,
+            pending_target_pixel_cmd: None,
             is_imu_estimate: false,
             strict_match: false,
             solved_crop: None,
@@ -311,6 +318,7 @@ pub struct Engine {
     target_ra: Option<f64>,
     target_dec: Option<f64>,
     target_pixel: Option<(f64, f64)>,
+    target_pixel_key: String,
     storage: Option<Arc<dyn olive_imu::storage::PersistentStorage>>,
     client_connected: Arc<std::sync::atomic::AtomicBool>,
     engine_state: Arc<RwLock<EngineStateData>>,
@@ -530,7 +538,10 @@ impl Engine {
             tokio::spawn(polling_task);
         }
 
-        let target_pixel = Self::load_target_pixel(storage.as_deref());
+        let cam_cfg = camera.get_config();
+        let target_pixel_key = Self::get_target_pixel_key(cam_cfg.as_ref());
+        let target_pixel =
+            Self::load_target_pixel(storage.as_deref(), &target_pixel_key, cam_cfg.as_ref());
         if let Some((tx, ty)) = target_pixel {
             if let Ok(mut state) = engine_state.write() {
                 state.target_pixel_x = Some(tx);
@@ -549,6 +560,7 @@ impl Engine {
             target_ra: None,
             target_dec: None,
             target_pixel,
+            target_pixel_key,
             storage,
             client_connected,
             engine_state,
@@ -564,25 +576,69 @@ impl Engine {
         }
     }
 
+    pub fn get_target_pixel_key(cam_config: Option<&CameraConfig>) -> String {
+        if let Some(cfg) = cam_config {
+            if cfg.model.contains("Demo") {
+                "target_pixel_demo".to_string()
+            } else if cfg.model.starts_with("Android_Cam_") {
+                let id = cfg.model.trim_start_matches("Android_Cam_");
+                format!("target_pixel_internal_{}", id)
+            } else {
+                format!("target_pixel_external_{}x{}", cfg.width, cfg.height)
+            }
+        } else {
+            "target_pixel_demo".to_string()
+        }
+    }
+
     fn load_target_pixel(
         storage: Option<&dyn olive_imu::storage::PersistentStorage>,
+        key: &str,
+        cam_config: Option<&CameraConfig>,
     ) -> Option<(f64, f64)> {
-        storage.and_then(|s| s.get("target_pixel")).and_then(|s| {
-            let parts: Vec<&str> = s.split(',').collect();
-            if parts.len() == 2 {
-                if let (Ok(x), Ok(y)) = (parts[0].trim().parse(), parts[1].trim().parse()) {
+        let s = storage?;
+        // 1. Try namespaced key
+        if let Some(val) = s.get(key) {
+            if let Some(pt) = Self::parse_pixel_coords(&val) {
+                return Some(pt);
+            }
+        }
+        // 2. Fall back to legacy "target_pixel" with bounds check
+        if let Some(legacy_val) = s.get("target_pixel") {
+            if let Some((x, y)) = Self::parse_pixel_coords(&legacy_val) {
+                let (max_w, max_h) = cam_config
+                    .map(|c| (c.width as f64, c.height as f64))
+                    .unwrap_or((f64::MAX, f64::MAX));
+                if x >= 0.0 && x <= max_w && y >= 0.0 && y <= max_h {
                     return Some((x, y));
+                } else {
+                    warn!(
+                        "Legacy target_pixel ({}, {}) out of bounds for {}x{}; ignoring",
+                        x, y, max_w, max_h
+                    );
                 }
             }
+        }
+        None
+    }
+
+    fn parse_pixel_coords(s: &str) -> Option<(f64, f64)> {
+        let mut parts = s.split(',');
+        let x = parts.next()?.trim().parse::<f64>().ok()?;
+        let y = parts.next()?.trim().parse::<f64>().ok()?;
+        if parts.next().is_none() {
+            Some((x, y))
+        } else {
             None
-        })
+        }
     }
 
     fn save_target_pixel(&self, pixel: Option<(f64, f64)>) {
         if let Some(storage) = &self.storage {
             if let Some((x, y)) = pixel {
-                storage.set("target_pixel", &format!("{},{}", x, y));
+                storage.set(&self.target_pixel_key, &format!("{},{}", x, y));
             } else {
+                storage.remove(&self.target_pixel_key);
                 storage.remove("target_pixel");
             }
         }
@@ -1300,13 +1356,22 @@ impl Engine {
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                     info!("Engine received UI target request: RA={}, Dec={}", ra, dec);
                 }
-                if let Some((x, y)) = st.requested_align_target_pixel {
-                    self.target_pixel = Some((x, y));
+                if let Some(cmd) = st.pending_target_pixel_cmd.take() {
+                    match cmd {
+                        TargetPixelCommand::Set(x, y) => {
+                            self.target_pixel = Some((x, y));
+                            st.target_pixel_x = Some(x);
+                            st.target_pixel_y = Some(y);
+                            info!("Engine received align target pixel request: ({}, {})", x, y);
+                        }
+                        TargetPixelCommand::Clear => {
+                            self.target_pixel = None;
+                            st.target_pixel_x = None;
+                            st.target_pixel_y = None;
+                            info!("Engine received clear target pixel request");
+                        }
+                    }
                     self.save_target_pixel(self.target_pixel);
-                    st.requested_align_target_pixel = None;
-                    st.target_pixel_x = Some(x);
-                    st.target_pixel_y = Some(y);
-                    info!("Engine received align target pixel request: ({}, {})", x, y);
                 }
                 if st.requested_sync {
                     st.requested_sync = false;
@@ -2128,6 +2193,7 @@ mod tests {
             target_ra: None,
             target_dec: None,
             target_pixel: None,
+            target_pixel_key: "target_pixel_demo".to_string(),
             storage: None,
             client_connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             engine_state: engine_state.clone(),
@@ -2230,6 +2296,7 @@ mod tests {
             target_ra: None,
             target_dec: None,
             target_pixel: None,
+            target_pixel_key: "target_pixel_demo".to_string(),
             storage: None,
             client_connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             engine_state: engine_state.clone(),
@@ -2337,6 +2404,7 @@ mod tests {
             target_ra: None,
             target_dec: None,
             target_pixel: None,
+            target_pixel_key: "target_pixel_demo".to_string(),
             storage: None,
             client_connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             engine_state: engine_state.clone(),
@@ -2376,6 +2444,61 @@ mod tests {
 
         let st = engine_state.read().unwrap();
         assert_eq!(st.fov, Some(65.5));
+    }
+
+    #[test]
+    fn test_target_pixel_keys() {
+        let demo_cfg = CameraConfig {
+            model: "Demo Camera".to_string(),
+            width: 1280,
+            height: 720,
+            fps: 30,
+            crop: None,
+            initial_fov: None,
+        };
+        assert_eq!(
+            Engine::get_target_pixel_key(Some(&demo_cfg)),
+            "target_pixel_demo"
+        );
+
+        let internal_cfg = CameraConfig {
+            model: "Android_Cam_0".to_string(),
+            width: 4032,
+            height: 3024,
+            fps: 2,
+            crop: None,
+            initial_fov: None,
+        };
+        assert_eq!(
+            Engine::get_target_pixel_key(Some(&internal_cfg)),
+            "target_pixel_internal_0"
+        );
+
+        let uvc_cfg = CameraConfig {
+            model: "External UVC".to_string(),
+            width: 1920,
+            height: 1080,
+            fps: 30,
+            crop: None,
+            initial_fov: None,
+        };
+        assert_eq!(
+            Engine::get_target_pixel_key(Some(&uvc_cfg)),
+            "target_pixel_external_1920x1080"
+        );
+
+        assert_eq!(Engine::get_target_pixel_key(None), "target_pixel_demo");
+    }
+
+    #[test]
+    fn test_parse_pixel_coords() {
+        assert_eq!(
+            Engine::parse_pixel_coords("123.45, 678.9"),
+            Some((123.45, 678.9))
+        );
+        assert_eq!(Engine::parse_pixel_coords("0,0"), Some((0.0, 0.0)));
+        assert_eq!(Engine::parse_pixel_coords("invalid"), None);
+        assert_eq!(Engine::parse_pixel_coords("1,2,3"), None);
     }
 }
 
