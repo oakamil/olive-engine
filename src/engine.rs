@@ -790,7 +790,9 @@ impl Engine {
             state.solve_rate_hz = solve_rate_hz;
             state.fov = reported_fov;
             state.distortion = self.distortion;
-            state.solved_crop = solved_crop;
+            if let Some(crop) = solved_crop {
+                state.solved_crop = Some(crop);
+            }
             state.target_pixel_x = self.target_pixel.map(|p| p.0);
             state.target_pixel_y = self.target_pixel.map(|p| p.1);
         }
@@ -1385,6 +1387,10 @@ impl Engine {
     pub fn run_solving_loop(&mut self) {
         info!("Entering solving loop...");
 
+        if let Ok(mut state) = self.engine_state.write() {
+            state.solved_crop = None;
+        }
+
         self.update_solve_stats(
             false,
             0,
@@ -1854,23 +1860,12 @@ impl Engine {
                         );
                     }
                     _ => {
-                        if !self.config.auto_mode
-                            || self.config.is_adaptive_camera
-                            || stacked_frames >= MAX_STACKED_FRAMES
-                            || exp_time.as_micros() as u32 >= MAX_VIRTUAL_EXPOSURE_US
-                        {
-                            self.update_solve_stats(
-                                false,
-                                count,
-                                self.target_ra,
-                                self.target_dec,
-                                exp_time.as_micros() as i32,
-                                pp_time,
-                                extract_time,
-                                solve_time,
-                                Some(SolvedCrop::Failed),
-                            );
-                        } else {
+                        let should_suppress_failure = self.config.auto_mode
+                            && !self.config.is_adaptive_camera
+                            && stacked_frames < MAX_STACKED_FRAMES
+                            && (exp_time.as_micros() as u32) < MAX_VIRTUAL_EXPOSURE_US;
+
+                        let solved_crop = if should_suppress_failure {
                             debug!(
                                 "Still stacking ({} / {} frames, {} / {} ms). Suppressing failure UI.",
                                 stacked_frames,
@@ -1878,7 +1873,23 @@ impl Engine {
                                 exp_time.as_millis(),
                                 MAX_VIRTUAL_EXPOSURE_US / 1000
                             );
-                        }
+                            None
+                        } else {
+                            Some(SolvedCrop::Failed)
+                        };
+
+                        self.update_solve_stats(
+                            false,
+                            count,
+                            self.target_ra,
+                            self.target_dec,
+                            exp_time.as_micros() as i32,
+                            pp_time,
+                            extract_time,
+                            solve_time,
+                            solved_crop,
+                        );
+
                         warn!(
                             "No Solution (Status: {:?}) | Centroids: {} | Exposure: {:?} | Post-Process: {:?} | Extract: {:?} | Solve: {:?}",
                             solution.status, count, exp_time, pp_time, extract_time, solve_time
