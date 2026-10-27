@@ -1,17 +1,22 @@
-// Required Notice: Copyright (c) 2026 Omair Kamil
-// See LICENSE file in root directory for license terms.
+// Copyright (c) 2026 Omair Kamil
+// See LICENSE.md in the repository root for license terms.
 
+/// Frame accumulator performing rolling pixel addition for exposure synthesis.
 pub struct Stacker {
+    /// Enables frame accumulation when `true`.
     pub enabled: bool,
     buffer: Vec<u16>,
     out_buffer: Vec<u8>,
+    /// Count of physical frames stacked into current accumulator buffer.
     pub stacked_frames: u32,
+    /// Effective synthesized virtual exposure in microseconds.
     pub virtual_exposure_us: u32,
     width: usize,
     height: usize,
 }
 
 impl Stacker {
+    /// Creates a new frame accumulator with dimensions `(width, height)`.
     pub fn new(width: usize, height: usize, enabled: bool) -> Self {
         let size = width * height;
         Self {
@@ -25,12 +30,14 @@ impl Stacker {
         }
     }
 
+    /// Clears the accumulator buffer and resets frame counters.
     pub fn reset(&mut self) {
         self.buffer.fill(0);
         self.stacked_frames = 0;
         self.virtual_exposure_us = 0;
     }
 
+    /// Re-allocates internal accumulation buffers if image dimensions change.
     pub fn resize_if_needed(&mut self, width: usize, height: usize) {
         if self.width != width || self.height != height {
             let size = width * height;
@@ -71,6 +78,7 @@ impl Stacker {
         }
     }
 
+    /// Adds a frame to the accumulator and returns the normalized rolling composite buffer.
     pub fn add_frame<'a>(&'a mut self, image: &'a [u8], exposure_us: u32) -> &'a [u8] {
         if !self.enabled {
             self.virtual_exposure_us = exposure_us;

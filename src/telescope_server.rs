@@ -1,5 +1,5 @@
-// Required Notice: Copyright (c) 2025 Omair Kamil
-// See LICENSE file in root directory for license terms.
+// Copyright (c) 2026 Omair Kamil
+// See LICENSE.md in the repository root for license terms.
 //
 // References for LX200 command set include:
 //    https://www.astro.louisville.edu/software/xmtel/archive/xmtel-indi-6.0/xmtel-6.0l/support/lx200/CommandSet.html
@@ -148,20 +148,28 @@ impl AtomicTargetOp {
     }
 }
 
+/// Atomic coordinates and synchronization commands shared between telescope servers and solving engine.
 #[derive(Debug)]
 pub struct SharedPosition {
+    /// Commanded target Right Ascension in degrees.
     pub target_ra: AtomicOptionF64,
+    /// Commanded target Declination in degrees.
     pub target_dec: AtomicOptionF64,
+    /// Observer site date/time in milliseconds since UNIX epoch.
     pub site_date_ms: AtomicOptionI64,
+    /// Observer site latitude in degrees [-90.0, +90.0].
     pub site_latitude: AtomicOptionF64,
+    /// Observer site longitude in degrees [-180.0, +180.0].
     pub site_longitude: AtomicOptionF64,
+    /// Pending telescope operation (`Sync`, `Slew`, `Abort`).
     pub target_op: AtomicTargetOp,
+    /// `true` while mount is actively executing a slew.
     pub is_slewing: AtomicBool,
 
-    // For reporting back to the client
+    /// Solved telescope coordinates `(ra, dec)` in degrees.
     pub telescope_position: RwLock<(f64, f64)>,
 
-    // Snapshot of position taken when RA is read to prevent tearing during sequential reads
+    /// Snapshot of position taken during RA read to prevent tearing during sequential reads.
     pub snapshot_position: RwLock<Option<(f64, f64)>>,
 }
 
@@ -181,11 +189,18 @@ impl Default for SharedPosition {
     }
 }
 
+/// Abstract Meade LX200 telescope server.
 #[async_trait]
 pub trait Lx200Telescope {
+    /// Listens for client connections and processes LX200 commands.
     async fn serve_requests(&mut self) -> Result<(), Box<dyn Error + 'static>>;
 }
 
+/// Meade LX200 Wi-Fi telescope server listening on TCP port 4030.
+///
+/// Implements bidirectional Meade LX200 protocol for planetarium clients
+/// (SkySafari, Stellarium+, INDI) to query coordinates, synchronize orientation,
+/// and execute slew commands.
 pub struct Lx200WifiTelescope {
     controller: Arc<RwLock<Lx200Controller>>,
     is_running: Arc<AtomicBool>,
@@ -225,10 +240,13 @@ impl Lx200WifiTelescope {
             debug!("WiFi LX200 connection closed");
         });
     }
+
+    /// Returns a reference to the shared LX200 controller.
     pub fn get_controller(&self) -> Arc<RwLock<Lx200Controller>> {
         self.controller.clone()
     }
 
+    /// Creates a new LX200 server instance.
     pub fn new(
         shared_position: Arc<SharedPosition>,
         is_running: Arc<AtomicBool>,
@@ -244,6 +262,7 @@ impl Lx200WifiTelescope {
     }
 }
 
+/// Protocol state machine and command parser for Meade LX200 communication.
 #[derive(Debug)]
 pub struct Lx200Controller {
     pub client_buffer: Vec<u8>,

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Omair Kamil
+// See LICENSE.md in the repository root for license terms.
+
 //! Adaptive exposure for cameras we fully control (Android Camera2, RPi).
 //! UVC cameras never create this; they use the auto-stacker.
 //!
@@ -23,29 +26,49 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+/// Hardware adjustment command emitted by the adaptive exposure controller.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ControllerAction {
+    /// Maintain current hardware settings.
     NoChange,
+    /// Set sensor exposure duration in microseconds.
     SetExposure(i32),
+    /// Set sensor analog gain multiplier.
     SetGain(f32),
+    /// Set hardware hot pixel suppression mode.
     SetHotPixelMode(u8),
+    /// Set hardware noise reduction mode.
     SetNoiseReduction(u8),
+    /// Set extraction noise sigma threshold.
     SetSigma(f32),
 }
 
+/// Optical feedback observation from a single captured video frame.
 #[derive(Clone, Debug, Default)]
 pub struct FrameObservation {
+    /// Sensor exposure duration in microseconds.
     pub actual_exposure_us: i32,
+    /// Sensor analog gain multiplier.
     pub actual_gain: f32,
+    /// Centroid counts per sub-crop region.
     pub centroid_counts_per_crop: Vec<usize>,
+    /// Total star centroids detected across full frame.
     pub full_frame_centroids: usize,
+    /// Mean background pixel value (0.0 to 255.0).
     pub background_level: f32,
+    /// `true` if astrometric plate solving succeeded on this frame.
     pub solve_succeeded: bool,
+    /// Ratio of matched catalog stars to extracted centroids.
     pub match_ratio: Option<f32>,
+    /// Solved Right Ascension in degrees.
     pub solve_ra: Option<f64>,
+    /// Solved Declination in degrees.
     pub solve_dec: Option<f64>,
+    /// IMU-detected motion classification.
     pub motion_state: Option<MotionState>,
+    /// Time delta from previous frame start in microseconds.
     pub frame_interval_us: i64,
+    /// `true` if frame metadata matches verified hardware registers.
     pub metadata_valid: bool,
 }
 
@@ -94,10 +117,14 @@ struct Tracking {
     successes: u32,
 }
 
+/// High-level lifecycle state of the adaptive exposure controller.
 #[derive(Clone, Debug)]
 pub enum State {
+    /// Controller initializing.
     Startup,
+    /// Sweeping hardware phases and exposures to find optimal sensitivity.
     Calibrating,
+    /// Real-time adaptive solve-rate maintenance.
     Tracking,
 }
 
@@ -116,16 +143,21 @@ struct Limits {
     gain_max: f32,
 }
 
-/// Same JSON keys as today's profiles (flattened), so existing files still load.
+/// Calibrated night exposure profile stored in persistent storage.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NightProfile {
+    /// Unique camera model or device identifier.
     pub camera_id: String,
+    /// Calibrated optimal exposure duration in microseconds.
     pub exposure_us: i32,
+    /// Optimal hardware sensor phase.
     #[serde(flatten)]
     pub phase: HardwarePhase,
+    /// Timestamp when profile was persisted.
     pub saved_at: SystemTime,
 }
 
+/// Autonomous exposure and gain controller optimizing star acquisition and tracking.
 pub struct AdaptiveController {
     internal_state: InternalState,
     phases: Vec<HardwarePhase>,
@@ -792,7 +824,7 @@ mod tests {
         assert!(matches!(ctrl.internal_state, InternalState::Calibrating(_)));
 
         // Let it start
-        for _ in 0..4 {
+        for _ in 0..6 {
             let (e, g, i) = cam.step();
             let acts = ctrl.on_frame(&make_obs(e, g, i, 50.0, 0));
             cam.apply_actions(&acts);
@@ -801,8 +833,8 @@ mod tests {
         // It failed twice at 250ms, so it stepped to 375ms.
         assert_eq!(cam.target_exp, 375_000);
 
-        // Next 3 frames are stale (still 250ms), should be NoChange and not counted as failures
-        for _ in 0..3 {
+        // Next 4 frames are stale (still 250ms), should be NoChange and not counted as failures
+        for _ in 0..4 {
             let (e, g, i) = cam.step();
             assert_eq!(e, 250_000);
             let acts = ctrl.on_frame(&make_obs(e, g, i, 50.0, 0));
@@ -810,8 +842,13 @@ mod tests {
         }
 
         // Now 375ms arrives
+        let (e, _, _) = cam.step();
+        assert_eq!(e, 375_000);
+        // The frame interval measures the previous frame's duration; step once more so interval is 375ms
         let (e, g, i) = cam.step();
         assert_eq!(e, 375_000);
+        assert_eq!(i, 375_000);
+
         // Step down test (T2): Force a reset back to 250ms by changing phase
         // We simulate this by manually setting the controller's target
         ctrl.exposure_us = 250_000;
@@ -824,7 +861,18 @@ mod tests {
         let mut ctrl = AdaptiveController::new("test".into(), default_phases(), None, 100.0, None);
         let mut cam = SimCamera::new(0, 1_000_000, 10_000.0, 100.0, 16_667); // cap at 1s
 
+        // Transition past startup
+        let acts = ctrl.on_frame(&make_obs(
+            SWEEP_START_US,
+            100.0,
+            SWEEP_START_US as i64,
+            50.0,
+            0,
+        ));
+        cam.apply_actions(&acts);
+
         ctrl.exposure_us = 1_500_000; // Ask for 1.5s
+        cam.target_exp = 1_500_000;
 
         for _ in 0..10 {
             let (e, g, i) = cam.step(); // Camera delivers 1.0s

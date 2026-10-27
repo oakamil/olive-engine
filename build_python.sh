@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright (c) 2026 Omair Kamil
+# See LICENSE.md in the repository root for license terms.
+
 set -e
 
 # Create and activate a virtual environment if not already in one

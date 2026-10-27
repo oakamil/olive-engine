@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Omair Kamil
+// See LICENSE.md in the repository root for license terms.
+
 use std::net::SocketAddr;
 use std::os::unix::io::FromRawFd;
 use std::sync::{
@@ -20,6 +23,11 @@ use crate::telescope_server::{SharedPosition, TargetOp};
 const ALPACA_PORT: u16 = 11111;
 const DISCOVERY_PORT: u16 = 32227;
 
+/// ASCOM Alpaca telescope driver server.
+///
+/// Implements:
+/// - ASCOM Alpaca Discovery Protocol on UDP port 32227.
+/// - ASCOM Alpaca Telescope v1 REST API on HTTP port 11111 (`/api/v1/telescope/0/...`).
 #[derive(Clone)]
 pub struct AlpacaServer {
     shared_position: Arc<SharedPosition>,
@@ -30,6 +38,7 @@ pub struct AlpacaServer {
 }
 
 impl AlpacaServer {
+    /// Creates a new ASCOM Alpaca server instance.
     pub fn new(
         shared_position: Arc<SharedPosition>,
         is_running: Arc<AtomicBool>,
@@ -44,6 +53,7 @@ impl AlpacaServer {
         }
     }
 
+    /// Spawns the UDP discovery listener and HTTP REST server.
     pub async fn serve_requests(&self) -> Result<(), Box<dyn std::error::Error + 'static>> {
         // Start Discovery Server
         let discovery_running = self.is_running.clone();

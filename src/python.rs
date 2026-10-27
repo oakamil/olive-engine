@@ -1,5 +1,5 @@
-// Required Notice: Copyright (c) 2026 Omair Kamil
-// See LICENSE file in root directory for license terms.
+// Copyright (c) 2026 Omair Kamil
+// See LICENSE.md in the repository root for license terms.
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -13,7 +13,50 @@ use crate::engine::{BgMode, Engine, EngineConfig, EngineStateData, Extractor};
 use crate::uvc_camera::Camera as UvcCamera;
 
 #[pyfunction]
-#[pyo3(signature = (isp=false, bg_mode="line".to_string(), extractor_type="approximate".to_string(), uvc=false, uvc_fps=None, uvc_mjpeg=false, gain=None, target_centroids=20, database_path=None, callback=None))]
+#[pyo3(
+    signature = (
+        isp=false,
+        bg_mode="line".to_string(),
+        extractor_type="approximate".to_string(),
+        uvc=false,
+        uvc_fps=None,
+        uvc_mjpeg=false,
+        gain=None,
+        target_centroids=20,
+        database_path=None,
+        callback=None
+    )
+)]
+/// Starts the Olive Engine plate-solving daemon and blocks until interrupted.
+///
+/// Spawns camera acquisition, the web diagnostic server (port 8080), LX200
+/// telescope server (port 4030), and ASCOM Alpaca services (port 11111).
+///
+/// Parameters
+/// ----------
+/// isp : bool, default=False
+///     Enable Raspberry Pi ISP hardware pipeline (libcamera backend only).
+/// bg_mode : {"line", "global", "block"}, default="line"
+///     Background subtraction method for star extraction.
+/// extractor_type : {"approximate", "fast", "cedar"}, default="approximate"
+///     Centroid extraction backend algorithm.
+/// uvc : bool, default=False
+///     Use USB UVC camera backend instead of libcamera.
+/// uvc_fps : int, optional
+///     Target framerate for UVC capture (default: 30).
+/// uvc_mjpeg : bool, default=False
+///     Request MJPEG stream format from UVC camera.
+/// gain : float, optional
+///     Manual analog gain override. Disables adaptive gain when set.
+/// target_centroids : int, default=20
+///     Target centroid count for auto-exposure regulation.
+/// database_path : str, optional
+///     Path to Tetra3 star catalog (`.npz`). Defaults to `~/data/default_database.npz`.
+/// callback : callable, optional
+///     Unary function invoked periodically with telemetry dict:
+///     `status`, `ra`, `dec`, `roll`, `exposure_us`, `post_process_ms`,
+///     `extract_ms`, `solve_ms`, `solve_rate_hz`, `centroids`,
+///     `target_ra`, `target_dec`.
 fn start_engine(
     py: Python,
     isp: bool,

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Omair Kamil
+// See LICENSE.md in the repository root for license terms.
+
 use clap::Parser;
 use ndarray::Array2;
 use olive_engine::CameraTrait;

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Omair Kamil
+// See LICENSE.md in the repository root for license terms.
+
 use crate::{CameraConfig, CameraTrait, CameraType, Image};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -6,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 const FRAME_DELAY_MS: u64 = 33;
 const FRAMES_PER_IMAGE: usize = 120;
 
+/// Synthetic camera driver playing back canned astronomical sky images.
 pub struct DummyCamera {
     images: Vec<Vec<u8>>,
     widths: Vec<u32>,
@@ -17,6 +21,7 @@ pub struct DummyCamera {
 }
 
 impl DummyCamera {
+    /// Creates a new synthetic dummy camera instance loaded with test fixtures.
     pub fn new() -> Self {
         let bytes_list: [&[u8]; 8] = [
             include_bytes!(

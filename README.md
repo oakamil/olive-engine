@@ -1,115 +1,189 @@
-# Olive Engine - Plate-Solving Engine in Rust
+# olive-engine
 
-A high performance astronomical plate-solving engine built on top of [`olive-solve`](https://github.com/oakamil/olive-solve).
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](LICENSE.md)
+[![Rust](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](Cargo.toml)
+
+High-performance astronomical plate-solving engine and telescope server daemon written in Rust with Python bindings. Built on top of [`olive-solve`](https://github.com/oakamil/olive-solve) and [`tetra3`](https://github.com/esa/tetra3).
+
+---
 
 ## Features
 
-* Core plate-solving engine that is optimized for speed
-* Implementation of the LX200 protocol for control through SkySafari (Plus/Pro) or Stellarium+ mobile applications
-* Optional ultra-fast camera pipeline option that uses the Raspberry Pi's ISP, enabling a solve rate of up to 60 Hz
-* Configurable extraction engine, integrating with both the `olive-solve` and `cedar-detect` extractors
+- **Real-Time Astrometry**: Up to 60 Hz attitude determination and celestial tracking.
+- **Telescope Protocol Servers**:
+  - **Meade LX200**: High-speed TCP server on port 4030 compatible with SkySafari (Plus/Pro), Stellarium+, and INDI.
+  - **ASCOM Alpaca**: Native HTTP REST API on port 11111 and UDP broadcast discovery on port 32227 compatible with N.I.N.A., Ekos/KStars, and SharpCap.
+- **Embedded Web Control & Diagnostics**: Lightweight web interface on port 8080 with real-time attitude telemetry (RA, Dec, Roll), solve rates, Half-Flux Radius (HFR) lens focus metric, and multipart MJPEG live camera stream.
+- **Dual Camera Backends**:
+  - **Raspberry Pi libcamera**: Hardware ISP debayering and downsampling for zero-copy high-throughput capture.
+  - **USB UVC Cameras**: Standard USB camera support with configurable framerate, MJPEG decoding, and multi-frame rolling exposure accumulation.
+- **Inertial Measurement Unit (IMU) Sensor Fusion**: Fused attitude tracking using Bosch BMI160 or CEVA/Hillcrest BNO085 sensors for dead-reckoning and instant re-acquisition during slews.
+- **Autonomous Adaptive Regulation**: Dynamic gain, exposure, and stacking controller that automatically adapts to changing sky brightness and cloud cover.
+- **Configurable Centroid Extractors**: Integration with `approximate`, `fast`, and `cedar-detect` extractors with multiple background subtraction modes (`line`, `global`, `block`).
+- **Python Bindings**: Native PyO3 extension (`olive_engine`) for seamless integration into custom Python astronomy pipelines.
+- **Hardware Tuning Utilities**: Dedicated companion binaries (`uvc_tuner` and `uvc_web_tuner`) for benchmarking and dialing in sensor exposure, gain, and gamma.
+
+---
+
+## Network Services
+
+`olive-engine` exposes the following network services:
+
+| Port | Protocol | Service | Compatible Clients / Usage |
+|---|---|---|---|
+| `8080` | HTTP | Web UI & MJPEG Stream | Web browser (lens focusing, manual controls, telemetry) |
+| `4030` | TCP | Meade LX200 Protocol | SkySafari Plus/Pro, Stellarium+, INDI |
+| `11111` | HTTP | ASCOM Alpaca API | N.I.N.A., Ekos, SharpCap, ASCOM Alpaca clients |
+| `32227` | UDP | ASCOM Discovery | Automated ASCOM Alpaca client discovery |
+
+---
 
 ## Getting Started
 
 ### Prerequisites
-* [Rust / Cargo](https://rustup.rs/)
-* Python 3
-* Maturin (for Python bindings)
+
+- [Rust & Cargo](https://rustup.rs/) (1.85+ recommended, 2024 edition)
+- Python 3.9+ & [Maturin](https://github.com/PyO3/maturin) (for Python extension)
+- Tetra3 star database file (default: `$HOME/data/default_database.npz`)
+- Linux / Raspberry Pi: `libcamera-dev` (if using Raspberry Pi camera)
+- macOS / Linux: `libuvc` (vendored automatically via Cargo)
 
 ### Building
-To build the Rust crate:
 
-```
+Build release binaries:
+```bash
 cargo build --release
 ```
 
-To build the Python wheel:
-
-```
+Build and install the Python wheel:
+```bash
 ./build_python.sh
 ```
 
-### Testing
+### Running Tests
 
 Run the test suite:
-
-```
+```bash
+# On Linux:
 cargo test --release
+
+# On macOS (framework path required for PyO3 dynamic linking):
+DYLD_FALLBACK_FRAMEWORK_PATH=/Applications/Xcode.app/Contents/Developer/Library/Frameworks cargo test --release
 ```
+
+---
 
 ## Usage
 
-### olive-engine
+### Running the Daemon
 
-The core plate-solving engine daemon. It controls the camera pipeline, extracts stars, and solves the astronomical plates.
-
-```Bash
+```bash
 cargo run --release -- --database-path ~/data/default_database.npz
 ```
-* `--min-exposure <MIN_EXPOSURE>`: (Optional) Minimum exposure time in microseconds. Default is 16670.
-* `--max-exposure <MAX_EXPOSURE>`: (Optional) Maximum exposure time in microseconds. Default is 1000000.
-* `--gain <GAIN>`: (Optional) Analog gain to apply to the camera.
-* `--target-centroids <TARGET_CENTROIDS>`: (Optional) Target number of centroids for auto-exposure. Default is 20.
-* `--database-path <DATABASE_PATH>`: (Optional) Path to the Tetra3 database NPZ file. Default is `$HOME/data/default_database.npz`.
-* `--isp`: (Optional) Enable ISP mode configuration for the ultra-fast camera pipeline.
-* `--uvc`: (Optional) Use UVC camera instead of libcamera.
-* `--bg-mode <BG_MODE>`: (Optional) Background subtraction mode for extraction (`line`, `global`, `block`). Default is `line`.
-* `--extractor-type <EXTRACTOR_TYPE>`: (Optional) Extractor type to use (`approximate`, `fast`, `cedar`). Default is `approximate`.
 
-### Web server
+### Command-Line Reference
 
-`olive-engine` runs a lightweight web server on port 8080. The server home page shows performance statistics. It also provides a live view of the camera feed that can be used to dial in the focus of the camera's lens. When the live view is active the plate-solving engine is paused.
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `--database-path <PATH>` | String | `$HOME/data/default_database.npz` | Path to Tetra3 star catalog (`.npz`) |
+| `--isp` | Flag | `false` | Enable Raspberry Pi ISP hardware pipeline (libcamera only) |
+| `--uvc` | Flag | `false` | Use UVC camera backend instead of libcamera |
+| `--uvc-fps <INT>` | Int | `30` | Target framerate for UVC camera |
+| `--uvc-mjpeg` | Flag | `false` | Enable MJPEG capture format for UVC |
+| `--gain <FLOAT>` | Float | Auto | Fixed analog gain override (disables AGC) |
+| `--target-centroids <INT>` | Int | `20` | Target star centroid count for auto-exposure |
+| `--bg-mode <MODE>` | Enum | `line` | Background subtraction mode (`line`, `global`, `block`) |
+| `--extractor-type <TYPE>` | Enum | `approximate` | Star extractor backend (`approximate`, `fast`, `cedar`) |
+| `--imu <TYPE>` | Enum | `none` | IMU sensor fusion backend (`none`, `bno085`, `bmi160`) |
+| `--no-downsample` | Flag | `false` | Disable automatic 2x2 image downsampling |
+| `--auto-mode <BOOL>` | Bool | `true` | Automated gain/exposure/stacking regulation |
 
-## Roadmap
+### Auxiliary Camera Tuning Tools
 
-Additional features are planned for this solving engine, including:
+`olive-engine` includes companion binaries for testing and tuning UVC USB cameras:
 
-1. Pre-built image for the Raspberry Pi platform
-2. Better UVC camera support (current implementation is a work in progress)
-3. IMU integration, initially targeting BNO085 and BMI160 sensors
-4. Bluetooth control
+- **CLI Tuner (`uvc_tuner`)**: Benchmarks camera control combinations (gamma, contrast, gain) against star detection rate:
+  ```bash
+  cargo run --release --bin uvc_tuner [-- --gain <GAIN>]
+  ```
+- **Web Tuner (`uvc_web_tuner`)**: Interactive browser-based UI for live-adjusting UVC camera controls and evaluating focus/detection:
+  ```bash
+  cargo run --release --bin uvc_web_tuner
+  ```
+
+---
+
+## Python Quickstart
+
+The Python extension module (`olive_engine`) exposes the core engine with real-time telemetry callbacks:
+
+```python
+import olive_engine
+
+def on_solve(telemetry):
+    if telemetry.get("ra") is not None:
+        print(
+            f"RA={telemetry['ra']:.3f}° Dec={telemetry['dec']:.3f}° "
+            f"Rate={telemetry.get('solve_rate_hz', 0.0):.1f}Hz "
+            f"HFR={telemetry.get('hfr', 0.0):.2f}px"
+        )
+
+# Start engine daemon (blocks until interrupted)
+olive_engine.start_engine(
+    isp=True,
+    target_centroids=25,
+    callback=on_solve
+)
+```
+
+---
+
+## Hardware Recommendations
+
+- **Single Board Computer**: Raspberry Pi Zero 2 W, Raspberry Pi 4B, or Raspberry Pi 5.
+- **Camera Sensor**: InnoMaker IMX462 or Arducam IMX462 (ultra-low-light sensitive sensor).
+- **Optics**: 25mm M12 lens (~12° × 7° field of view).
+- **Storage**: 32 GB or larger high-endurance microSD card.
+- **IMU Sensor (Optional)**: Adafruit BNO085 or Bosch BMI160 connected via I2C/SPI.
+- **Enclosure**: [3D-printed Cedar Zero Case v2](https://www.printables.com/model/1648425-cedar-zero-case-v2).
+
+---
 
 ## FAQ
 
-1\. Which extractor type and mode should I use?
+#### 1. Which extractor type and background mode should I use?
+- `cedar`: Maximum performance and speed, but its use is subject to [cedar-detect license restrictions](https://github.com/smroid/cedar-detect).
+- `approximate`: Recommended for resource-constrained platforms (e.g. Raspberry Pi Zero 2W).
+- `fast`: High-precision centroiding algorithm for challenging optical setups.
+- Background modes (`line`, `global`, `block`): `line` is the default and effectively mitigates rolling-shutter CMOS gradients. `global` is slightly faster. `block` applies local background modeling at higher CPU cost.
 
-`cedar` provides the fastest performance, but its use is [restricted](https://github.com/smroid/cedar-detect/blob/main/LICENSE.md). `approximate` sacrifices a bit of accuracy for performance, and is recommended on lower end hardware. `fast` utilizes a robust algorithm for finding centroids. The background subtraction modes apply to `approximate` and `fast`, with `block` being the slowest but applying semi-local background processing. `global` is generally slightly faster than `line`, but `line` can better deal with certain types of image artifacts.
+#### 2. What is ISP mode and why use it?
+ISP mode uses the Raspberry Pi's hardware Image Signal Processor to handle debayering and downsampling in silicon. This increases throughput from ~40 FPS to the sensor maximum of 60 FPS and reduces frame post-processing time to a single memory copy. Custom camera tuning JSON files for libcamera ISP mode are provided in `data/pisp/` and `data/vc4/`.
 
-2\. What's ISP mode and why should I use it?
+---
 
-ISP mode utilizes the Raspberry Pi's built-in image signal processor to perform debayering and downsampling of images. It has 2 benefits. The available frame rate increases from ~40fps to the typical sensor maximum of 60fps, and the post-processing time drops significantly since the resulting format requires a memory copy only.
+## Roadmap
 
-Note that ISP mode requires custom tuning files to turn off most image processing in the ISP.
+1. Pre-built Raspberry Pi OS disk images for turnkey setup.
+2. Bluetooth Low Energy (BLE) telescope protocol support.
+3. Expanded support for native motorized focuser drivers.
 
-3\. What hardware should I use?
+---
 
-The recommended hardware configuration is as follows:
+## License & Attribution
 
-* Raspberry Pi Zero 2W
-* Innomaker IMX462 color module
-* 25mm M12 lens
-* 32GB or larger microSD card
-* (Optional) Heat sinks
-* (Optional) [3D printed case](https://www.printables.com/model/1648425-cedar-zero-case-v2)
-
-4\. Can I use this engine in my own project?
-
-Yes! Part of the goal here is to provide a core engine that can be used in other projects. Rust and Python entry points are provided in order to make it easier to integrate the engine into other systems.
-
-There are some restrictions though:
-* The `cedar` extractor type uses `cedar-detect` which has a restricted license. Commercial projects that intend to use that path will need to negotiate a license with Clear Skies Astro.
-* The other extractor types and the core solver are subject to the licensing of the `olive-solve` project, which currently limits commercial use to small businesses.
-
-## License
-
-This project is licensed under the Apache License, Version 2.0.
-
-See LICENSE.md for full details.
+This project is licensed under the [GNU General Public License v3.0 or later (GPL-3.0-or-later)](LICENSE.md).
 
 ### Third-Party Licenses
 
-While `olive-engine` itself is licensed under the Apache License 2.0, it integrates with and depends on several external projects (including but not limited to `olive-solve` and `cedar-detect`). Each of these third-party projects is governed by its own respective licensing terms. Users are responsible for reviewing and complying with the individual licenses of any integrated components, tools, or dependencies.
+`olive-engine` integrates with and relies on several upstream projects:
+- [`olive-solve`](https://github.com/oakamil/olive-solve): Core astrometric plate solver.
+- [`tetra3`](https://github.com/esa/tetra3): Star identification algorithm developed by the European Space Agency (ESA).
+- [`cedar-detect`](https://github.com/smroid/cedar-detect): High-performance star extraction engine. Note that commercial use requires separate licensing from Clear Skies Astro.
+- [`starfield`](https://crates.io/crates/starfield): High-precision astronomical time and coordinate precession calculations.
+
+---
 
 ## Disclaimer
 
-All product names, trademarks and registered trademarks are property of their respective owners. All company, product and service names used in this website are for identification purposes only. Use of these names, trademarks and brands does not imply endorsement.
+All product names, trademarks, and registered trademarks are property of their respective owners. All company, product, and service names used in this project are for identification purposes only. Use of these names, trademarks, and brands does not imply endorsement.

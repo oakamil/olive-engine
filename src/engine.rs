@@ -1,5 +1,5 @@
-// Required Notice: Copyright (c) 2026 Omair Kamil
-// See LICENSE file in root directory for license terms.
+// Copyright (c) 2026 Omair Kamil
+// See LICENSE.md in the repository root for license terms.
 
 use std::sync::atomic::Ordering;
 use std::{
@@ -43,20 +43,34 @@ pub const VIRTUAL_CROP_LABELS: [SolvedCrop; 5] = [
     SolvedCrop::Bottom,
 ];
 
+/// Plate-solving engine configuration.
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
+    /// Fixed analog gain override. If `None`, automatic gain control (AGC) is used.
     pub gain: Option<f32>,
+    /// Target star centroid count for auto-exposure feedback.
     pub target_centroids: usize,
+    /// Filesystem path to the Tetra3 star catalog (`.npz`).
     pub database_path: String,
+    /// Enable Raspberry Pi ISP hardware pipeline mode (libcamera only).
     pub isp: bool,
+    /// Background estimation algorithm for star centroiding.
     pub bg_mode: BgMode,
+    /// Centroid extraction backend algorithm.
     pub extractor_type: Extractor,
+    /// Sub-window crop dimensions `(width, height)` in pixels.
     pub crop: Option<(usize, usize)>,
+    /// Downsampling factor applied before extraction (`0` disables).
     pub downsample: u8,
+    /// Enable automated runtime tuning (gain, exposure, stacking).
     pub auto_mode: bool,
+    /// `true` for cameras with native low-latency exposure AGC.
     pub is_adaptive_camera: bool,
+    /// Apply noise threshold filter during centroid detection.
     pub noise_filter: bool,
+    /// Initial field-of-view estimate in degrees to accelerate catalog lookup.
     pub initial_fov: Option<f32>,
+    /// Compute topocentric Alt/Az coordinates from client location.
     pub use_observer_location: bool,
 }
 
@@ -83,104 +97,185 @@ impl Default for EngineConfig {
     }
 }
 
+/// Intermediate frame processing and centroid extraction results.
 pub struct IntermediateResult {
+    /// Total star centroids extracted from frame.
     pub count: usize,
+    /// Star centroid count per virtual sub-crop.
     pub per_crop_centroid_counts: Vec<usize>,
+    /// Sensor gain multiplier applied during acquisition.
     pub gain: f32,
+    /// Virtual exposure duration in milliseconds or seconds.
     pub exp_time: Duration,
+    /// Physical sensor exposure duration.
     pub phys_exp_time: Duration,
+    /// Time spent in debayering and pre-processing.
     pub pp_time: Duration,
+    /// Time spent in centroid extraction.
     pub extract_time: Duration,
+    /// Extracted centroid coordinates and crop metadata.
     pub centroids_batch: Vec<(Array2<f64>, Option<tetra3::extractor::Crop>, SolvedCrop)>,
+    /// Acquisition host timestamp.
     pub timestamp: SystemTime,
+    /// Number of stacked physical frames contributing to this result.
     pub stacked_frames: u32,
+    /// Measured background light level (0.0 to 255.0).
     pub background_level: Option<f32>,
+    /// Time delta from previous frame start in microseconds.
     pub frame_interval_us: i64,
+    /// `true` if frame metadata matches verified hardware registers.
     pub metadata_valid: bool,
 }
 
+/// Star centroid extractor algorithm backend.
 #[derive(Clone, Debug, PartialEq, Eq, Default, clap::ValueEnum, Serialize, Deserialize)]
 pub enum Extractor {
+    /// Fast heuristic centroid extraction optimized for embedded CPUs.
     #[default]
     Approximate,
+    /// Robust, full-precision centroid extractor.
     Fast,
+    /// Cedar-detect extraction engine for maximum throughput.
     Cedar,
 }
 
+/// Background estimation and subtraction mode.
 #[derive(Clone, Debug, PartialEq, Eq, Default, clap::ValueEnum, Serialize, Deserialize)]
 pub enum BgMode {
+    /// Line-by-line background subtraction.
     #[default]
     Line,
+    /// Global frame-wide median subtraction.
     Global,
+    /// Block-based local background estimation.
     Block,
 }
 
+/// Region of interest that produced an astrometric solution.
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub enum SolvedCrop {
+    /// Center sub-crop.
     Center,
+    /// Top sub-crop.
     Top,
+    /// Left sub-crop.
     Left,
+    /// Right sub-crop.
     Right,
+    /// Bottom sub-crop.
     Bottom,
+    /// Full uncropped sensor frame.
     Full,
+    /// Astrometric solution failed across all crops.
     Failed,
+    /// Center sub-crop at high sensitivity.
     CenterHighSens,
+    /// Top sub-crop at high sensitivity.
     TopHighSens,
+    /// Left sub-crop at high sensitivity.
     LeftHighSens,
+    /// Right sub-crop at high sensitivity.
     RightHighSens,
+    /// Bottom sub-crop at high sensitivity.
     BottomHighSens,
+    /// Full frame at high sensitivity.
     FullHighSens,
 }
 
+/// Target pixel alignment command.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum TargetPixelCommand {
+    /// Set target pixel coordinates `(x, y)`.
     Set(f64, f64),
+    /// Clear active target pixel.
     Clear,
 }
 
+/// Real-time engine telemetry, astrometric coordinates, and server state.
 #[derive(Clone, Debug, Serialize)]
 pub struct EngineStateData {
+    /// Operating state message (e.g. `"Solving"`, `"Camera Mode"`, `"Idle"`).
     pub status: String,
+    /// Boresight Right Ascension in degrees [0.0, 360.0), topocentric epoch.
     pub ra: Option<f64>,
+    /// Boresight Declination in degrees [-90.0, +90.0], topocentric epoch.
     pub dec: Option<f64>,
+    /// Center RA in degrees before pixel-offset translation.
     pub center_ra: Option<f64>,
+    /// Center Declination in degrees before pixel-offset translation.
     pub center_dec: Option<f64>,
+    /// Equatorial roll / position angle in degrees.
     pub roll: Option<f64>,
+    /// `true` if image orientation is optically mirrored.
     pub is_mirrored: Option<bool>,
+    /// Star centroid count detected in the last analyzed frame.
     pub centroids: usize,
+    /// Active target Right Ascension in degrees.
     pub target_ra: Option<f64>,
+    /// Active target Declination in degrees.
     pub target_dec: Option<f64>,
+    /// Active sensor exposure duration in microseconds.
     pub exposure_us: i32,
+    /// Image pre-processing latency in milliseconds.
     pub post_process_ms: f64,
+    /// Centroid extraction latency in milliseconds.
     pub extract_ms: f64,
+    /// Catalog matching and attitude determination latency in milliseconds.
     pub solve_ms: f64,
+    /// Rolling 5-second solve throughput in Hertz.
     pub solve_rate_hz: f64,
+    /// Flag indicating an image capture snapshot was requested.
     pub capture_requested: bool,
+    /// `true` when plate solving is paused (e.g. during live camera view).
     pub paused: bool,
+    /// Half Flux Radius focus metric in pixels (lower indicates sharper focus).
     pub hfr: f64, // Added focus metric
+    /// Observer site latitude in degrees [-90.0, +90.0].
     pub client_latitude: Option<f64>,
+    /// Observer site longitude in degrees [-180.0, +180.0].
     pub client_longitude: Option<f64>,
+    /// Observer UTC date and time.
     pub client_date: Option<chrono::DateTime<chrono::Utc>>,
+    /// Target angular offset in RA in arcseconds or degrees.
     pub offset_ra: Option<f64>,
+    /// Target angular offset in Declination in arcseconds or degrees.
     pub offset_dec: Option<f64>,
+    /// Target angular offset in Azimuth in degrees.
     pub offset_az: Option<f64>,
+    /// Target angular offset in Altitude in degrees.
     pub offset_alt: Option<f64>,
+    /// Total angular separation to target in degrees.
     pub offset_angle: Option<f64>,
+    /// Adaptive noise sigma threshold.
     pub current_sigma: Option<f32>,
+    /// Estimated horizontal field-of-view in degrees.
     pub fov: Option<f64>,
+    /// Optical distortion coefficient.
     pub distortion: Option<f64>,
+    /// Commanded target RA from client in degrees.
     pub requested_target_ra: Option<f64>,
+    /// Commanded target Declination from client in degrees.
     pub requested_target_dec: Option<f64>,
+    /// Commanded target epoch (e.g. J2000 or current year).
     pub requested_target_epoch: Option<f64>,
+    /// Flag requesting active target coordinates be cleared.
     pub requested_target_clear: bool,
+    /// Pending target pixel alignment command.
     #[serde(skip)]
     pub pending_target_pixel_cmd: Option<TargetPixelCommand>,
+    /// `true` if current orientation is dead-reckoned via IMU sensor fusion.
     pub is_imu_estimate: bool,
+    /// Require strict match threshold for catalog verification.
     pub strict_match: bool,
+    /// Sub-crop region that produced the active astrometric solution.
     pub solved_crop: Option<SolvedCrop>,
+    /// Flag requesting telescope position synchronization.
     pub requested_sync: bool,
+    /// Target pixel X coordinate on camera sensor.
     pub target_pixel_x: Option<f64>,
+    /// Target pixel Y coordinate on camera sensor.
     pub target_pixel_y: Option<f64>,
+    /// Commanded synchronization coordinates `(ra, dec)` in degrees.
     pub requested_sync_coords: Option<(f64, f64)>,
 }
 
@@ -300,6 +395,7 @@ pub fn evaluate_virtual_crops(
     }
 }
 
+/// Celestial plate-solving engine coordinating frame acquisition, attitude estimation, and servers.
 #[allow(dead_code)]
 pub struct Engine {
     camera: Arc<dyn CameraTrait>,
@@ -372,6 +468,9 @@ fn calculate_alt_az(
 }
 
 impl Engine {
+    /// Initializes the plate-solving engine, background network servers, and IMU solver.
+    ///
+    /// Spawns the Meade LX200 server (TCP 4030) and ASCOM Alpaca server (HTTP 11111 / UDP 32227).
     pub async fn new(
         camera: Arc<dyn CameraTrait>,
         config: EngineConfig,
@@ -576,6 +675,7 @@ impl Engine {
         }
     }
 
+    /// Returns the cache key used for storing sensor target pixel calibration.
     pub fn get_target_pixel_key(cam_config: Option<&CameraConfig>) -> String {
         match cam_config {
             Some(cfg) => match &cfg.camera_type {
@@ -696,6 +796,10 @@ impl Engine {
         }
     }
 
+    /// Spawns the image extraction pipeline thread and plate-solving worker thread.
+    ///
+    /// Returns join handles for the extraction and solving threads. Both threads
+    /// run continuously until [`Self::is_running`] is signaled `false`.
     pub fn start(self) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
         let camera_ext = self.camera.clone();
         let config_ext = self.config.clone();

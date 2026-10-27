@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Omair Kamil
+// See LICENSE.md in the repository root for license terms.
+
 use axum::{
     Json, Router,
     body::Body,

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Omair Kamil
+// See LICENSE.md in the repository root for license terms.
+
 use axum::{
     Json, Router,
     body::Body,
@@ -17,19 +20,29 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::CameraTrait;
 use std::sync::RwLock;
 
+/// Shared state for the HTTP control and diagnostics web server.
 pub struct ServerState {
+    /// Active camera driver.
     pub camera: Arc<dyn CameraTrait>,
+    /// Concurrency limiter restricting video streaming to 1 client.
     pub semaphore: Arc<Semaphore>,
+    /// Flag set to `true` while a client is actively streaming video.
     pub client_connected: Arc<AtomicBool>,
+    /// Shared plate-solving engine telemetry and coordinates.
     pub engine_state: Arc<RwLock<crate::engine::EngineStateData>>,
 }
 
+/// Camera exposure and analog gain settings payload for REST API.
 #[derive(Serialize, Deserialize)]
 pub struct ControlsData {
+    /// Sensor analog gain multiplier.
     pub gain: f32,
+    /// Exposure duration in milliseconds.
     pub exposure_ms: f32,
+    /// Minimum supported gain multiplier.
     #[serde(default)]
     pub min_gain: f32,
+    /// Maximum supported gain multiplier.
     #[serde(default)]
     pub max_gain: f32,
 }
@@ -400,10 +413,14 @@ async fn post_capture(State(state): State<Arc<ServerState>>) -> StatusCode {
     StatusCode::OK
 }
 
+/// Observer geographic coordinates and host UTC timestamp.
 #[derive(serde::Deserialize)]
 pub struct LocationTimeData {
+    /// Observer latitude in degrees [-90.0, +90.0].
     pub latitude: Option<f64>,
+    /// Observer longitude in degrees [-180.0, +180.0].
     pub longitude: Option<f64>,
+    /// Host timestamp in milliseconds since UNIX epoch.
     pub timestamp_ms: Option<u64>,
 }
 
@@ -428,6 +445,15 @@ async fn post_location_time(
     StatusCode::OK
 }
 
+/// Starts the Axum web control server on port 8080.
+///
+/// Endpoints:
+/// - `GET /`: Diagnostics web UI and camera focusing view.
+/// - `GET /stream`: Single-client multipart MJPEG camera stream.
+/// - `GET /api/controls` & `POST /api/controls`: Read/write exposure and gain sliders.
+/// - `POST /api/capture`: Trigger high-resolution snapshot to disk.
+/// - `GET /api/engine_state`: Read JSON telemetry state.
+/// - `POST /api/location_time`: Sync observer GPS coordinates and UTC clock.
 pub async fn start_server(
     camera: Arc<dyn CameraTrait>,
     client_connected: Arc<AtomicBool>,

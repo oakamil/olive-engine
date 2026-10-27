@@ -1,5 +1,5 @@
-// Required Notice: Copyright (c) 2026 Omair Kamil
-// See LICENSE file in root directory for license terms.
+// Copyright (c) 2026 Omair Kamil
+// See LICENSE.md in the repository root for license terms.
 
 use crate::{CameraConfig, CameraTrait, CameraType, Image};
 use log::{info, warn};
@@ -68,6 +68,7 @@ enum CaptureCommand {
     StopCaptureThread,
 }
 
+/// USB Video Class (UVC) camera driver backend with frame accumulation.
 pub struct Camera {
     command_tx: Option<mpsc::Sender<CaptureCommand>>,
     store: Arc<CaptureStore>,

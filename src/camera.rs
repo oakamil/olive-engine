@@ -1,5 +1,5 @@
-// Required Notice: Copyright (c) 2026 Omair Kamil
-// See LICENSE file in root directory for license terms.
+// Copyright (c) 2026 Omair Kamil
+// See LICENSE.md in the repository root for license terms.
 
 #[cfg(target_os = "linux")]
 mod hardware {
@@ -90,6 +90,7 @@ mod hardware {
                 || s.contains('V'))
     }
 
+    /// Native Raspberry Pi camera driver via libcamera.
     pub struct Camera {
         command_tx: Option<mpsc::Sender<CaptureCommand>>,
         store: Arc<CaptureStore>,
@@ -252,6 +253,9 @@ mod hardware {
     impl Camera {
         /// Instantiates the camera module and sets initial cached state.
         /// Performs hardware discovery immediately to populate gain limits.
+        /// Creates a new libcamera driver instance.
+        ///
+        /// If `isp_mode` is `true`, enables zero-copy hardware debayering and downsampling.
         pub fn new(isp_mode: bool) -> Self {
             let store = Arc::new(CaptureStore {
                 image: Mutex::new(None),
@@ -1177,9 +1181,11 @@ mod stub {
     use std::sync::Arc;
     use std::time::SystemTime;
 
+    /// Stub camera driver for non-Linux host platforms.
     pub struct Camera;
 
     impl Camera {
+        /// Creates a stub camera instance.
         pub fn new(_isp_mode: bool) -> Self {
             Self
         }
