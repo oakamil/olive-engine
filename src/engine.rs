@@ -1578,16 +1578,27 @@ impl Engine {
                 let frame_zoom = res.zoom.max(1.0);
                 if (frame_zoom - self.active_zoom).abs() > 0.05 {
                     log::info!(
-                        "Zoom changed from {:.2}x to {:.2}x: resetting FOV and distortion for recalibration",
+                        "Zoom changed from {:.2}x to {:.2}x: resetting solver feedback state",
                         self.active_zoom,
                         frame_zoom
                     );
-                    self.fov = None;
+                    let initial_engine_fov = if (frame_zoom - 1.0).abs() <= 0.05 {
+                        self.config.initial_fov.map(|f| f as f64)
+                    } else {
+                        None
+                    };
+                    self.fov = initial_engine_fov;
                     self.distortion = None;
                     self.active_zoom = frame_zoom;
+                    self.clear_stacker.store(true, Ordering::Relaxed);
 
                     if let Some(ac) = adaptive_controller.as_mut() {
                         ac.reset_failures();
+                    }
+
+                    if let Ok(mut state) = self.engine_state.write() {
+                        state.fov = initial_engine_fov;
+                        state.distortion = None;
                     }
                 }
 
@@ -2598,6 +2609,65 @@ mod tests {
         assert_eq!(Engine::parse_pixel_coords("0,0"), Some((0.0, 0.0)));
         assert_eq!(Engine::parse_pixel_coords("invalid"), None);
         assert_eq!(Engine::parse_pixel_coords("1,2,3"), None);
+    }
+
+    #[test]
+    fn test_zoom_change_engine_state_reset() {
+        let engine_state = Arc::new(RwLock::new(EngineStateData::default()));
+        {
+            let mut st = engine_state.write().unwrap();
+            st.exposure_us = 250_000;
+            st.focus = Some(0.42);
+            st.target_pixel_x = Some(640.0);
+            st.target_pixel_y = Some(360.0);
+            st.client_latitude = Some(37.77);
+            st.client_longitude = Some(-122.42);
+            st.ra = Some(180.0);
+            st.dec = Some(45.0);
+            st.center_ra = Some(180.0);
+            st.center_dec = Some(45.0);
+            st.roll = Some(12.0);
+            st.centroids = 45;
+            st.solve_rate_hz = 15.0;
+            st.offset_ra = Some(1.5);
+            st.offset_dec = Some(2.0);
+            st.hfr = 2.8;
+            st.solved_crop = Some(SolvedCrop::Center2x);
+        }
+
+        // Simulate zoom change from 2.0x to 1.0x: only solver feedback parameters (FOV & distortion) are reset
+        let initial_engine_fov = Some(65.0);
+        {
+            let mut state = engine_state.write().unwrap();
+            state.fov = initial_engine_fov;
+            state.distortion = None;
+        }
+
+        let st = engine_state.read().unwrap();
+        // Preserved calibration and observer location
+        assert_eq!(st.exposure_us, 250_000);
+        assert_eq!(st.focus, Some(0.42));
+        assert_eq!(st.target_pixel_x, Some(640.0));
+        assert_eq!(st.target_pixel_y, Some(360.0));
+        assert_eq!(st.client_latitude, Some(37.77));
+        assert_eq!(st.client_longitude, Some(-122.42));
+
+        // Preserved solutions and metrics (not cleared on zoom transition)
+        assert_eq!(st.ra, Some(180.0));
+        assert_eq!(st.dec, Some(45.0));
+        assert_eq!(st.center_ra, Some(180.0));
+        assert_eq!(st.center_dec, Some(45.0));
+        assert_eq!(st.roll, Some(12.0));
+        assert_eq!(st.centroids, 45);
+        assert_eq!(st.solve_rate_hz, 15.0);
+        assert_eq!(st.offset_ra, Some(1.5));
+        assert_eq!(st.offset_dec, Some(2.0));
+        assert_eq!(st.hfr, 2.8);
+        assert_eq!(st.solved_crop, Some(SolvedCrop::Center2x));
+
+        // Reset solver feedback data
+        assert_eq!(st.fov, Some(65.0));
+        assert_eq!(st.distortion, None);
     }
 }
 
