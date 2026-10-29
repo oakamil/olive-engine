@@ -146,6 +146,7 @@ impl CameraTrait for DummyCamera {
             post_process_time: Duration::from_millis(0),
             frame_interval_us: 0,
             metadata_valid: true,
+            zoom: 1.0,
         }))
     }
 
@@ -161,6 +162,7 @@ impl CameraTrait for DummyCamera {
             post_process_time: Duration::from_millis(0),
             frame_interval_us: 0,
             metadata_valid: true,
+            zoom: 1.0,
         }))
     }
 

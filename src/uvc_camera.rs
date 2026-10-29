@@ -764,6 +764,7 @@ impl Camera {
                         post_process_time,
                         frame_interval_us: 0,
                         metadata_valid: true,
+                        zoom: 1.0,
                     }));
                     store_clone.cvar.notify_all();
                 }

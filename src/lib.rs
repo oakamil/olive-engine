@@ -106,6 +106,8 @@ pub struct Image {
     pub frame_interval_us: i64,
     /// `true` if exposure and gain reflect verified hardware registers.
     pub metadata_valid: bool,
+    /// Optical/digital zoom factor applied to this frame (defaults to 1.0).
+    pub zoom: f32,
 }
 
 /// Classification of camera hardware backend.

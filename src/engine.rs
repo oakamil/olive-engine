@@ -34,14 +34,8 @@ const GAIN_ADJUST_THROTTLE_MS: u64 = 10_000;
 /// eliminating the overhead of 5 sub-crop evaluations per frame.
 pub const MIN_VIRTUAL_CROP_FOV: f64 = 25.0;
 
-/// The labels corresponding to the 5 virtual crop regions produced by [`generate_5_crop_layout`].
-pub const VIRTUAL_CROP_LABELS: [SolvedCrop; 5] = [
-    SolvedCrop::Center,
-    SolvedCrop::Top,
-    SolvedCrop::Left,
-    SolvedCrop::Right,
-    SolvedCrop::Bottom,
-];
+/// The labels corresponding to the 2 concentric virtual crop regions produced by [`generate_concentric_center_crops`].
+pub const VIRTUAL_CROP_LABELS: [SolvedCrop; 2] = [SolvedCrop::Center2x, SolvedCrop::Center1_5x];
 
 /// Plate-solving engine configuration.
 #[derive(Clone, Debug)]
@@ -125,6 +119,8 @@ pub struct IntermediateResult {
     pub frame_interval_us: i64,
     /// `true` if frame metadata matches verified hardware registers.
     pub metadata_valid: bool,
+    /// Optical/digital zoom factor applied to this frame (defaults to 1.0).
+    pub zoom: f32,
 }
 
 /// Star centroid extractor algorithm backend.
@@ -154,30 +150,18 @@ pub enum BgMode {
 /// Region of interest that produced an astrometric solution.
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub enum SolvedCrop {
-    /// Center sub-crop.
-    Center,
-    /// Top sub-crop.
-    Top,
-    /// Left sub-crop.
-    Left,
-    /// Right sub-crop.
-    Right,
-    /// Bottom sub-crop.
-    Bottom,
+    /// Center 2.0x virtual crop (50% image dimensions).
+    Center2x,
+    /// Center 1.5x virtual crop (66.7% image dimensions).
+    Center1_5x,
     /// Full uncropped sensor frame.
     Full,
     /// Astrometric solution failed across all crops.
     Failed,
-    /// Center sub-crop at high sensitivity.
-    CenterHighSens,
-    /// Top sub-crop at high sensitivity.
-    TopHighSens,
-    /// Left sub-crop at high sensitivity.
-    LeftHighSens,
-    /// Right sub-crop at high sensitivity.
-    RightHighSens,
-    /// Bottom sub-crop at high sensitivity.
-    BottomHighSens,
+    /// Center 2.0x virtual crop at high sensitivity.
+    Center2xHighSens,
+    /// Center 1.5x virtual crop at high sensitivity.
+    Center1_5xHighSens,
     /// Full frame at high sensitivity.
     FullHighSens,
 }
@@ -327,42 +311,21 @@ impl Default for EngineStateData {
     }
 }
 
-/// Generates a 5-crop layout (Center, Top, Left, Right, Bottom) for wide-angle star extraction.
-/// Offsets place the edge crops directly flush against the image boundaries.
-pub fn generate_5_crop_layout(
-    crop_w: usize,
-    crop_h: usize,
-    off_x: isize,
-    off_y: isize,
+/// Generates concentric center crops (Center 2.0x, Center 1.5x) sharing the optical axis (W/2, H/2).
+pub fn generate_concentric_center_crops(
+    proc_width: usize,
+    proc_height: usize,
 ) -> Vec<tetra3::extractor::Crop> {
     vec![
+        // Center 2.0x: 50% width & height (25% area) - Aggressive perimeter clutter rejection
         tetra3::extractor::Crop::Center {
-            width: crop_w,
-            height: crop_h,
+            width: (proc_width as f64 * 0.50).round() as usize,
+            height: (proc_height as f64 * 0.50).round() as usize,
         },
-        tetra3::extractor::Crop::Region {
-            height: crop_h,
-            width: crop_w,
-            offset_y: -off_y,
-            offset_x: 0,
-        },
-        tetra3::extractor::Crop::Region {
-            height: crop_h,
-            width: crop_w,
-            offset_y: 0,
-            offset_x: -off_x,
-        },
-        tetra3::extractor::Crop::Region {
-            height: crop_h,
-            width: crop_w,
-            offset_y: 0,
-            offset_x: off_x,
-        },
-        tetra3::extractor::Crop::Region {
-            height: crop_h,
-            width: crop_w,
-            offset_y: off_y,
-            offset_x: 0,
+        // Center 1.5x: 66.7% width & height (44.4% area) - Moderate clutter rejection, wider star collection
+        tetra3::extractor::Crop::Center {
+            width: (proc_width as f64 * (2.0 / 3.0)).round() as usize,
+            height: (proc_height as f64 * (2.0 / 3.0)).round() as usize,
         },
     ]
 }
@@ -378,16 +341,8 @@ pub fn evaluate_virtual_crops(
     Option<Vec<SolvedCrop>>,
 ) {
     if best_fov.is_some_and(|fov| fov >= MIN_VIRTUAL_CROP_FOV) {
-        let scale = 0.50;
-
-        let crop_w = (proc_width as f64 * scale).round() as usize;
-        let crop_h = (proc_height as f64 * scale).round() as usize;
-
-        let off_x = (proc_width as isize - crop_w as isize) / 2;
-        let off_y = (proc_height as isize - crop_h as isize) / 2;
-
         (
-            Some(generate_5_crop_layout(crop_w, crop_h, off_x, off_y)),
+            Some(generate_concentric_center_crops(proc_width, proc_height)),
             Some(VIRTUAL_CROP_LABELS.to_vec()),
         )
     } else {
@@ -404,6 +359,7 @@ pub struct Engine {
     pub fused_solver: Arc<olive_solve::FusedSolver>,
     fov: Option<f64>,
     distortion: Option<f64>,
+    active_zoom: f32,
 
     shared_position: Arc<SharedPosition>,
     pub telescope_server_handle: Option<tokio::task::JoinHandle<()>>,
@@ -648,13 +604,21 @@ impl Engine {
             }
         }
 
+        let start_zoom = camera.get_zoom().unwrap_or(1.0);
+        let initial_engine_fov = if (start_zoom - 1.0).abs() > 0.05 {
+            None
+        } else {
+            config_fov
+        };
+
         Self {
             camera,
             config,
             last_gain_adjust: None,
             fused_solver,
-            fov: config_fov,
+            fov: initial_engine_fov,
             distortion: None,
+            active_zoom: start_zoom,
             shared_position,
             target_ra: None,
             target_dec: None,
@@ -767,17 +731,7 @@ impl Engine {
             .retain(|t| t.elapsed() <= Duration::from_secs(5));
         let solve_rate_hz = self.solve_timestamps.len() as f64 / 5.0;
 
-        let zoom = self.camera.get_zoom().unwrap_or(1.0) as f64;
-        let reported_fov = if let Some(fov) = self.fov {
-            if (zoom - 1.0).abs() > 0.01 {
-                let fov_rad = fov.to_radians();
-                Some(2.0 * ((fov_rad / 2.0).tan() / zoom).atan().to_degrees())
-            } else {
-                Some(fov)
-            }
-        } else {
-            None
-        };
+        let reported_fov = self.fov;
 
         if let Ok(mut state) = self.engine_state.write() {
             state.centroids = centroids;
@@ -884,6 +838,7 @@ impl Engine {
                 let img_timestamp = img_arc.timestamp;
                 let frame_interval_us = img_arc.frame_interval_us;
                 let metadata_valid = img_arc.metadata_valid;
+                let img_zoom = img_arc.zoom.max(1.0);
 
                 let img_data = match Arc::try_unwrap(img_arc) {
                     Ok(img) => img.data,
@@ -1000,7 +955,13 @@ impl Engine {
 
                         let active_sigma = state_sigma.unwrap_or(3.5);
                         let mut update_max_area = None;
-                        let best_fov = state_fov.or(config_ext.initial_fov.map(|f| f as f64));
+                        let best_fov = if state_fov.is_some() {
+                            state_fov
+                        } else if (img_zoom - 1.0).abs() <= 0.05 {
+                            config_ext.initial_fov.map(|f| f as f64)
+                        } else {
+                            None
+                        };
                         if let Some(fov) = best_fov {
                             if fov > 0.0 {
                                 let ratio = (width as f64) / fov;
@@ -1104,11 +1065,12 @@ impl Engine {
                                             virtual_crop_labels.as_ref().unwrap()[i].clone();
                                         if v_idx > 0 {
                                             label = match label {
-                                                SolvedCrop::Center => SolvedCrop::CenterHighSens,
-                                                SolvedCrop::Top => SolvedCrop::TopHighSens,
-                                                SolvedCrop::Left => SolvedCrop::LeftHighSens,
-                                                SolvedCrop::Right => SolvedCrop::RightHighSens,
-                                                SolvedCrop::Bottom => SolvedCrop::BottomHighSens,
+                                                SolvedCrop::Center2x => {
+                                                    SolvedCrop::Center2xHighSens
+                                                }
+                                                SolvedCrop::Center1_5x => {
+                                                    SolvedCrop::Center1_5xHighSens
+                                                }
                                                 _ => label,
                                             };
                                         }
@@ -1273,6 +1235,7 @@ impl Engine {
                     background_level: final_bg_level,
                     frame_interval_us,
                     metadata_valid,
+                    zoom: img_zoom,
                 };
 
                 let (lock, cvar) = &*shared_res_ext;
@@ -1591,6 +1554,22 @@ impl Engine {
             self.update_status(status);
 
             if let Some(res) = self.wait_for_extraction() {
+                let frame_zoom = res.zoom.max(1.0);
+                if (frame_zoom - self.active_zoom).abs() > 0.05 {
+                    log::info!(
+                        "Zoom changed from {:.2}x to {:.2}x: resetting FOV and distortion for recalibration",
+                        self.active_zoom,
+                        frame_zoom
+                    );
+                    self.fov = None;
+                    self.distortion = None;
+                    self.active_zoom = frame_zoom;
+
+                    if let Some(ac) = adaptive_controller.as_mut() {
+                        ac.reset_failures();
+                    }
+                }
+
                 if let Some(bg) = res.background_level {
                     self.auto_adjust_gain(bg);
                 }
@@ -1649,15 +1628,11 @@ impl Engine {
                 solve_options.solve_timeout_ms = Some(crop_budget_ms);
 
                 if let Some(fov) = self.fov {
-                    let zoom = self.camera.get_zoom().unwrap_or(1.0) as f64;
-                    // Mathematically project the Base FOV to the Zoomed FOV (rectilinear projection).
-                    let fov_rad = fov.to_radians();
-                    let zoomed_fov_rad = 2.0 * ((fov_rad / 2.0).tan() / zoom).atan();
-
-                    solve_options.fov_estimate = Some(zoomed_fov_rad.to_degrees());
-                    // Provide a proportional constraint (5%) for wide-angle distortion shifts, with a minimum 0.1 degree floor for telescopes
-                    solve_options.fov_max_error =
-                        Some((zoomed_fov_rad.to_degrees() * 0.05).max(0.1));
+                    solve_options.fov_estimate = Some(fov);
+                    solve_options.fov_max_error = Some((fov * 0.05).max(0.1));
+                } else {
+                    solve_options.fov_estimate = None;
+                    solve_options.fov_max_error = None;
                 }
                 // Check for pending sync or slew already processed above
 
@@ -1815,34 +1790,41 @@ impl Engine {
                             solve_time
                         );
 
-                        // Update base FOV from the solver's astrometric solution
-                        if let Some(new_fov) = solution.fov {
-                            let zoom = self.camera.get_zoom().unwrap_or(1.0) as f64;
-                            // The solver returns the FOV of the zoomed (cropped) image.
-                            // We must reverse the rectilinear projection to find the camera's true 1.0x Base FOV.
-                            let solved_fov_rad = new_fov.to_radians();
-                            let base_fov_rad = 2.0 * ((solved_fov_rad / 2.0).tan() * zoom).atan();
-                            let base_fov = base_fov_rad.to_degrees();
+                        let is_full_frame = matches!(
+                            solved_crop_enum,
+                            Some(SolvedCrop::Full | SolvedCrop::FullHighSens)
+                        );
 
-                            if self.fov.is_none() {
-                                log::info!(
-                                    "Locked base FOV to {:.2}° (Solved {:.2}° at {:.2}x zoom)",
-                                    base_fov,
-                                    new_fov,
-                                    zoom
-                                );
+                        if is_full_frame {
+                            if let Some(new_fov) = solution.fov {
+                                if self.fov.is_none() {
+                                    log::info!(
+                                        "Locked FOV to {:.2}° at {:.2}x zoom",
+                                        new_fov,
+                                        frame_zoom
+                                    );
+                                }
+                                self.fov = Some(new_fov);
                             }
-                            self.fov = Some(base_fov);
-                        }
 
-                        // EMA update for distortion
-                        if let Some(new_dist) = solution.distortion {
-                            if let Some(old_dist) = self.distortion {
-                                // Exponential Moving Average (EMA).
-                                self.distortion = Some(0.9 * old_dist + 0.1 * new_dist);
-                            } else {
-                                self.distortion = Some(new_dist);
-                                log::info!("Locked initial distortion to {:.6}", new_dist);
+                            if let Some(new_dist) = solution.distortion {
+                                if (-0.15..=0.05).contains(&new_dist) {
+                                    if let Some(old_dist) = self.distortion {
+                                        self.distortion = Some(0.9 * old_dist + 0.1 * new_dist);
+                                    } else {
+                                        self.distortion = Some(new_dist);
+                                        log::info!(
+                                            "Locked initial distortion to {:.6} at {:.2}x zoom",
+                                            new_dist,
+                                            frame_zoom
+                                        );
+                                    }
+                                } else {
+                                    log::warn!(
+                                        "Rejected unphysical distortion fit: {:.6}",
+                                        new_dist
+                                    );
+                                }
                             }
                         }
                         solved = true;
@@ -2178,28 +2160,22 @@ mod tests {
             }
         }
 
-        // Mimic engine.rs logic for a 50% scale
-        let scale = 0.50;
-        let crop_w = (width as f64 * scale).round() as usize;
-        let crop_h = (height as f64 * scale).round() as usize;
+        let virtual_crops = super::generate_concentric_center_crops(width, height);
+        assert_eq!(virtual_crops.len(), 2);
 
-        let off_x = (width as isize - crop_w as isize) / 2;
-        let off_y = (height as isize - crop_h as isize) / 2;
+        // Center 2.0x (50% dimensions)
+        let (y1, y2, x1, x2) = virtual_crops[0].bounds(width, height);
+        assert_eq!(y2 - y1, height / 2);
+        assert_eq!(x2 - x1, width / 2);
+        assert_eq!((y1 + y2) / 2, height / 2);
+        assert_eq!((x1 + x2) / 2, width / 2);
 
-        let virtual_crops = super::generate_5_crop_layout(crop_w, crop_h, off_x, off_y);
-
-        // Ensure the absolute bounds actually hit the edges
-        let (y1, _y2, _x1, _x2) = virtual_crops[1].bounds(width, height);
-        assert_eq!(y1, 0, "Top-Center crop must start at y=0");
-
-        let (_y1, _y2, x1, _x2) = virtual_crops[2].bounds(width, height);
-        assert_eq!(x1, 0, "Left-Center crop must start at x=0");
-
-        let (_y1, _y2, _x1, x2) = virtual_crops[3].bounds(width, height);
-        assert_eq!(x2, width, "Right-Center crop must end at x=width");
-
-        let (_y1, y2, _x1, _x2) = virtual_crops[4].bounds(width, height);
-        assert_eq!(y2, height, "Bottom-Center crop must end at y=height");
+        // Center 1.5x (66.7% dimensions)
+        let (y1, y2, x1, x2) = virtual_crops[1].bounds(width, height);
+        assert_eq!(y2 - y1, (height * 2) / 3);
+        assert_eq!(x2 - x1, (width * 2) / 3);
+        assert_eq!((y1 + y2) / 2, height / 2);
+        assert_eq!((x1 + x2) / 2, width / 2);
 
         // Run extractor
         let options = FastExtractOptions {
@@ -2215,28 +2191,13 @@ mod tests {
             .expect("Should have virtual crop centroids");
         assert_eq!(
             vcrops_res.len(),
-            5,
-            "Expected 5 crop buckets (1 center + 4 edges)"
+            2,
+            "Expected 2 concentric center crop buckets"
         );
 
         // Verify each quadrant actually extracted stars
-        assert!(!vcrops_res[0].is_empty(), "Expected stars in Center");
-        assert!(
-            !vcrops_res[1].is_empty(),
-            "Expected stars in Top-Center edge"
-        );
-        assert!(
-            !vcrops_res[2].is_empty(),
-            "Expected stars in Left-Center edge"
-        );
-        assert!(
-            !vcrops_res[3].is_empty(),
-            "Expected stars in Right-Center edge"
-        );
-        assert!(
-            !vcrops_res[4].is_empty(),
-            "Expected stars in Bottom-Center edge"
-        );
+        assert!(!vcrops_res[0].is_empty(), "Expected stars in Center 2.0x");
+        assert!(!vcrops_res[1].is_empty(), "Expected stars in Center 1.5x");
     }
 
     #[test]
@@ -2258,18 +2219,18 @@ mod tests {
         assert!(crops.is_none());
         assert!(labels.is_none());
 
-        // 3. Exact threshold (25.0°) -> activates 5 virtual crops & labels
+        // 3. Exact threshold (25.0°) -> activates 2 virtual crops & labels
         let (crops, labels) = super::evaluate_virtual_crops(Some(25.0), width, height);
         let crops = crops.expect("Should produce virtual crops at 25.0°");
         let labels = labels.expect("Should produce virtual crop labels at 25.0°");
-        assert_eq!(crops.len(), 5);
+        assert_eq!(crops.len(), 2);
         assert_eq!(labels, super::VIRTUAL_CROP_LABELS);
 
-        // 4. Wide-angle FOV (35.0°) -> activates 5 virtual crops & labels
+        // 4. Wide-angle FOV (35.0°) -> activates 2 virtual crops & labels
         let (crops, labels) = super::evaluate_virtual_crops(Some(35.0), width, height);
         let crops = crops.expect("Should produce virtual crops at 35.0°");
         let labels = labels.expect("Should produce virtual crop labels at 35.0°");
-        assert_eq!(crops.len(), 5);
+        assert_eq!(crops.len(), 2);
         assert_eq!(labels, super::VIRTUAL_CROP_LABELS);
     }
 
@@ -2368,11 +2329,11 @@ mod tests {
             Duration::from_millis(5),
             Duration::from_millis(10),
             Duration::from_millis(20),
-            Some(SolvedCrop::Center),
+            Some(SolvedCrop::Center2x),
         );
         assert_eq!(
             engine_state.read().unwrap().solved_crop,
-            Some(SolvedCrop::Center)
+            Some(SolvedCrop::Center2x)
         );
     }
 
@@ -2513,6 +2474,7 @@ mod tests {
             fused_solver,
             fov: Some(initial_fov),
             distortion: None,
+            active_zoom: 1.0,
             shared_position,
             target_ra: None,
             target_dec: None,
@@ -2537,11 +2499,7 @@ mod tests {
 
         // Simulate solver match returning 65.5° FOV
         let solution_fov: f64 = 65.5;
-        let zoom = engine.camera.get_zoom().unwrap_or(1.0) as f64;
-        let solved_fov_rad = solution_fov.to_radians();
-        let base_fov_rad = 2.0 * ((solved_fov_rad / 2.0).tan() * zoom).atan();
-        let base_fov = base_fov_rad.to_degrees();
-        engine.fov = Some(base_fov);
+        engine.fov = Some(solution_fov);
 
         engine.update_solve_stats(
             true,

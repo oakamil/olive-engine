@@ -600,6 +600,7 @@ mod hardware {
                 post_process_time,
                 frame_interval_us: frame_interval_us as i64,
                 metadata_valid: true,
+                zoom: 1.0,
             }));
             store.cvar.notify_all();
         }

@@ -212,6 +212,15 @@ impl AdaptiveController {
         )
     }
 
+    /// Resets consecutive tracking failures (e.g. after camera zoom changes)
+    /// to prevent immediate 1.5x exposure escalation.
+    pub fn reset_failures(&mut self) {
+        if let InternalState::Tracking(ref mut trk) = self.internal_state {
+            trk.failures = 0;
+            trk.frames_since_change = 0;
+        }
+    }
+
     pub fn on_frame(&mut self, obs: &FrameObservation) -> Vec<ControllerAction> {
         if matches!(self.internal_state, InternalState::Startup) {
             return self.start();

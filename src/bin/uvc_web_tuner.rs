@@ -424,6 +424,7 @@ fn run_camera(
                         post_process_time: Duration::from_millis(0),
                         frame_interval_us: 0,
                         metadata_valid: true,
+                        zoom: 1.0,
                     }));
                     store_clone.cvar.notify_all();
                 },
