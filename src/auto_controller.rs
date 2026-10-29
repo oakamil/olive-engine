@@ -162,6 +162,7 @@ pub struct AdaptiveController {
     internal_state: InternalState,
     phases: Vec<HardwarePhase>,
     limits: Limits,
+    initial_limits: Limits,
     exposure_us: i32,
     gain: f32,
     base_gain: f32,
@@ -194,6 +195,12 @@ impl AdaptiveController {
                 exposure_max,
                 gain_min: min_gain,
                 gain_max: 10_000.0, // High default, will be clamped by hardware limit learning
+            },
+            initial_limits: Limits {
+                exposure_min,
+                exposure_max,
+                gain_min: min_gain,
+                gain_max: 10_000.0,
             },
             exposure_us: SWEEP_START_US,
             gain: min_gain,
@@ -301,9 +308,12 @@ impl AdaptiveController {
         true
     }
 
-    /// The interval if known, else metadata (cameras without timestamps).
+    /// Uses verified hardware metadata exposure when valid; falls back to frame interval
+    /// for cameras lacking per-frame metadata (e.g. V4L2/UVC).
     fn measured_exposure_us(&self, obs: &FrameObservation) -> i64 {
-        if obs.frame_interval_us > 0 {
+        if obs.metadata_valid {
+            obs.actual_exposure_us as i64
+        } else if obs.frame_interval_us > 0 {
             obs.frame_interval_us
         } else {
             obs.actual_exposure_us as i64
@@ -326,9 +336,13 @@ impl AdaptiveController {
             limit_learned = true;
             info!("Learned exposure_max = {} us", measured);
         } else if measured > target + tolerance {
-            self.limits.exposure_min = measured;
-            limit_learned = true;
-            info!("Learned exposure_min = {} us", measured);
+            // Only learn an exposure_min floor if metadata is verified.
+            // Frame interval reflects the pipeline delivery cadence floor, NOT the sensor shutter floor.
+            if obs.metadata_valid {
+                self.limits.exposure_min = measured;
+                limit_learned = true;
+                info!("Learned exposure_min = {} us", measured);
+            }
         }
 
         if obs.actual_gain < self.gain * 0.85 {
@@ -628,6 +642,8 @@ impl AdaptiveController {
 
         info!("FullSweep failed, no fallback. Retrying.");
         self.internal_state = InternalState::Startup;
+        self.limits.exposure_min = self.initial_limits.exposure_min;
+        self.limits.exposure_max = self.initial_limits.exposure_max;
         let actions = self.start();
         let state = std::mem::replace(&mut self.internal_state, InternalState::Startup);
         (state, actions)
@@ -721,8 +737,6 @@ impl AdaptiveController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::sync::Mutex;
 
     struct SimCamera {
         exposure_cap: i32,
@@ -890,5 +904,40 @@ mod tests {
 
         // Should have learned limit
         assert_eq!(ctrl.limits.exposure_max, 1_000_000);
+    }
+
+    #[test]
+    fn test_tracking_exposure_ramp_down_with_slower_frame_interval() {
+        let mut ctrl = AdaptiveController::new("test".into(), default_phases(), None, 100.0, None);
+        // Put controller directly into tracking at 500,000 us
+        ctrl.internal_state = InternalState::Tracking(Tracking {
+            ema_solve_rate: Some(1.0),
+            frames_since_change: 10,
+            failures: 0,
+            successes: 10,
+        });
+        ctrl.exposure_us = 500_000;
+
+        // Feed frames solving at 100% (bg=60 within hold band [50..80])
+        // Target steps down to 500_000 * 0.9 = 450_000 us
+        let acts = ctrl.on_frame(&make_obs(500_000, 100.0, 500_000, 60.0, 15));
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, ControllerAction::SetExposure(450_000)))
+        );
+        assert_eq!(ctrl.exposure_us, 450_000);
+
+        // Hardware camera sets shutter to 450,000 us, but frame interval remains at 500_000 us (e.g. 2 FPS streaming)
+        let obs = make_obs(450_000, 100.0, 500_000, 60.0, 15);
+        // Verified metadata must allow settling even though frame interval (500ms) > target (450ms)
+        assert!(ctrl.is_settled(&obs));
+
+        // Ensure exposure ramps down further and does not get clamped back to 500,000 us
+        for _ in 0..10 {
+            ctrl.on_frame(&obs);
+        }
+        // Stepped down again from 450_000 to 405_000 us (450_000 * 0.9)
+        assert_eq!(ctrl.exposure_us, 405_000);
+        assert!(ctrl.limits.exposure_min <= 405_000);
     }
 }

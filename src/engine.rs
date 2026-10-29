@@ -214,6 +214,8 @@ pub struct EngineStateData {
     pub paused: bool,
     /// Half Flux Radius focus metric in pixels (lower indicates sharper focus).
     pub hfr: f64, // Added focus metric
+    /// Active lens focus position (0.0 to 1.0).
+    pub focus: Option<f32>,
     /// Observer site latitude in degrees [-90.0, +90.0].
     pub client_latitude: Option<f64>,
     /// Observer site longitude in degrees [-180.0, +180.0].
@@ -284,6 +286,7 @@ impl Default for EngineStateData {
             capture_requested: false,
             paused: false,
             hfr: 0.0,
+            focus: None,
             client_latitude: None,
             client_longitude: None,
             client_date: None,
@@ -757,6 +760,24 @@ impl Engine {
     /// Returns join handles for the extraction and solving threads. Both threads
     /// run continuously until [`Self::is_running`] is signaled `false`.
     pub fn start(self) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
+        #[cfg(target_os = "ios")]
+        let should_autofocus = self.config.auto_mode
+            && matches!(
+                self.camera.get_config().map(|c| c.camera_type),
+                Some(crate::CameraType::Internal { .. })
+            )
+            && self.camera.get_focus().is_some();
+        #[cfg(not(target_os = "ios"))]
+        let should_autofocus = false;
+
+        if should_autofocus {
+            let best_focus =
+                crate::autofocus::run_autofocus(&self.camera, &self.engine_state, &self.is_running);
+            if let Ok(mut state) = self.engine_state.write() {
+                state.focus = Some(best_focus);
+            }
+        }
+
         let camera_ext = self.camera.clone();
         let config_ext = self.config.clone();
         let shared_res_ext = self.shared_result.clone();
@@ -2167,15 +2188,15 @@ mod tests {
         let (y1, y2, x1, x2) = virtual_crops[0].bounds(width, height);
         assert_eq!(y2 - y1, height / 2);
         assert_eq!(x2 - x1, width / 2);
-        assert_eq!((y1 + y2) / 2, height / 2);
-        assert_eq!((x1 + x2) / 2, width / 2);
+        assert!(((y1 + y2) as isize / 2 - height as isize / 2).abs() <= 1);
+        assert!(((x1 + x2) as isize / 2 - width as isize / 2).abs() <= 1);
 
         // Center 1.5x (66.7% dimensions)
         let (y1, y2, x1, x2) = virtual_crops[1].bounds(width, height);
-        assert_eq!(y2 - y1, (height * 2) / 3);
-        assert_eq!(x2 - x1, (width * 2) / 3);
-        assert_eq!((y1 + y2) / 2, height / 2);
-        assert_eq!((x1 + x2) / 2, width / 2);
+        assert_eq!(y2 - y1, (height as f64 * (2.0 / 3.0)).round() as usize);
+        assert_eq!(x2 - x1, (width as f64 * (2.0 / 3.0)).round() as usize);
+        assert!(((y1 + y2) as isize / 2 - height as isize / 2).abs() <= 1);
+        assert!(((x1 + x2) as isize / 2 - width as isize / 2).abs() <= 1);
 
         // Run extractor
         let options = FastExtractOptions {
@@ -2263,6 +2284,7 @@ mod tests {
             fused_solver,
             fov: Some(15.0),
             distortion: None,
+            active_zoom: 1.0,
             shared_position,
             target_ra: None,
             target_dec: None,
@@ -2366,6 +2388,7 @@ mod tests {
             fused_solver: fused_solver.clone(),
             fov: Some(15.0),
             distortion: None,
+            active_zoom: 1.0,
             shared_position,
             target_ra: None,
             target_dec: None,

@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 pub mod auto_controller;
+pub mod autofocus;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub mod camera;
 pub mod control_server;
