@@ -435,13 +435,6 @@ async fn post_location_time(
     if let Some(lon) = payload.longitude {
         engine_state.client_longitude = Some(lon);
     }
-    if let Some(ms) = payload.timestamp_ms {
-        if let Some(dt) =
-            chrono::DateTime::from_timestamp((ms / 1000) as i64, ((ms % 1000) * 1_000_000) as u32)
-        {
-            engine_state.client_date = Some(dt);
-        }
-    }
     StatusCode::OK
 }
 

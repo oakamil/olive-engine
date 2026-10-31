@@ -220,8 +220,6 @@ pub struct EngineStateData {
     pub client_latitude: Option<f64>,
     /// Observer site longitude in degrees [-180.0, +180.0].
     pub client_longitude: Option<f64>,
-    /// Observer UTC date and time.
-    pub client_date: Option<chrono::DateTime<chrono::Utc>>,
     /// Target angular offset in RA in arcseconds or degrees.
     pub offset_ra: Option<f64>,
     /// Target angular offset in Declination in arcseconds or degrees.
@@ -289,7 +287,6 @@ impl Default for EngineStateData {
             focus: None,
             client_latitude: None,
             client_longitude: None,
-            client_date: None,
             offset_ra: None,
             offset_dec: None,
             offset_az: None,
@@ -532,14 +529,12 @@ impl Engine {
                     let mut target_dec_opt = None;
                     let mut lat_opt_state = None;
                     let mut lon_opt_state = None;
-                    let mut client_date_opt = None;
 
                     if let Ok(state) = engine_state_clone.read() {
                         target_ra_opt = state.target_ra;
                         target_dec_opt = state.target_dec;
                         lat_opt_state = state.client_latitude;
                         lon_opt_state = state.client_longitude;
-                        client_date_opt = state.client_date;
                     }
 
                     let mut offset_ra = None;
@@ -555,7 +550,7 @@ impl Engine {
                         offset_dec = Some(d_dec);
 
                         if let (Some(lat), Some(lon)) = (lat_opt_state, lon_opt_state) {
-                            let time = client_date_opt.unwrap_or_else(|| chrono::Utc::now());
+                            let time = chrono::Utc::now();
                             let (cur_alt, cur_az) =
                                 calculate_alt_az(ra, dec, lat, lon, &time, &timescale_clone);
                             let (t_alt, t_az) =
@@ -1684,7 +1679,6 @@ impl Engine {
                 let lon_opt = engine_state
                     .client_longitude
                     .or(self.shared_position.site_longitude.load(Ordering::Relaxed));
-                let client_date_opt = engine_state.client_date;
                 let is_strict = engine_state.strict_match;
                 drop(engine_state);
 
@@ -1699,7 +1693,7 @@ impl Engine {
                 // Set Zenith limits to automatically reject patterns containing stars below the horizon
                 if let (Some(lat), Some(lon)) = (lat_opt, lon_opt) {
                     if self.config.use_observer_location {
-                        let now = client_date_opt.unwrap_or_else(|| chrono::Utc::now());
+                        let now = chrono::Utc::now();
                         let t = self.timescale.from_datetime(now);
                         let gast_hours = t.gast();
                         let lst_deg = (gast_hours * 15.0 + lon).rem_euclid(360.0);
