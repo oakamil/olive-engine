@@ -1785,6 +1785,14 @@ impl Engine {
                                     // Use the synced values for reporting in this frame
                                     ra = t_ra;
                                     dec = t_dec;
+
+                                    self.fused_solver.update_position(
+                                        t_ra,
+                                        t_dec,
+                                        solution.roll,
+                                        Some(img_timestamp),
+                                        true,
+                                    );
                                 } else {
                                     warn!(
                                         "Solver could not project sync RA/Dec to pixels (out of bounds?). Sync failed."
