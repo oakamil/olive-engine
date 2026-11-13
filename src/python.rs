@@ -38,7 +38,7 @@ use crate::uvc_camera::Camera as UvcCamera;
 ///     Enable Raspberry Pi ISP hardware pipeline (libcamera backend only).
 /// bg_mode : {"line", "global", "block"}, default="line"
 ///     Background subtraction method for star extraction.
-/// extractor_type : {"approximate", "fast", "cedar"}, default="approximate"
+/// extractor_type : {"approximate", "fast"}, default="approximate"
 ///     Centroid extraction backend algorithm.
 /// uvc : bool, default=False
 ///     Use USB UVC camera backend instead of libcamera.
@@ -78,7 +78,6 @@ fn start_engine(
 
     let ext_type = match extractor_type.to_lowercase().as_str() {
         "fast" => Extractor::Fast,
-        "cedar" => Extractor::Cedar,
         _ => Extractor::Approximate,
     };
 
@@ -127,7 +126,7 @@ fn start_engine(
             .await;
     });
 
-    let engine = futures::executor::block_on(Engine::new(
+    let engine = rt.block_on(Engine::new(
         camera,
         config,
         client_connected,

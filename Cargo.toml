@@ -10,13 +10,9 @@ readme = "README.md"
 [dependencies]
 clap = { version = "4.4", features = ["derive"] }
 log = "0.4"
-libc = "0.2"
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
-futures-util = "0.3"
-tower-http = { version = "0.5", features = ["fs", "cors"] }
-base64 = "0.22"
 image = "0.25"
 olive-solve = { path = "../olive-solve" }
 olive-imu = { path = "../olive-solve/olive-imu" }
@@ -28,29 +24,35 @@ ndarray = "0.17"
 async-trait = "0.1"
 chrono = "0.4"
 memchr = "2.7"
-futures = "0.3.32"
 serde = { version = "1.0.228", features = ["derive"] }
-cedar_detect = { git = "https://github.com/oakamil/cedar-detect" }
-turbojpeg = { git = "https://github.com/oakamil/rust-turbojpeg.git" }
 hyper = "1"
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 tower = { version = "0.4", features = ["util"] }
 socket2 = "0.6.4"
 serde_json = "1.0.151"
 
-[target.'cfg(not(target_os = "ios"))'.dependencies]
-uvc = { git = "https://github.com/oakamil/libuvc-rs", features = ["vendor"] }
-
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 pyo3 = { version = "0.21.2" }
 env_logger = "0.11"
+uvc = { git = "https://github.com/oakamil/libuvc-rs", features = ["vendor"] }
+turbojpeg = { git = "https://github.com/oakamil/rust-turbojpeg.git" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libcamera = "0.7.0"
+libc = "0.2"
 
 [features]
 extension-module = ["pyo3/extension-module"]
+uvc-tuners = []
 default = []
+
+[[bin]]
+name = "uvc_tuner"
+required-features = ["uvc-tuners"]
+
+[[bin]]
+name = "uvc_web_tuner"
+required-features = ["uvc-tuners"]
 
 [lib]
 name = "olive_engine"

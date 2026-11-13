@@ -5,7 +5,7 @@
 //!
 //! `olive-engine` provides real-time sky orientation tracking at up to 60 Hz by integrating:
 //! - Hardware camera capture (Raspberry Pi ISP via `libcamera`, or USB UVC).
-//! - Sub-pixel star centroid extraction (`cedar-detect`, `tetra3` fast/approximate).
+//! - Sub-pixel star centroid extraction (`tetra3` fast/approximate).
 //! - Lost-in-space plate solving (`tetra3`, `olive-solve`).
 //! - IMU sensor fusion (BNO085, BMI160).
 //! - Telescope server protocols: Meade LX200 (TCP 4030) and ASCOM Alpaca (HTTP 11111 / UDP 32227).
@@ -28,7 +28,7 @@ pub mod alpaca_server;
 pub mod dummy_camera;
 
 pub mod telescope_server;
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub mod uvc_camera;
 
 use serde::{Deserialize, Serialize};

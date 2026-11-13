@@ -968,8 +968,6 @@ impl Lx200Controller {
 
 #[cfg(test)]
 mod tests {
-    extern crate approx;
-
     use approx::assert_abs_diff_eq;
     use chrono::TimeZone;
 
@@ -1475,7 +1473,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_input_fragmented_command() {
-        use futures::poll;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (mut controller, _) = setup_controller().await;
@@ -1508,9 +1505,14 @@ mod tests {
         let mut buf = [0; 64];
         // Verify that no data is returned yet
         {
-            let read_fut = client_read.read(&mut buf);
-            tokio::pin!(read_fut);
-            assert!(poll!(&mut read_fut).is_pending());
+            let mut read_fut = std::pin::pin!(client_read.read(&mut buf));
+            let is_pending = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(
+                    std::future::Future::poll(read_fut.as_mut(), cx).is_pending(),
+                )
+            })
+            .await;
+            assert!(is_pending);
         } // Drop read_fut to allow reading again and checking the buffer
 
         assert_eq!(buf, [0; 64]);

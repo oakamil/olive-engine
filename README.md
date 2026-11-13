@@ -19,7 +19,7 @@ High-performance astronomical plate-solving engine and telescope server daemon w
   - **USB UVC Cameras**: Standard USB camera support with configurable framerate, MJPEG decoding, and multi-frame rolling exposure accumulation.
 - **Inertial Measurement Unit (IMU) Sensor Fusion**: Fused attitude tracking using Bosch BMI160 or CEVA/Hillcrest BNO085 sensors for dead-reckoning and instant re-acquisition during slews.
 - **Autonomous Adaptive Regulation**: Dynamic gain, exposure, and stacking controller that automatically adapts to changing sky brightness and cloud cover.
-- **Configurable Centroid Extractors**: Integration with `approximate`, `fast`, and `cedar-detect` extractors with multiple background subtraction modes (`line`, `global`, `block`).
+- **Configurable Centroid Extractors**: Integration with `approximate` and `fast` extractors with multiple background subtraction modes (`line`, `global`, `block`).
 - **Python Bindings**: Native PyO3 extension (`olive_engine`) for seamless integration into custom Python astronomy pipelines.
 - **Hardware Tuning Utilities**: Dedicated companion binaries (`uvc_tuner` and `uvc_web_tuner`) for benchmarking and dialing in sensor exposure, gain, and gamma.
 
@@ -93,7 +93,7 @@ cargo run --release -- --database-path ~/data/default_database.npz
 | `--gain <FLOAT>` | Float | Auto | Fixed analog gain override (disables AGC) |
 | `--target-centroids <INT>` | Int | `20` | Target star centroid count for auto-exposure |
 | `--bg-mode <MODE>` | Enum | `line` | Background subtraction mode (`line`, `global`, `block`) |
-| `--extractor-type <TYPE>` | Enum | `approximate` | Star extractor backend (`approximate`, `fast`, `cedar`) |
+| `--extractor-type <TYPE>` | Enum | `approximate` | Star extractor backend (`approximate`, `fast`) |
 | `--imu <TYPE>` | Enum | `none` | IMU sensor fusion backend (`none`, `bno085`, `bmi160`) |
 | `--no-downsample` | Flag | `false` | Disable automatic 2x2 image downsampling |
 | `--auto-mode <BOOL>` | Bool | `true` | Automated gain/exposure/stacking regulation |
@@ -104,11 +104,11 @@ cargo run --release -- --database-path ~/data/default_database.npz
 
 - **CLI Tuner (`uvc_tuner`)**: Benchmarks camera control combinations (gamma, contrast, gain) against star detection rate:
   ```bash
-  cargo run --release --bin uvc_tuner [-- --gain <GAIN>]
+  cargo run --release --features uvc-tuners --bin uvc_tuner [-- --gain <GAIN>]
   ```
 - **Web Tuner (`uvc_web_tuner`)**: Interactive browser-based UI for live-adjusting UVC camera controls and evaluating focus/detection:
   ```bash
-  cargo run --release --bin uvc_web_tuner
+  cargo run --release --features uvc-tuners --bin uvc_web_tuner
   ```
 
 ---
@@ -152,7 +152,6 @@ olive_engine.start_engine(
 ## FAQ
 
 #### 1. Which extractor type and background mode should I use?
-- `cedar`: Maximum performance and speed, but its use is subject to [cedar-detect license restrictions](https://github.com/smroid/cedar-detect).
 - `approximate`: Recommended for resource-constrained platforms (e.g. Raspberry Pi Zero 2W).
 - `fast`: High-precision centroiding algorithm for challenging optical setups.
 - Background modes (`line`, `global`, `block`): `line` is the default and effectively mitigates rolling-shutter CMOS gradients. `global` is slightly faster. `block` applies local background modeling at higher CPU cost.
@@ -179,7 +178,6 @@ This project is licensed under the [GNU General Public License v3.0 or later (GP
 `olive-engine` integrates with and relies on several upstream projects:
 - [`olive-solve`](https://github.com/oakamil/olive-solve): Core astrometric plate solver.
 - [`tetra3`](https://github.com/esa/tetra3): Star identification algorithm developed by the European Space Agency (ESA).
-- [`cedar-detect`](https://github.com/smroid/cedar-detect): High-performance star extraction engine. Note that commercial use requires separate licensing from Clear Skies Astro.
 - [`starfield`](https://crates.io/crates/starfield): High-precision astronomical time and coordinate precession calculations.
 
 ---

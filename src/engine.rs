@@ -131,8 +131,6 @@ pub enum Extractor {
     Approximate,
     /// Robust, full-precision centroid extractor.
     Fast,
-    /// Cedar-detect extraction engine for maximum throughput.
-    Cedar,
 }
 
 /// Background estimation and subtraction mode.
@@ -925,10 +923,7 @@ impl Engine {
                 }
 
                 let extract_start = Instant::now();
-                let num_centroids;
-                let centroids_batch;
                 let mut baseline_full_centroids = None;
-                let mut final_bg_level: Option<f32> = None;
                 let mut per_crop_centroid_counts = Vec::new();
 
                 let (state_sigma, state_fov) = {
@@ -936,255 +931,171 @@ impl Engine {
                     (st.current_sigma, st.fov)
                 };
 
-                match config_ext.extractor_type {
-                    Extractor::Approximate | Extractor::Fast => {
-                        let array_img =
-                            match Array2::from_shape_vec((height, width), final_img_data.clone()) {
-                                Ok(arr) => arr,
-                                Err(e) => {
-                                    error!("Failed to create Array2 from image data: {}", e);
-                                    continue;
-                                }
-                            };
-
-                        let final_crop = config_ext
-                            .crop
-                            .or(cam_config.crop.map(|(w, h)| (w as usize, h as usize)));
-                        let (proc_width, proc_height) = match final_crop {
-                            Some((cw, ch)) => (cw.min(width), ch.min(height)),
-                            None => (width, height),
-                        };
-
-                        let downsample = match config_ext.downsample {
-                            4 => FastDownsample::X4,
-                            2 => FastDownsample::X2,
-                            1 => FastDownsample::None, // explicitly Off
-                            _ => {
-                                // 0 = Auto
-                                if proc_width * proc_height > 1_250_000 {
-                                    FastDownsample::X2
-                                } else {
-                                    FastDownsample::None
-                                }
-                            }
-                        };
-
-                        let active_sigma = state_sigma.unwrap_or(3.5);
-                        let mut update_max_area = None;
-                        let best_fov = if state_fov.is_some() {
-                            state_fov
-                        } else if (img_zoom - 1.0).abs() <= 0.05 {
-                            config_ext.initial_fov.map(|f| f as f64)
-                        } else {
-                            None
-                        };
-                        if let Some(fov) = best_fov {
-                            if fov > 0.0 {
-                                let ratio = (width as f64) / fov;
-                                let raw_max_area = 20.0 + 0.03 * (ratio * ratio);
-                                let ds_factor = match downsample {
-                                    FastDownsample::X4 => 4.0,
-                                    FastDownsample::X2 => 2.0,
-                                    FastDownsample::None => 1.0,
-                                };
-                                active_max_area =
-                                    (raw_max_area / (ds_factor * ds_factor)).round().max(10.0)
-                                        as usize;
-                                update_max_area = Some(active_max_area);
-                            }
-                        }
-
-                        let (virtual_crops, virtual_crop_labels) =
-                            evaluate_virtual_crops(best_fov, proc_width, proc_height);
-
-                        if extractor.is_none() {
-                            let bg_sub_mode = match config_ext.bg_mode {
-                                BgMode::Global => Some(FastBgSubMode::GlobalMedian),
-                                BgMode::Block => {
-                                    Some(FastBgSubMode::BlockMedian { block_size: 32 })
-                                }
-                                BgMode::Line => Some(FastBgSubMode::LineMedian),
-                            };
-
-                            let approximate_background =
-                                config_ext.extractor_type == Extractor::Approximate;
-
-                            let options = FastExtractOptions {
-                                sigma: active_sigma,
-                                approximate_background,
-                                downsample,
-                                bg_sub_mode,
-                                binary_open: config_ext.noise_filter,
-                                min_area: Some(2),
-                                max_area: Some(active_max_area),
-                                max_axis_ratio: Some(2.0),
-                                crop: final_crop,
-                                virtual_crops: virtual_crops.clone(),
-                                //centroid_window: Some(3),
-                                ..FastExtractOptions::default()
-                            };
-                            extractor = Some(FastExtractor::new(width, height, options));
-                        }
-
-                        let ext = extractor.as_mut().unwrap();
-                        ext.update_options(tetra3::fast_extractor::FastExtractOptionsUpdate {
-                            sigma: Some(active_sigma),
-                            max_area: update_max_area,
-                            virtual_crops: Some(virtual_crops.clone()),
-                            ..Default::default()
-                        });
-
-                        let mut variants = vec![Default::default()];
-
-                        let do_multiple_variants = exposure_us
-                            >= MULTIPLE_EXTRACTION_MIN_EXPOSURE_US
-                            && config_ext.auto_mode;
-
-                        if do_multiple_variants {
-                            variants.push(tetra3::fast_extractor::FastExtractOptionsUpdate {
-                                sigma: Some(MULTIPLE_EXTRACTION_SIGMA),
-                                min_area: Some(MULTIPLE_EXTRACTION_MIN_AREA),
-                                noise_filter: Some(MULTIPLE_EXTRACTION_NOISE_FILTER),
-                                ..Default::default()
-                            });
-                        }
-
-                        let results = ext.extract_variants(&array_img, &variants);
-                        final_bg_level = results.first().map(|r| r.background_level);
-                        if let Some(res) = results.first() {
-                            if let Some(vc) = &res.virtual_crop_centroids {
-                                per_crop_centroid_counts = vc.iter().map(|c| c.len()).collect();
-                            }
-                        }
-
-                        let mut batch: Vec<(
-                            Array2<f64>,
-                            Option<tetra3::extractor::Crop>,
-                            SolvedCrop,
-                        )> = Vec::new();
-                        let target_c = config_ext.target_centroids as f64 * 0.5;
-
-                        for (v_idx, result) in results.iter().enumerate() {
-                            if let Some(vc) = &result.virtual_crop_centroids {
-                                for (i, crop_cents) in vc.iter().enumerate() {
-                                    if (crop_cents.len() as f64) >= target_c {
-                                        let num_cents = crop_cents.len().min(80);
-                                        let mut arr = Array2::<f64>::zeros((num_cents, 2));
-                                        for (j, c) in crop_cents.iter().take(80).enumerate() {
-                                            arr[[j, 0]] = c.y;
-                                            arr[[j, 1]] = c.x;
-                                        }
-                                        let crop = virtual_crops
-                                            .as_ref()
-                                            .and_then(|vc| vc.get(i).cloned());
-                                        let mut label =
-                                            virtual_crop_labels.as_ref().unwrap()[i].clone();
-                                        if v_idx > 0 {
-                                            label = match label {
-                                                SolvedCrop::Center2x => {
-                                                    SolvedCrop::Center2xHighSens
-                                                }
-                                                SolvedCrop::Center1_5x => {
-                                                    SolvedCrop::Center1_5xHighSens
-                                                }
-                                                _ => label,
-                                            };
-                                        }
-                                        batch.push((arr, crop, label));
-                                    }
-                                }
-                            }
-
-                            let num_cents = result.centroids.len().min(80);
-                            let mut arr = Array2::<f64>::zeros((num_cents, 2));
-                            for (i, c) in result.centroids.iter().take(80).enumerate() {
-                                arr[[i, 0]] = c.y;
-                                arr[[i, 1]] = c.x;
-                            }
-                            if v_idx == 0 {
-                                baseline_full_centroids = Some(arr.clone());
-                            }
-                            let label = if v_idx > 0 {
-                                SolvedCrop::FullHighSens
-                            } else {
-                                SolvedCrop::Full
-                            };
-                            batch.push((arr, None, label));
-                        }
-
-                        // Use the base variant's full image centroid count for the UI
-                        num_centroids = results.first().map(|r| r.centroids.len()).unwrap_or(0);
-                        centroids_batch = batch;
-                    }
-                    Extractor::Cedar => {
-                        let final_crop = config_ext
-                            .crop
-                            .or(cam_config.crop.map(|(w, h)| (w as usize, h as usize)));
-                        let (crop_w, crop_h, crop_x, crop_y) = match final_crop {
-                            Some((cw, ch)) => {
-                                let cw = cw.min(width);
-                                let ch = ch.min(height);
-                                let cx = (width - cw) / 2;
-                                let cy = (height - ch) / 2;
-                                (cw, ch, cx, cy)
-                            }
-                            None => (width, height, 0, 0),
-                        };
-
-                        let cropped_img_data = if final_crop.is_some() {
-                            let mut cropped = Vec::with_capacity(crop_w * crop_h);
-                            for y in crop_y..(crop_y + crop_h) {
-                                let start = y * width + crop_x;
-                                let end = start + crop_w;
-                                cropped.extend_from_slice(&final_img_data[start..end]);
-                            }
-                            cropped
-                        } else {
-                            final_img_data.clone()
-                        };
-
-                        if let Some(gray_img) = image::ImageBuffer::from_raw(
-                            crop_w as u32,
-                            crop_h as u32,
-                            cropped_img_data,
-                        ) {
-                            let noise_estimate =
-                                cedar_detect::algorithm::estimate_noise_from_image(&gray_img);
-                            let active_sigma = state_sigma.unwrap_or(8.0);
-                            let (stars, _, _, _) = cedar_detect::algorithm::get_stars_from_image(
-                                &gray_img,
-                                noise_estimate,
-                                active_sigma as f64, // sigma
-                                true,                // normalize_rows
-                                match config_ext.downsample {
-                                    4 => 4,
-                                    2 => 2,
-                                    1 => 1,
-                                    _ => {
-                                        if crop_w * crop_h > 1_250_000 {
-                                            2
-                                        } else {
-                                            1
-                                        }
-                                    }
-                                }, // binning
-                                config_ext.noise_filter, // detect_hot_pixels
-                                false,               // return_binned_image
-                            );
-
-                            num_centroids = stars.len();
-                            let mut arr = Array2::<f64>::zeros((num_centroids, 2));
-                            for (i, c) in stars.iter().enumerate() {
-                                arr[[i, 0]] = c.centroid_y + crop_y as f64;
-                                arr[[i, 1]] = c.centroid_x + crop_x as f64;
-                            }
-                            centroids_batch = vec![(arr, None, SolvedCrop::Full)];
-                        } else {
-                            error!("Failed to create ImageBuffer from image data");
+                let array_img =
+                    match Array2::from_shape_vec((height, width), final_img_data.clone()) {
+                        Ok(arr) => arr,
+                        Err(e) => {
+                            error!("Failed to create Array2 from image data: {}", e);
                             continue;
                         }
+                    };
+
+                let final_crop = config_ext
+                    .crop
+                    .or(cam_config.crop.map(|(w, h)| (w as usize, h as usize)));
+                let (proc_width, proc_height) = match final_crop {
+                    Some((cw, ch)) => (cw.min(width), ch.min(height)),
+                    None => (width, height),
+                };
+
+                let downsample = match config_ext.downsample {
+                    4 => FastDownsample::X4,
+                    2 => FastDownsample::X2,
+                    1 => FastDownsample::None, // explicitly Off
+                    _ => {
+                        // 0 = Auto
+                        if proc_width * proc_height > 1_250_000 {
+                            FastDownsample::X2
+                        } else {
+                            FastDownsample::None
+                        }
+                    }
+                };
+
+                let active_sigma = state_sigma.unwrap_or(3.5);
+                let mut update_max_area = None;
+                let best_fov = if state_fov.is_some() {
+                    state_fov
+                } else if (img_zoom - 1.0).abs() <= 0.05 {
+                    config_ext.initial_fov.map(|f| f as f64)
+                } else {
+                    None
+                };
+                if let Some(fov) = best_fov {
+                    if fov > 0.0 {
+                        let ratio = (width as f64) / fov;
+                        let raw_max_area = 20.0 + 0.03 * (ratio * ratio);
+                        let ds_factor = match downsample {
+                            FastDownsample::X4 => 4.0,
+                            FastDownsample::X2 => 2.0,
+                            FastDownsample::None => 1.0,
+                        };
+                        active_max_area =
+                            (raw_max_area / (ds_factor * ds_factor)).round().max(10.0) as usize;
+                        update_max_area = Some(active_max_area);
                     }
                 }
+
+                let (virtual_crops, virtual_crop_labels) =
+                    evaluate_virtual_crops(best_fov, proc_width, proc_height);
+
+                if extractor.is_none() {
+                    let bg_sub_mode = match config_ext.bg_mode {
+                        BgMode::Global => Some(FastBgSubMode::GlobalMedian),
+                        BgMode::Block => Some(FastBgSubMode::BlockMedian { block_size: 32 }),
+                        BgMode::Line => Some(FastBgSubMode::LineMedian),
+                    };
+
+                    let approximate_background =
+                        config_ext.extractor_type == Extractor::Approximate;
+
+                    let options = FastExtractOptions {
+                        sigma: active_sigma,
+                        approximate_background,
+                        downsample,
+                        bg_sub_mode,
+                        binary_open: config_ext.noise_filter,
+                        min_area: Some(2),
+                        max_area: Some(active_max_area),
+                        max_axis_ratio: Some(2.0),
+                        crop: final_crop,
+                        virtual_crops: virtual_crops.clone(),
+                        //centroid_window: Some(3),
+                        ..FastExtractOptions::default()
+                    };
+                    extractor = Some(FastExtractor::new(width, height, options));
+                }
+
+                let ext = extractor.as_mut().unwrap();
+                ext.update_options(tetra3::fast_extractor::FastExtractOptionsUpdate {
+                    sigma: Some(active_sigma),
+                    max_area: update_max_area,
+                    virtual_crops: Some(virtual_crops.clone()),
+                    ..Default::default()
+                });
+
+                let mut variants = vec![Default::default()];
+
+                let do_multiple_variants =
+                    exposure_us >= MULTIPLE_EXTRACTION_MIN_EXPOSURE_US && config_ext.auto_mode;
+
+                if do_multiple_variants {
+                    variants.push(tetra3::fast_extractor::FastExtractOptionsUpdate {
+                        sigma: Some(MULTIPLE_EXTRACTION_SIGMA),
+                        min_area: Some(MULTIPLE_EXTRACTION_MIN_AREA),
+                        noise_filter: Some(MULTIPLE_EXTRACTION_NOISE_FILTER),
+                        ..Default::default()
+                    });
+                }
+
+                let results = ext.extract_variants(&array_img, &variants);
+                let final_bg_level = results.first().map(|r| r.background_level);
+                if let Some(res) = results.first() {
+                    if let Some(vc) = &res.virtual_crop_centroids {
+                        per_crop_centroid_counts = vc.iter().map(|c| c.len()).collect();
+                    }
+                }
+
+                let mut centroids_batch: Vec<(
+                    Array2<f64>,
+                    Option<tetra3::extractor::Crop>,
+                    SolvedCrop,
+                )> = Vec::new();
+                let target_c = config_ext.target_centroids as f64 * 0.5;
+
+                for (v_idx, result) in results.iter().enumerate() {
+                    if let Some(vc) = &result.virtual_crop_centroids {
+                        for (i, crop_cents) in vc.iter().enumerate() {
+                            if (crop_cents.len() as f64) >= target_c {
+                                let num_cents = crop_cents.len().min(80);
+                                let mut arr = Array2::<f64>::zeros((num_cents, 2));
+                                for (j, c) in crop_cents.iter().take(80).enumerate() {
+                                    arr[[j, 0]] = c.y;
+                                    arr[[j, 1]] = c.x;
+                                }
+                                let crop = virtual_crops.as_ref().and_then(|vc| vc.get(i).cloned());
+                                let mut label = virtual_crop_labels.as_ref().unwrap()[i].clone();
+                                if v_idx > 0 {
+                                    label = match label {
+                                        SolvedCrop::Center2x => SolvedCrop::Center2xHighSens,
+                                        SolvedCrop::Center1_5x => SolvedCrop::Center1_5xHighSens,
+                                        _ => label,
+                                    };
+                                }
+                                centroids_batch.push((arr, crop, label));
+                            }
+                        }
+                    }
+
+                    let num_cents = result.centroids.len().min(80);
+                    let mut arr = Array2::<f64>::zeros((num_cents, 2));
+                    for (i, c) in result.centroids.iter().take(80).enumerate() {
+                        arr[[i, 0]] = c.y;
+                        arr[[i, 1]] = c.x;
+                    }
+                    if v_idx == 0 {
+                        baseline_full_centroids = Some(arr.clone());
+                    }
+                    let label = if v_idx > 0 {
+                        SolvedCrop::FullHighSens
+                    } else {
+                        SolvedCrop::Full
+                    };
+                    centroids_batch.push((arr, None, label));
+                }
+
+                // Use the base variant's full image centroid count for the UI
+                let num_centroids = results.first().map(|r| r.centroids.len()).unwrap_or(0);
 
                 let extract_time = extract_start.elapsed();
 
@@ -1305,14 +1216,10 @@ impl Engine {
     /// brightness window. Changes are throttled (e.g. 10s) to give the camera's
     /// exposure buffer time to flush and avoid oscillation.
     ///
-    /// Skipped when `Extractor::Cedar` is in use, calibration is bypassed, or
+    /// Skipped when calibration is bypassed or
     /// when an explicit gain is provided in the configuration.
     fn auto_adjust_gain(&mut self, bg_level: f32) {
-        if !self.config.auto_mode
-            || self.config.is_adaptive_camera
-            || self.config.gain.is_some()
-            || self.config.extractor_type == Extractor::Cedar
-        {
+        if !self.config.auto_mode || self.config.is_adaptive_camera || self.config.gain.is_some() {
             return;
         }
 
