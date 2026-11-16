@@ -171,14 +171,15 @@ ISP mode uses the Raspberry Pi's hardware Image Signal Processor to handle debay
 
 ## License & Attribution
 
-This project is licensed under the [GNU General Public License v3.0 or later (GPL-3.0-or-later)](LICENSE.md).
+Copyright (c) 2026 Omair Kamil. This project is licensed under the [GNU General Public License v3.0 or later (GPL-3.0-or-later)](LICENSE.md).
+
+In addition to `GPL-3.0-or-later`, the copyright holder licenses `olive-engine` for use and distribution within **Olive Finder (`olive-app`)** under the PolyForm Noncommercial License 1.0.0. Contributions submitted to this repository are accepted under both licenses (see [LICENSE.md](LICENSE.md)).
 
 ### Third-Party Licenses
 
 `olive-engine` integrates with and relies on several upstream projects:
-- [`olive-solve`](https://github.com/oakamil/olive-solve): Core astrometric plate solver.
-- [`tetra3`](https://github.com/esa/tetra3): Star identification algorithm developed by the European Space Agency (ESA).
-- [`starfield`](https://crates.io/crates/starfield): High-precision astronomical time and coordinate precession calculations.
+- [`olive-solve`](https://github.com/oakamil/olive-solve): Core astrometric plate solver (Apache-2.0, derived from [`smroid/cedar-solve`](https://github.com/smroid/cedar-solve), [`esa/tetra3`](https://github.com/esa/tetra3), and [`brownj4/tetra`](https://github.com/brownj4/tetra)).
+- [`starfield`](https://crates.io/crates/starfield): High-precision astronomical time and coordinate precession calculations (MIT).
 
 ---
 

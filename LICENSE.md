@@ -1,3 +1,14 @@
+# License
+
+Copyright (c) 2026 Omair Kamil
+
+This project is licensed under the **GNU General Public License v3.0 or later (`GPL-3.0-or-later`)** as set forth below.
+
+### Dual-Licensing & Contribution Notice
+As the copyright holder, Omair Kamil also licenses `olive-engine` for integration and distribution within **Olive Finder (`olive-app`)** under the [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/) (or other terms designated by the copyright holder). By submitting a contribution to this repository, you agree that your contribution may be licensed and distributed under both `GPL-3.0-or-later` and the license terms governing `olive-app`.
+
+---
+
 # GNU GENERAL PUBLIC LICENSE
 
 Version 3, 29 June 2007
