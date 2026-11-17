@@ -2,7 +2,7 @@
 name = "olive-engine"
 version = "0.1.0"
 edition = "2024"
-license = "GPL-3.0-or-later"
+license = "GPL-3.0-or-later OR PolyForm-Noncommercial-1.0.0"
 description = "High-performance astronomical plate-solving engine"
 repository = "https://github.com/oakamil/olive-engine"
 readme = "README.md"

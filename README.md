@@ -1,6 +1,6 @@
 # olive-engine
 
-[![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](LICENSE.md)
+[![License: GPL-3.0-or-later OR PolyForm-Noncommercial-1.0.0](https://img.shields.io/badge/License-GPL--3.0--or--later%20OR%20PolyForm--Noncommercial--1.0.0-blue.svg)](LICENSE.md)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](Cargo.toml)
 
 High-performance astronomical plate-solving engine and telescope server daemon written in Rust with Python bindings. Built on top of [`olive-solve`](https://github.com/oakamil/olive-solve) and [`tetra3`](https://github.com/esa/tetra3).
@@ -171,9 +171,12 @@ ISP mode uses the Raspberry Pi's hardware Image Signal Processor to handle debay
 
 ## License & Attribution
 
-Copyright (c) 2026 Omair Kamil. This project is licensed under the [GNU General Public License v3.0 or later (GPL-3.0-or-later)](LICENSE.md).
+Copyright (c) 2026 Omair Kamil. This project is dual-licensed under your choice of either the [GNU General Public License v3.0 or later (`GPL-3.0-or-later`)](LICENSE.md) or the [PolyForm Noncommercial License 1.0.0 (`PolyForm-Noncommercial-1.0.0`)](LICENSE.md).
 
-In addition to `GPL-3.0-or-later`, the copyright holder licenses `olive-engine` for use and distribution within **Olive Finder (`olive-app`)** under the PolyForm Noncommercial License 1.0.0. Contributions submitted to this repository are accepted under both licenses (see [LICENSE.md](LICENSE.md)).
+- Under **`GPL-3.0-or-later`**, you may use, modify, and distribute this project (including for commercial purposes) subject to the copyleft terms of GPLv3+.
+- Under **`PolyForm-Noncommercial-1.0.0`**, you may use, modify, and distribute this project for noncommercial purposes without GPLv3+ copyleft obligations.
+
+Contributions submitted to this repository are accepted under both licenses (see [LICENSE.md](LICENSE.md)).
 
 ### Third-Party Licenses
 
