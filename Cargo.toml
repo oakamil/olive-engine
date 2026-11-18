@@ -14,10 +14,10 @@ axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 image = "0.25"
-olive-solve = { path = "../olive-solve" }
-olive-imu = { path = "../olive-solve/olive-imu" }
+olive-solve = { git = "https://github.com/oakamil/olive-solve.git", rev = "bc471d9b1a2081b5bdc1ffc2c4b8b105ed7ea365" }
+olive-imu = { git = "https://github.com/oakamil/olive-solve.git", rev = "bc471d9b1a2081b5bdc1ffc2c4b8b105ed7ea365" }
 starfield = "0.10.2"
-tetra3 = { path = "../olive-solve/tetra3" }
+tetra3 = { git = "https://github.com/oakamil/olive-solve.git", rev = "bc471d9b1a2081b5bdc1ffc2c4b8b105ed7ea365" }
 nalgebra = "0.32"
 ndarray = "0.17"
 
