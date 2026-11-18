@@ -141,7 +141,7 @@ olive_engine.start_engine(
 ## Hardware Recommendations
 
 - **Single Board Computer**: Raspberry Pi Zero 2 W, Raspberry Pi 4B, or Raspberry Pi 5.
-- **Camera Sensor**: InnoMaker IMX462 or Arducam IMX462 (ultra-low-light sensitive sensor).
+- **Camera Sensor**: InnoMaker IMX462 (ultra-low-light sensitive sensor).
 - **Optics**: 25mm M12 lens (~12° × 7° field of view).
 - **Storage**: 32 GB or larger high-endurance microSD card.
 - **IMU Sensor (Optional)**: Adafruit BNO085 or Bosch BMI160 connected via I2C/SPI.
@@ -157,15 +157,7 @@ olive_engine.start_engine(
 - Background modes (`line`, `global`, `block`): `line` is the default and effectively mitigates rolling-shutter CMOS gradients. `global` is slightly faster. `block` applies local background modeling at higher CPU cost.
 
 #### 2. What is ISP mode and why use it?
-ISP mode uses the Raspberry Pi's hardware Image Signal Processor to handle debayering and downsampling in silicon. This increases throughput from ~40 FPS to the sensor maximum of 60 FPS and reduces frame post-processing time to a single memory copy. Custom camera tuning JSON files for libcamera ISP mode are provided in `data/pisp/` and `data/vc4/`.
-
----
-
-## Roadmap
-
-1. Pre-built Raspberry Pi OS disk images for turnkey setup.
-2. Bluetooth Low Energy (BLE) telescope protocol support.
-3. Expanded support for native motorized focuser drivers.
+ISP mode uses the Raspberry Pi's hardware Image Signal Processor to handle debayering and downsampling in silicon.
 
 ---
 
