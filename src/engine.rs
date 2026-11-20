@@ -569,6 +569,8 @@ impl Engine {
                     if let Ok(mut state) = engine_state_clone.write() {
                         state.ra = Some(ra);
                         state.dec = Some(dec);
+                        state.center_ra = Some(pos.center_ra);
+                        state.center_dec = Some(pos.center_dec);
                         state.roll = Some(eq_roll);
                         state.is_mirrored = Some(pos.is_mirrored);
                         state.is_imu_estimate = pos.source == olive_solve::PositionSource::Imu;
@@ -1669,11 +1671,6 @@ impl Engine {
                         };
 
                         // Sync logic: update target_pixel based on the solver's coordinate mapping
-                        if let Ok(mut state) = self.engine_state.write() {
-                            state.center_ra = solution.ra;
-                            state.center_dec = solution.dec;
-                        }
-
                         if let Some((t_ra, t_dec)) = pending_sync {
                             // The solver found the pixel coordinates for our requested sync RA/Dec
                             if let (Some(tx), Some(ty)) = (&solution.target_x, &solution.target_y) {
@@ -1693,10 +1690,11 @@ impl Engine {
                                     ra = t_ra;
                                     dec = t_dec;
 
-                                    self.fused_solver.update_position(
-                                        t_ra,
-                                        t_dec,
-                                        solution.roll,
+                                    let mut synced_solution = solution.clone();
+                                    synced_solution.target_ra = Some(vec![t_ra]);
+                                    synced_solution.target_dec = Some(vec![t_dec]);
+                                    self.fused_solver.update_from_solution(
+                                        &synced_solution,
                                         Some(img_timestamp),
                                         true,
                                     );
