@@ -208,10 +208,11 @@ pub struct EngineStateData {
     pub solve_rate_hz: f64,
     /// Flag indicating an image capture snapshot was requested.
     pub capture_requested: bool,
-    /// `true` when plate solving is paused (e.g. during live camera view).
-    pub paused: bool,
+    /// `true` when live HFR focus metric computation is requested by the client.
+    #[serde(skip)]
+    pub hfr_enabled: bool,
     /// Half Flux Radius focus metric in pixels (lower indicates sharper focus).
-    pub hfr: f64, // Added focus metric
+    pub hfr: f64,
     /// Active lens focus position (0.0 to 1.0).
     pub focus: Option<f32>,
     /// Observer site latitude in degrees [-90.0, +90.0].
@@ -280,7 +281,7 @@ impl Default for EngineStateData {
             solve_ms: 0.0,
             solve_rate_hz: 0.0,
             capture_requested: false,
-            paused: false,
+            hfr_enabled: false,
             hfr: 0.0,
             focus: None,
             client_latitude: None,
@@ -798,19 +799,6 @@ impl Engine {
                     log::info!("Engine thread stopping.");
                     break;
                 }
-                {
-                    let mut needs_update = false;
-                    {
-                        let state = engine_state_ext.read().unwrap();
-                        if state.paused && state.status != "Camera Mode" {
-                            needs_update = true;
-                        }
-                    }
-                    if needs_update {
-                        let mut state = engine_state_ext.write().unwrap();
-                        state.status = "Camera Mode".to_string();
-                    }
-                }
 
                 let img_opt = camera_ext.wait_for_next_capture(
                     last_processed_timestamp,
@@ -1101,12 +1089,10 @@ impl Engine {
 
                 let extract_time = extract_start.elapsed();
 
-                // Calculate focus metric only when camera mode is active (manual focus).
-                // This prevents wasting CPU cycles during active plate solving.
-                let is_paused = engine_state_ext.read().unwrap().paused;
-                let mut hfr = if client_connected_ext.load(std::sync::atomic::Ordering::Relaxed)
-                    || is_paused
-                {
+                // Calculate focus metric only when requested (e.g. Camera / Align or web stream).
+                // This prevents wasting CPU cycles during normal plate solving.
+                let hfr_enabled = engine_state_ext.read().unwrap().hfr_enabled;
+                let mut hfr = if client_connected_ext.load(Ordering::Relaxed) || hfr_enabled {
                     calculate_hfr(
                         &final_img_data,
                         width,
@@ -1187,10 +1173,6 @@ impl Engine {
                 if !engine.is_running.load(std::sync::atomic::Ordering::Relaxed) {
                     log::info!("Main engine thread stopping.");
                     return;
-                }
-                if engine.engine_state.read().unwrap().paused {
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                    continue;
                 }
                 engine.run_solving_loop();
             }
@@ -1450,11 +1432,6 @@ impl Engine {
                     .store(None, std::sync::atomic::Ordering::Relaxed);
             }
 
-            if self.engine_state.read().unwrap().paused {
-                self.update_status("Camera Mode");
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                continue;
-            }
             if self
                 .client_connected
                 .load(std::sync::atomic::Ordering::Relaxed)
