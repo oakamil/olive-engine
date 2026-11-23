@@ -26,6 +26,7 @@ pub mod stacker;
 
 pub mod alpaca_server;
 pub mod dummy_camera;
+pub mod mount;
 
 pub mod telescope_server;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]

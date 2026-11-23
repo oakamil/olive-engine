@@ -1,18 +1,23 @@
 // Copyright (c) 2026 Omair Kamil
 // See LICENSE.md in the repository root for license terms.
 
+use std::f64::consts::TAU;
 use std::sync::atomic::Ordering;
 use std::{
     sync::{Arc, RwLock},
     time::{Duration, Instant, SystemTime},
 };
 
+use chrono::{DateTime, Utc};
 use log::{debug, error, info, warn};
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
+use starfield::time::Timescale;
 use tokio::sync::mpsc::Receiver;
+use tokio::time::interval;
 
 use crate::alpaca_server::AlpacaServer;
+use crate::mount::{MountHandle, MountUiState};
 use crate::telescope_server::{Lx200Telescope, Lx200WifiTelescope, SharedPosition, TargetOp};
 use crate::{CameraConfig, CameraTrait, CameraType};
 use tetra3::{
@@ -121,6 +126,8 @@ pub struct IntermediateResult {
     pub metadata_valid: bool,
     /// Optical/digital zoom factor applied to this frame (defaults to 1.0).
     pub zoom: f32,
+    /// Monotonic mount slew epoch stamped when `t1` accepted this frame.
+    pub slew_epoch: u64,
 }
 
 /// Star centroid extractor algorithm backend.
@@ -260,6 +267,12 @@ pub struct EngineStateData {
     pub target_pixel_y: Option<f64>,
     /// Commanded synchronization coordinates `(ra, dec)` in degrees.
     pub requested_sync_coords: Option<(f64, f64)>,
+    /// Current motorized mount state (`Disabled` in Push-To mode).
+    pub mount_state: MountUiState,
+    /// Identified motorized mount model name (e.g. `"HAZ31"`, `"AZ Mount Pro"`).
+    pub mount_model: Option<String>,
+    /// Latest concise mount status or error notice.
+    pub mount_notice: Option<String>,
 }
 
 impl Default for EngineStateData {
@@ -306,6 +319,9 @@ impl Default for EngineStateData {
             target_pixel_x: None,
             target_pixel_y: None,
             requested_sync_coords: None,
+            mount_state: MountUiState::Disabled,
+            mount_model: None,
+            mount_notice: None,
         }
     }
 }
@@ -380,7 +396,8 @@ pub struct Engine {
     )>,
     pub is_running: Arc<std::sync::atomic::AtomicBool>,
     pub clear_stacker: Arc<std::sync::atomic::AtomicBool>,
-    timescale: Arc<starfield::time::Timescale>,
+    timescale: Arc<Timescale>,
+    mount_handle: Arc<MountHandle>,
 }
 
 fn angle_diff_deg(a: f64, b: f64) -> f64 {
@@ -388,13 +405,27 @@ fn angle_diff_deg(a: f64, b: f64) -> f64 {
     if diff > 180.0 { diff - 360.0 } else { diff }
 }
 
-fn calculate_alt_az(
+fn resolve_site_location(
+    state: &EngineStateData,
+    shared_pos: &SharedPosition,
+) -> (Option<f64>, Option<f64>) {
+    (
+        state
+            .client_latitude
+            .or(shared_pos.site_latitude.load(Ordering::Relaxed)),
+        state
+            .client_longitude
+            .or(shared_pos.site_longitude.load(Ordering::Relaxed)),
+    )
+}
+
+pub(crate) fn calculate_alt_az(
     ra_deg: f64,
     dec_deg: f64,
     lat_deg: f64,
     lon_deg: f64,
-    time: &chrono::DateTime<chrono::Utc>,
-    ts: &starfield::time::Timescale,
+    time: &DateTime<Utc>,
+    ts: &Timescale,
 ) -> (f64, f64) {
     let t = ts.from_datetime(*time);
     let gast_hours = t.gast();
@@ -417,7 +448,7 @@ fn calculate_alt_az(
     // Azimuth
     let cos_az = (dec_rad.sin() - alt_rad.sin() * lat_rad.sin()) / (alt_rad.cos() * lat_rad.cos());
     let sin_az = -dec_rad.cos() * ha_rad.sin() / alt_rad.cos();
-    let az_rad = sin_az.atan2(cos_az).rem_euclid(std::f64::consts::TAU);
+    let az_rad = sin_az.atan2(cos_az).rem_euclid(TAU);
 
     (alt_rad.to_degrees(), az_rad.to_degrees())
 }
@@ -495,6 +526,7 @@ impl Engine {
         };
 
         let clear_stacker = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mount_handle = MountHandle::start(timescale.clone(), None);
 
         let engine_state_clone = engine_state.clone();
         let shared_pos_clone = shared_position.clone();
@@ -502,11 +534,67 @@ impl Engine {
         let is_running_clone = is_running.clone();
         let timescale_clone = timescale.clone();
         let clear_stacker_clone = clear_stacker.clone();
+        let mount_handle_poll = mount_handle.clone();
 
         let polling_task = async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(33));
-            while is_running_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                interval.tick().await;
+            let mut ticker = interval(Duration::from_millis(33));
+            let mut last_mount_seq = u64::MAX;
+            let mut mount_was_enabled = false;
+            while is_running_clone.load(Ordering::Relaxed) {
+                ticker.tick().await;
+
+                if mount_handle_poll.is_enabled() {
+                    mount_was_enabled = true;
+                    let op = shared_pos_clone.target_op.load(Ordering::Acquire);
+                    if op == Some(TargetOp::Abort)
+                        && !mount_handle_poll.is_abort_pending()
+                        && (mount_handle_poll.is_goto_active()
+                            || mount_handle_poll.is_physically_slewing())
+                    {
+                        mount_handle_poll.abort();
+                    }
+
+                    let (lat, lon, has_pending_ui_goto) =
+                        if let Ok(state) = engine_state_clone.read() {
+                            let (lat, lon) = resolve_site_location(&state, &shared_pos_clone);
+                            (
+                                lat,
+                                lon,
+                                state.requested_target_ra.is_some()
+                                    && state.requested_target_dec.is_some(),
+                            )
+                        } else {
+                            (None, None, false)
+                        };
+                    mount_handle_poll.set_site_location(lat, lon);
+
+                    if op == Some(TargetOp::Slew) || has_pending_ui_goto {
+                        shared_pos_clone.is_slewing.store(true, Ordering::Release);
+                    } else {
+                        shared_pos_clone
+                            .is_slewing
+                            .store(mount_handle_poll.is_goto_active(), Ordering::Release);
+                    }
+
+                    let (mt, seq) = mount_handle_poll.telemetry_with_seq();
+                    if seq != last_mount_seq {
+                        last_mount_seq = seq;
+                        if let Ok(mut state) = engine_state_clone.write() {
+                            state.mount_state = mt.state;
+                            state.mount_model = mt.model;
+                            state.mount_notice = mt.notice;
+                        }
+                    }
+                } else if mount_was_enabled {
+                    mount_was_enabled = false;
+                    last_mount_seq = u64::MAX;
+                    shared_pos_clone.is_slewing.store(false, Ordering::Release);
+                    if let Ok(mut state) = engine_state_clone.write() {
+                        state.mount_state = MountUiState::Disabled;
+                        state.mount_model = None;
+                        state.mount_notice = None;
+                    }
+                }
 
                 // High-cadence IMU motion distribution
                 if let Some(motion) = fused_solver_clone.get_motion_state() {
@@ -635,7 +723,13 @@ impl Engine {
             rt_handle,
             lx200_controller,
             timescale,
+            mount_handle,
         }
+    }
+
+    /// Returns a thread-safe handle for configuring and controlling the optional motorized mount.
+    pub fn mount_handle(&self) -> Arc<MountHandle> {
+        self.mount_handle.clone()
     }
 
     /// Returns the cache key used for storing sensor target pixel calibration.
@@ -781,6 +875,7 @@ impl Engine {
         let is_running_ext = self.is_running.clone();
         let client_connected_ext = self.client_connected.clone();
         let clear_stacker_ext = self.clear_stacker.clone();
+        let mount_handle_ext = self.mount_handle.clone();
 
         let t1 = std::thread::spawn(move || {
             let mut stacker = crate::stacker::Stacker::new(
@@ -790,6 +885,7 @@ impl Engine {
             );
             let mut extractor: Option<FastExtractor> = None;
             let mut last_processed_timestamp = None;
+            let mut last_slew_epoch = 0u64;
             let mut active_max_area = 150;
             let mut hfr_history: std::collections::VecDeque<(std::time::SystemTime, f64)> =
                 std::collections::VecDeque::new();
@@ -826,6 +922,16 @@ impl Engine {
                     break;
                 }
                 last_processed_timestamp = Some(img_arc.timestamp);
+
+                let (drop_for_slew, frame_slew_epoch) =
+                    mount_handle_ext.frame_fence(img_arc.timestamp, img_arc.exposure_time_us);
+                if drop_for_slew || frame_slew_epoch != last_slew_epoch {
+                    stacker.reset();
+                    last_slew_epoch = frame_slew_epoch;
+                }
+                if drop_for_slew {
+                    continue;
+                }
 
                 let mut do_capture = false;
                 {
@@ -1151,6 +1257,7 @@ impl Engine {
                     frame_interval_us,
                     metadata_valid,
                     zoom: img_zoom,
+                    slew_epoch: frame_slew_epoch,
                 };
 
                 let (lock, cvar) = &*shared_res_ext;
@@ -1303,6 +1410,14 @@ impl Engine {
                     st.target_ra = None;
                     st.target_dec = None;
                     st.requested_target_clear = false;
+                    if self.mount_handle.is_enabled() {
+                        if self.mount_handle.is_goto_active() {
+                            self.mount_handle.abort();
+                        }
+                        self.shared_position
+                            .is_slewing
+                            .store(false, Ordering::Relaxed);
+                    }
                 }
 
                 if let (Some(ra), Some(dec)) = (st.requested_target_ra, st.requested_target_dec) {
@@ -1326,12 +1441,16 @@ impl Engine {
                     st.requested_target_dec = None;
                     st.requested_target_epoch = None;
 
-                    self.shared_position
-                        .target_op
-                        .store(Some(TargetOp::Slew), std::sync::atomic::Ordering::Relaxed);
+                    if self.mount_handle.is_enabled() {
+                        self.mount_handle.goto(ra_j2000, dec_j2000);
+                    } else {
+                        self.shared_position
+                            .target_op
+                            .store(Some(TargetOp::Slew), Ordering::Release);
+                    }
                     self.shared_position
                         .is_slewing
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                        .store(true, Ordering::Release);
                     info!("Engine received UI target request: RA={}, Dec={}", ra, dec);
                 }
                 if let Some(cmd) = st.pending_target_pixel_cmd.take() {
@@ -1350,6 +1469,7 @@ impl Engine {
                         }
                     }
                     self.save_target_pixel(self.target_pixel);
+                    self.mount_handle.notify_target_pixel_changed();
                 }
                 if st.requested_sync {
                     st.requested_sync = false;
@@ -1378,18 +1498,9 @@ impl Engine {
             }
 
             // 2. Process External Client & State Flags (Alpaca/LX200)
-            let target_op = self
-                .shared_position
-                .target_op
-                .load(std::sync::atomic::Ordering::Relaxed);
-            let target_ra = self
-                .shared_position
-                .target_ra
-                .load(std::sync::atomic::Ordering::Relaxed);
-            let target_dec = self
-                .shared_position
-                .target_dec
-                .load(std::sync::atomic::Ordering::Relaxed);
+            let target_op = self.shared_position.target_op.load(Ordering::Acquire);
+            let target_ra = self.shared_position.target_ra.load(Ordering::Relaxed);
+            let target_dec = self.shared_position.target_dec.load(Ordering::Relaxed);
 
             if target_op == Some(TargetOp::Abort) {
                 self.target_ra = None;
@@ -1398,12 +1509,22 @@ impl Engine {
                     st.target_ra = None;
                     st.target_dec = None;
                 }
-                self.shared_position
-                    .target_op
-                    .store(None, std::sync::atomic::Ordering::Relaxed);
+                if self.mount_handle.is_enabled()
+                    && !self.mount_handle.is_abort_pending()
+                    && (self.mount_handle.is_goto_active()
+                        || self.mount_handle.is_physically_slewing())
+                {
+                    self.mount_handle.abort();
+                }
+                let _ = self.shared_position.target_op.compare_exchange(
+                    Some(TargetOp::Abort),
+                    None,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
                 self.shared_position
                     .is_slewing
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                    .store(false, Ordering::Release);
             } else if target_op == Some(TargetOp::Slew)
                 && target_ra.is_some()
                 && target_dec.is_some()
@@ -1416,20 +1537,30 @@ impl Engine {
                     st.target_ra = Some(t_ra);
                     st.target_dec = Some(t_dec);
                 }
-                self.shared_position
+                if self.mount_handle.is_enabled() {
+                    self.mount_handle.goto(t_ra, t_dec);
+                }
+                if self
+                    .shared_position
                     .target_op
-                    .store(None, std::sync::atomic::Ordering::Relaxed);
-                self.shared_position
-                    .is_slewing
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-
-                // Consume it so we don't repeatedly trigger it
-                self.shared_position
-                    .target_ra
-                    .store(None, std::sync::atomic::Ordering::Relaxed);
-                self.shared_position
-                    .target_dec
-                    .store(None, std::sync::atomic::Ordering::Relaxed);
+                    .compare_exchange(
+                        Some(TargetOp::Slew),
+                        None,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    self.shared_position
+                        .target_ra
+                        .store(None, Ordering::Relaxed);
+                    self.shared_position
+                        .target_dec
+                        .store(None, Ordering::Relaxed);
+                    self.shared_position
+                        .is_slewing
+                        .store(true, Ordering::Release);
+                }
             }
 
             if self
@@ -1484,7 +1615,9 @@ impl Engine {
                 }
 
                 if let Some(bg) = res.background_level {
-                    self.auto_adjust_gain(bg);
+                    if !self.mount_handle.is_physically_slewing() {
+                        self.auto_adjust_gain(bg);
+                    }
                 }
                 let per_crop_centroid_counts = res.per_crop_centroid_counts.clone();
                 let actual_gain = res.gain;
@@ -1500,6 +1633,9 @@ impl Engine {
                 let stacked_frames = res.stacked_frames;
                 let frame_interval_us = res.frame_interval_us;
                 let metadata_valid = res.metadata_valid;
+                let frame_slew_epoch = res.slew_epoch;
+                self.mount_handle
+                    .set_expected_solve_window_ms(exp_time.as_millis() as u64);
                 let mut pending_sync = None;
 
                 // 3. Process Sync Request (Requires active frame)
@@ -1559,12 +1695,8 @@ impl Engine {
                 }
 
                 let engine_state = self.engine_state.read().unwrap();
-                let lat_opt = engine_state
-                    .client_latitude
-                    .or(self.shared_position.site_latitude.load(Ordering::Relaxed));
-                let lon_opt = engine_state
-                    .client_longitude
-                    .or(self.shared_position.site_longitude.load(Ordering::Relaxed));
+                let (lat_opt, lon_opt) =
+                    resolve_site_location(&engine_state, &self.shared_position);
                 let is_strict = engine_state.strict_match;
                 drop(engine_state);
 
@@ -1654,6 +1786,7 @@ impl Engine {
                                 if let (Some(x), Some(y)) = (tx[0], ty[0]) {
                                     self.target_pixel = Some((x, y));
                                     self.save_target_pixel(self.target_pixel);
+                                    self.mount_handle.notify_target_pixel_changed();
                                     if let Ok(mut state) = self.engine_state.write() {
                                         state.target_pixel_x = Some(x);
                                         state.target_pixel_y = Some(y);
@@ -1745,6 +1878,8 @@ impl Engine {
                         }
                         solved = true;
 
+                        self.mount_handle.on_solved(ra, dec, frame_slew_epoch);
+
                         self.update_solve_stats(
                             true,
                             count,
@@ -1800,7 +1935,9 @@ impl Engine {
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
 
-                if let Some(ac) = adaptive_controller.as_mut() {
+                if !self.mount_handle.is_physically_slewing()
+                    && let Some(ac) = adaptive_controller.as_mut()
+                {
                     let mut match_ratio = None;
                     if solved {
                         let num_crop_centroids = sliced_batch[batch_solution.crop_index].0.nrows();
@@ -2150,34 +2287,44 @@ mod tests {
         assert_eq!(labels, super::VIRTUAL_CROP_LABELS);
     }
 
-    #[test]
-    fn test_update_solve_stats_crop_status() {
-        let camera = Arc::new(crate::dummy_camera::DummyCamera::new());
+    fn create_test_engine(
+        config: EngineConfig,
+        initial_fov: Option<f64>,
+    ) -> (Engine, Arc<RwLock<EngineStateData>>) {
+        use crate::dummy_camera::DummyCamera;
+        use olive_solve::FusedSolver;
+        use std::collections::VecDeque;
+        use std::path::Path;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Condvar, Mutex};
+
+        let camera = Arc::new(DummyCamera::new());
         let engine_state = Arc::new(RwLock::new(EngineStateData::default()));
         let shared_position = Arc::new(SharedPosition::default());
-        let timescale = Arc::new(starfield::time::Timescale::default());
+        let timescale = Arc::new(Timescale::default());
         let server = Lx200WifiTelescope::new(
             shared_position.clone(),
-            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
             timescale.clone(),
         );
         let lx200_controller = server.get_controller();
         let fused_solver = Arc::new(
-            olive_solve::FusedSolver::new(
-                std::path::Path::new("../olive-solve/tetra3/tests/fixtures/default_database.npz"),
+            FusedSolver::new(
+                Path::new("../olive-solve/tetra3/tests/fixtures/default_database.npz"),
                 None,
                 None,
                 false,
             )
             .unwrap(),
         );
+        let mount_handle = MountHandle::start(timescale.clone(), None);
 
-        let mut engine = Engine {
+        let engine = Engine {
             camera,
-            config: EngineConfig::default(),
+            config,
             last_gain_adjust: None,
             fused_solver,
-            fov: Some(15.0),
+            fov: initial_fov,
             distortion: None,
             active_zoom: 1.0,
             shared_position,
@@ -2186,18 +2333,25 @@ mod tests {
             target_pixel: None,
             target_pixel_key: "target_pixel_demo".to_string(),
             storage: None,
-            client_connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            client_connected: Arc::new(AtomicBool::new(false)),
             engine_state: engine_state.clone(),
-            solve_timestamps: std::collections::VecDeque::with_capacity(60),
-            shared_result: Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new())),
-            is_running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            clear_stacker: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            solve_timestamps: VecDeque::with_capacity(60),
+            shared_result: Arc::new((Mutex::new(None), Condvar::new())),
+            is_running: Arc::new(AtomicBool::new(true)),
+            clear_stacker: Arc::new(AtomicBool::new(false)),
             telescope_server_handle: None,
             alpaca_server_handle: None,
             rt_handle: None,
             lx200_controller,
+            mount_handle,
             timescale,
         };
+        (engine, engine_state)
+    }
+
+    #[test]
+    fn test_update_solve_stats_crop_status() {
+        let (mut engine, engine_state) = create_test_engine(EngineConfig::default(), Some(15.0));
 
         // 1. Initial state has None
         assert_eq!(engine_state.read().unwrap().solved_crop, None);
@@ -2256,52 +2410,7 @@ mod tests {
 
     #[test]
     fn test_active_imu_and_low_confidence_handling() {
-        let camera = Arc::new(crate::dummy_camera::DummyCamera::new());
-        let engine_state = Arc::new(RwLock::new(EngineStateData::default()));
-        let shared_position = Arc::new(SharedPosition::default());
-        let timescale = Arc::new(starfield::time::Timescale::default());
-        let server = Lx200WifiTelescope::new(
-            shared_position.clone(),
-            Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            timescale.clone(),
-        );
-        let lx200_controller = server.get_controller();
-        let fused_solver = Arc::new(
-            olive_solve::FusedSolver::new(
-                std::path::Path::new("../olive-solve/tetra3/tests/fixtures/default_database.npz"),
-                None,
-                None,
-                false,
-            )
-            .unwrap(),
-        );
-
-        let mut engine = Engine {
-            camera,
-            config: EngineConfig::default(),
-            last_gain_adjust: None,
-            fused_solver: fused_solver.clone(),
-            fov: Some(15.0),
-            distortion: None,
-            active_zoom: 1.0,
-            shared_position,
-            target_ra: None,
-            target_dec: None,
-            target_pixel: None,
-            target_pixel_key: "target_pixel_demo".to_string(),
-            storage: None,
-            client_connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            engine_state: engine_state.clone(),
-            solve_timestamps: std::collections::VecDeque::with_capacity(60),
-            shared_result: Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new())),
-            is_running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            clear_stacker: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            telescope_server_handle: None,
-            alpaca_server_handle: None,
-            rt_handle: None,
-            lx200_controller,
-            timescale,
-        };
+        let (mut engine, engine_state) = create_test_engine(EngineConfig::default(), Some(15.0));
 
         // 1. When no IMU is running, get_motion_state() is None
         let has_active_imu = engine.fused_solver.get_motion_state().is_some();
@@ -2361,56 +2470,14 @@ mod tests {
 
     #[test]
     fn test_fov_updated_from_solver() {
-        let camera = Arc::new(crate::dummy_camera::DummyCamera::new());
-        let engine_state = Arc::new(RwLock::new(EngineStateData::default()));
-        let shared_position = Arc::new(SharedPosition::default());
-        let timescale = Arc::new(starfield::time::Timescale::default());
-        let server = Lx200WifiTelescope::new(
-            shared_position.clone(),
-            Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            timescale.clone(),
-        );
-        let lx200_controller = server.get_controller();
-        let fused_solver = Arc::new(
-            olive_solve::FusedSolver::new(
-                std::path::Path::new("../olive-solve/tetra3/tests/fixtures/default_database.npz"),
-                None,
-                None,
-                false,
-            )
-            .unwrap(),
-        );
-
         let initial_fov = 58.0;
-        let mut engine = Engine {
-            camera,
-            config: EngineConfig {
+        let (mut engine, engine_state) = create_test_engine(
+            EngineConfig {
                 initial_fov: Some(initial_fov as f32),
                 ..EngineConfig::default()
             },
-            last_gain_adjust: None,
-            fused_solver,
-            fov: Some(initial_fov),
-            distortion: None,
-            active_zoom: 1.0,
-            shared_position,
-            target_ra: None,
-            target_dec: None,
-            target_pixel: None,
-            target_pixel_key: "target_pixel_demo".to_string(),
-            storage: None,
-            client_connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            engine_state: engine_state.clone(),
-            solve_timestamps: std::collections::VecDeque::with_capacity(60),
-            shared_result: Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new())),
-            is_running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            clear_stacker: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            telescope_server_handle: None,
-            alpaca_server_handle: None,
-            rt_handle: None,
-            lx200_controller,
-            timescale,
-        };
+            Some(initial_fov),
+        );
 
         // Before solve: fov is initial seed
         assert_eq!(engine.fov, Some(58.0));
@@ -2557,6 +2624,8 @@ mod tests {
 
 impl Drop for Engine {
     fn drop(&mut self) {
+        self.is_running.store(false, Ordering::SeqCst);
+        self.mount_handle.shutdown();
         if let Some(handle) = self.telescope_server_handle.take() {
             handle.abort();
         }

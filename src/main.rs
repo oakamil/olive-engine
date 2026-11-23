@@ -2,13 +2,18 @@
 // See LICENSE.md in the repository root for license terms.
 
 use clap::Parser;
-use log::info;
+use log::{error, info};
+use std::net::{IpAddr, SocketAddr};
+use std::process::exit;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::sleep;
 
 use olive_engine::CameraTrait;
 use olive_engine::camera::Camera as LibCamera;
 use olive_engine::control_server;
 use olive_engine::engine::{Engine, EngineConfig};
+use olive_engine::mount::MountConfig;
 use olive_engine::uvc_camera::Camera as UvcCamera;
 
 #[derive(Parser, Debug)]
@@ -61,6 +66,51 @@ struct Args {
     /// Enable automatic tuning (gain, stacking, extraction)
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     auto_mode: bool,
+
+    /// Optional iOptron Wi-Fi mount address (`<host>` or `<host>:<port>`, default port 8899)
+    #[arg(long)]
+    mount_host: Option<String>,
+}
+
+fn parse_mount_host(raw: &str) -> Result<(String, u16), String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("Mount host cannot be empty".to_string());
+    }
+    let (host, port) = if let Some(rest) = trimmed.strip_prefix('[') {
+        let Some((h, after)) = rest.split_once(']') else {
+            return Err(format!("Unclosed '[' in --mount-host {:?}", raw));
+        };
+        let port = if after.is_empty() {
+            8899
+        } else if let Some(p_str) = after.strip_prefix(':') {
+            p_str
+                .parse::<u16>()
+                .map_err(|_| format!("Invalid port {:?} in --mount-host {:?}", p_str, raw))?
+        } else {
+            return Err(format!("Invalid bracketed --mount-host {:?}", raw));
+        };
+        (h.to_string(), port)
+    } else if let Ok(sock) = trimmed.parse::<SocketAddr>() {
+        (sock.ip().to_string(), sock.port())
+    } else if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        (ip.to_string(), 8899)
+    } else if let Some((h, p_str)) = trimmed.rsplit_once(':') {
+        let port = p_str
+            .parse::<u16>()
+            .map_err(|_| format!("Invalid port {:?} in --mount-host {:?}", p_str, raw))?;
+        (h.to_string(), port)
+    } else {
+        (trimmed.to_string(), 8899)
+    };
+
+    if host.is_empty() {
+        return Err(format!("Missing host in --mount-host {:?}", raw));
+    }
+    if port == 0 {
+        return Err(format!("Port cannot be 0 in --mount-host {:?}", raw));
+    }
+    Ok((host, port))
 }
 
 #[tokio::main]
@@ -144,6 +194,19 @@ async fn main() {
         None,
     )
     .await;
+    let mount_handle = engine.mount_handle();
+    if let Some(ref mount_addr) = args.mount_host {
+        match parse_mount_host(mount_addr) {
+            Ok((host, port)) => {
+                info!("Enabling iOptron mount control at {}:{}", host, port);
+                mount_handle.configure(Some(MountConfig::ioptron(host, port)));
+            }
+            Err(err) => {
+                error!("Invalid --mount-host: {}", err);
+                exit(2);
+            }
+        }
+    }
     let _ = engine.fused_solver.start_imu();
     let _ = engine.start();
 
@@ -152,5 +215,7 @@ async fn main() {
         .await
         .expect("Failed to listen for Ctrl-C");
     info!("Received Ctrl-C, shutting down...");
-    std::process::exit(0);
+    mount_handle.shutdown();
+    sleep(Duration::from_millis(50)).await;
+    exit(0);
 }

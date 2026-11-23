@@ -146,6 +146,24 @@ impl AtomicTargetOp {
     pub fn store(&self, val: Option<TargetOp>, order: Ordering) {
         self.0.store(Self::to_u8(val), order);
     }
+
+    pub fn compare_exchange(
+        &self,
+        current: Option<TargetOp>,
+        new: Option<TargetOp>,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<(), Option<TargetOp>> {
+        self.0
+            .compare_exchange(Self::to_u8(current), Self::to_u8(new), success, failure)
+            .map(|_| ())
+            .map_err(|actual| match actual {
+                1 => Some(TargetOp::Sync),
+                2 => Some(TargetOp::Slew),
+                3 => Some(TargetOp::Abort),
+                _ => None,
+            })
+    }
 }
 
 /// Atomic coordinates and synchronization commands shared between telescope servers and solving engine.
