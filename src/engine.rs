@@ -14,11 +14,14 @@ use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 use starfield::time::Timescale;
 use tokio::sync::mpsc::Receiver;
+use tokio::task::spawn_blocking;
 use tokio::time::interval;
 
 use crate::alpaca_server::AlpacaServer;
 use crate::mount::{MountHandle, MountUiState};
-use crate::telescope_server::{Lx200Telescope, Lx200WifiTelescope, SharedPosition, TargetOp};
+use crate::telescope_server::{
+    Lx200Telescope, Lx200WifiTelescope, SharedPosition, TargetOp, precess_coordinates,
+};
 use crate::{CameraConfig, CameraTrait, CameraType};
 use tetra3::{
     fast_extractor::{FastBgSubMode, FastDownsample, FastExtractOptions, FastExtractor},
@@ -273,6 +276,8 @@ pub struct EngineStateData {
     pub mount_model: Option<String>,
     /// Latest concise mount status or error notice.
     pub mount_notice: Option<String>,
+    /// `true` when the connected mount is ready to accept GoTo commands.
+    pub mount_goto_ready: bool,
 }
 
 impl Default for EngineStateData {
@@ -322,6 +327,7 @@ impl Default for EngineStateData {
             mount_state: MountUiState::Disabled,
             mount_model: None,
             mount_notice: None,
+            mount_goto_ready: false,
         }
     }
 }
@@ -482,7 +488,7 @@ impl Engine {
         let is_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
         let timescale = Arc::new(
-            tokio::task::spawn_blocking(|| starfield::time::Timescale::default())
+            spawn_blocking(Timescale::default)
                 .await
                 .expect("Failed to initialize Timescale"),
         );
@@ -546,12 +552,8 @@ impl Engine {
                 if mount_handle_poll.is_enabled() {
                     mount_was_enabled = true;
                     let op = shared_pos_clone.target_op.load(Ordering::Acquire);
-                    if op == Some(TargetOp::Abort)
-                        && !mount_handle_poll.is_abort_pending()
-                        && (mount_handle_poll.is_goto_active()
-                            || mount_handle_poll.is_physically_slewing())
-                    {
-                        mount_handle_poll.abort();
+                    if op == Some(TargetOp::Abort) {
+                        mount_handle_poll.abort_if_active();
                     }
 
                     let (lat, lon, has_pending_ui_goto) =
@@ -571,9 +573,11 @@ impl Engine {
                     if op == Some(TargetOp::Slew) || has_pending_ui_goto {
                         shared_pos_clone.is_slewing.store(true, Ordering::Release);
                     } else {
+                        let slewing = mount_handle_poll.is_goto_active()
+                            || mount_handle_poll.is_physically_slewing();
                         shared_pos_clone
                             .is_slewing
-                            .store(mount_handle_poll.is_goto_active(), Ordering::Release);
+                            .store(slewing, Ordering::Release);
                     }
 
                     let (mt, seq) = mount_handle_poll.telemetry_with_seq();
@@ -583,6 +587,7 @@ impl Engine {
                             state.mount_state = mt.state;
                             state.mount_model = mt.model;
                             state.mount_notice = mt.notice;
+                            state.mount_goto_ready = mt.goto_ready;
                         }
                     }
                 } else if mount_was_enabled {
@@ -593,6 +598,7 @@ impl Engine {
                         state.mount_state = MountUiState::Disabled;
                         state.mount_model = None;
                         state.mount_notice = None;
+                        state.mount_goto_ready = false;
                     }
                 }
 
@@ -1423,13 +1429,7 @@ impl Engine {
                 if let (Some(ra), Some(dec)) = (st.requested_target_ra, st.requested_target_dec) {
                     let epoch = st.requested_target_epoch.unwrap_or(2000.0);
                     let (ra_j2000, dec_j2000) = if (epoch - 2000.0).abs() > 0.001 {
-                        crate::telescope_server::precess_coordinates(
-                            ra,
-                            dec,
-                            epoch,
-                            2000.0,
-                            &self.timescale,
-                        )
+                        precess_coordinates(ra, dec, epoch, 2000.0, &self.timescale)
                     } else {
                         (ra, dec)
                     };
@@ -1509,13 +1509,7 @@ impl Engine {
                     st.target_ra = None;
                     st.target_dec = None;
                 }
-                if self.mount_handle.is_enabled()
-                    && !self.mount_handle.is_abort_pending()
-                    && (self.mount_handle.is_goto_active()
-                        || self.mount_handle.is_physically_slewing())
-                {
-                    self.mount_handle.abort();
-                }
+                self.mount_handle.abort_if_active();
                 let _ = self.shared_position.target_op.compare_exchange(
                     Some(TargetOp::Abort),
                     None,

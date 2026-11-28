@@ -7,19 +7,19 @@
 //! mounts with automatic V2.5 vs V3.10 dialect detection via `:GLS#` length.
 
 use std::io::{Error, ErrorKind, Read, Result as IoResult, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::str::from_utf8;
-use std::time::Duration;
 
 use chrono::{DateTime, Datelike, Timelike};
 use log::{info, trace};
 
-use super::{MountDriver, MountRawStatus, TcpConnector, angular_separation_deg};
+use super::{
+    MountDriver, MountRawStatus, StartTrackingOutcome, TcpConnector, angular_separation_deg,
+    connect_tcp_stream, invalid_data,
+};
 
 const J2000_NOON_UNIX_MS: i64 = 946_728_000_000;
 const SYNC_READBACK_MAX_ERROR_DEG: f64 = 0.25;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const IO_TIMEOUT: Duration = Duration::from_millis(350);
 const MAX_HASH_REPLY_LEN: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,19 +45,11 @@ impl IoptronMount {
         port: u16,
         connector: Option<&TcpConnector>,
     ) -> IoResult<Self> {
-        let stream = if let Some(connect_fn) = connector {
-            connect_fn(host, port)?
-        } else {
-            connect_default_tcp(host, port, CONNECT_TIMEOUT)?
-        };
+        let stream = connect_tcp_stream(host, port, connector)?;
         Self::from_stream(stream)
     }
 
     fn from_stream(mut stream: TcpStream) -> IoResult<Self> {
-        let _ = stream.set_nodelay(true);
-        stream.set_read_timeout(Some(IO_TIMEOUT))?;
-        stream.set_write_timeout(Some(IO_TIMEOUT))?;
-
         // `:MountInfo#` returns exactly 4 ASCII digits with no `#` terminator.
         send_raw(&mut stream, b":MountInfo#")?;
         let mut info_buf = [0u8; 4];
@@ -167,6 +159,7 @@ impl MountDriver for IoptronMount {
             gps_locked,
             ra_jnow_deg,
             dec_jnow_deg,
+            safety_notice: None,
         })
     }
 
@@ -199,8 +192,16 @@ impl MountDriver for IoptronMount {
         }
     }
 
-    fn start_tracking(&mut self) -> IoResult<bool> {
-        self.send_action(":ST1#")
+    fn start_tracking(&mut self) -> IoResult<StartTrackingOutcome> {
+        Ok(if self.send_action(":ST1#")? {
+            StartTrackingOutcome::Started
+        } else {
+            StartTrackingOutcome::Refused
+        })
+    }
+
+    fn stop_tracking(&mut self) -> IoResult<bool> {
+        self.send_action(":ST0#")
     }
 
     fn abort(&mut self) -> IoResult<()> {
@@ -234,25 +235,8 @@ impl MountDriver for IoptronMount {
     }
 }
 
-fn invalid_data(msg: impl Into<String>) -> Error {
-    Error::new(ErrorKind::InvalidData, msg.into())
-}
-
 fn invalid_input(msg: impl Into<String>) -> Error {
     Error::new(ErrorKind::InvalidInput, msg.into())
-}
-
-fn connect_default_tcp(host: &str, port: u16, timeout: Duration) -> IoResult<TcpStream> {
-    let mut last_err = None;
-    // Try at most two resolved addresses (e.g. IPv4 + IPv6) to bound teardown latency.
-    for addr in (host, port).to_socket_addrs()?.take(2) {
-        match TcpStream::connect_timeout(&addr, timeout) {
-            Ok(s) => return Ok(s),
-            Err(e) => last_err = Some(e),
-        }
-    }
-    Err(last_err
-        .unwrap_or_else(|| Error::new(ErrorKind::AddrNotAvailable, "No socket address resolved")))
 }
 
 fn send_raw(stream: &mut TcpStream, bytes: &[u8]) -> IoResult<()> {
@@ -666,6 +650,7 @@ mod tests {
             .unwrap();
         assert!(m.sync_jnow(120.5, 33.25).unwrap().is_ok());
         assert!(m.goto_jnow(125.0, 35.0).unwrap());
+        assert!(m.stop_tracking().unwrap());
         m.abort().unwrap();
 
         let cmds = log.lock().unwrap();
@@ -674,6 +659,7 @@ mod tests {
         assert!(cmds.iter().any(|c| c == ":SDS0#"));
         assert!(cmds.iter().any(|c| c.starts_with(":SUT")));
         assert!(cmds.iter().any(|c| c == ":MS1#"));
+        assert!(cmds.iter().any(|c| c == ":ST0#"));
         assert!(cmds.iter().any(|c| c == ":Q#"));
     }
 

@@ -13,7 +13,7 @@ use olive_engine::CameraTrait;
 use olive_engine::camera::Camera as LibCamera;
 use olive_engine::control_server;
 use olive_engine::engine::{Engine, EngineConfig};
-use olive_engine::mount::MountConfig;
+use olive_engine::mount::{MountConfig, MountProtocol};
 use olive_engine::uvc_camera::Camera as UvcCamera;
 
 #[derive(Parser, Debug)]
@@ -67,12 +67,16 @@ struct Args {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     auto_mode: bool,
 
-    /// Optional iOptron Wi-Fi mount address (`<host>` or `<host>:<port>`, default port 8899)
+    /// Optional Wi-Fi mount address (`<host>` or `<host>:<port>`)
     #[arg(long)]
     mount_host: Option<String>,
+
+    /// Wireless mount protocol (`ioptron`, `skywatcher`, `celestron`)
+    #[arg(long, value_enum, default_value_t = MountProtocol::Ioptron)]
+    mount_protocol: MountProtocol,
 }
 
-fn parse_mount_host(raw: &str) -> Result<(String, u16), String> {
+fn parse_mount_host(raw: &str, default_port: u16) -> Result<(String, u16), String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err("Mount host cannot be empty".to_string());
@@ -82,7 +86,7 @@ fn parse_mount_host(raw: &str) -> Result<(String, u16), String> {
             return Err(format!("Unclosed '[' in --mount-host {:?}", raw));
         };
         let port = if after.is_empty() {
-            8899
+            default_port
         } else if let Some(p_str) = after.strip_prefix(':') {
             p_str
                 .parse::<u16>()
@@ -94,14 +98,14 @@ fn parse_mount_host(raw: &str) -> Result<(String, u16), String> {
     } else if let Ok(sock) = trimmed.parse::<SocketAddr>() {
         (sock.ip().to_string(), sock.port())
     } else if let Ok(ip) = trimmed.parse::<IpAddr>() {
-        (ip.to_string(), 8899)
+        (ip.to_string(), default_port)
     } else if let Some((h, p_str)) = trimmed.rsplit_once(':') {
         let port = p_str
             .parse::<u16>()
             .map_err(|_| format!("Invalid port {:?} in --mount-host {:?}", p_str, raw))?;
         (h.to_string(), port)
     } else {
-        (trimmed.to_string(), 8899)
+        (trimmed.to_string(), default_port)
     };
 
     if host.is_empty() {
@@ -196,10 +200,11 @@ async fn main() {
     .await;
     let mount_handle = engine.mount_handle();
     if let Some(ref mount_addr) = args.mount_host {
-        match parse_mount_host(mount_addr) {
+        let protocol = args.mount_protocol;
+        match parse_mount_host(mount_addr, protocol.default_port()) {
             Ok((host, port)) => {
-                info!("Enabling iOptron mount control at {}:{}", host, port);
-                mount_handle.configure(Some(MountConfig::ioptron(host, port)));
+                info!("Enabling {:?} mount control at {}:{}", protocol, host, port);
+                mount_handle.configure(Some(MountConfig::new(protocol, host, port)));
             }
             Err(err) => {
                 error!("Invalid --mount-host: {}", err);
@@ -216,6 +221,6 @@ async fn main() {
         .expect("Failed to listen for Ctrl-C");
     info!("Received Ctrl-C, shutting down...");
     mount_handle.shutdown();
-    sleep(Duration::from_millis(50)).await;
+    sleep(Duration::from_millis(500)).await;
     exit(0);
 }
