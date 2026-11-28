@@ -193,6 +193,7 @@ impl CelestronAuxMount {
     }
 
     fn halt_axis(&mut self, idx: usize) -> IoResult<()> {
+        // Sending MC_MOVE_*(0) aborts both manual slews and active MC_GOTO_FAST slews on AUX.
         let r_move = self.stop_manual_axis(idx);
         let r_rate = self.set_axis_rate_steps(idx, 0, true);
         r_move.and(r_rate)

@@ -77,7 +77,7 @@ pub(super) trait RawAxisMount: Send {
     /// Sets continuous tracking velocities `(rad/sec, rad/sec)` on both axes.
     fn set_rates_rad_per_sec(&mut self, rate1: f64, rate2: f64) -> IoResult<()>;
     /// Commands continuous manual slewing (`axis*_dir` in `-1..=1`, `speed` in `1..=9`),
-    /// or stops and waits for deceleration settle when `(0, 0, _)`.
+    /// or stops and waits for deceleration settle when `(0, 0, _)` or `speed == 0`.
     fn manual_slew(&mut self, axis1_dir: i8, axis2_dir: i8, speed: u8) -> IoResult<()>;
     /// Halts all motion on both axes.
     fn abort(&mut self) -> IoResult<()>;
@@ -257,6 +257,7 @@ impl<M: RawAxisMount> MountDriver for KinematicMount<M> {
         let (ax1, ax2) = self.raw.read_axes_rad()?;
         let now = Utc::now();
 
+        // Rate-mode manual slews report false from raw.is_slewing(), so short-circuit before poll/tracking.
         if self.manual_moving {
             let (ra_jnow_deg, dec_jnow_deg) = self
                 .model

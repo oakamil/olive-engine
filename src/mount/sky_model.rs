@@ -91,6 +91,7 @@ fn try_record_fit(
             .map(|s| wrap_pi(sign2 * (s.ax2 - th2_0)).abs())
             .sum::<f64>()
             / samples.len() as f64;
+        // Prefer keeping sample 0 unflipped (|phi2| <= π/2) so probes stepping across a pole recover the pre-probe posture.
         let s0_unflipped = wrap_pi(sign2 * (samples[0].ax2 - th2_0)).abs() <= FRAC_PI_2;
         if s0_unflipped || mean_abs_elev <= FRAC_PI_2 {
             let cand = FitSolution {
@@ -417,6 +418,7 @@ struct GemMeridianState {
 }
 
 fn ha_earth_rad(u_earth: Vector3<f64>, lon_deg: f64) -> f64 {
+    // HA = LST - RA = (GAST + lon_obs) - (GAST + lon_u) = lon_obs - lon_u.
     let lon_u = u_earth.y.atan2(u_earth.x);
     wrap_pi(lon_deg.to_radians() - lon_u)
 }
@@ -444,6 +446,7 @@ fn compute_gem_state(
         if horiz * ha.sin().abs() < 1e-3 {
             return None;
         }
+        // Assumes calibration reference sample p_ref was taken counterweight-down.
         let on_branch_a = wrap_pi(sol.s2 * (p_ref.ax2 - sol.theta2_0)).abs() <= FRAC_PI_2;
         let is_east = ha < 0.0;
         (on_branch_a == is_east, p_ref.ax1, p_ref.ax2)

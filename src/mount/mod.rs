@@ -5,8 +5,8 @@
 //!
 //! Runs a single blocking `std::thread` controller (`MountController`) over a
 //! small synchronous `MountDriver` trait. Keeping the mount loop off Tokio
-//! avoids cancelling half-duplex serial-over-WiFi TCP reads mid-flight and lets
-//! `:Q#` aborts fire immediately on the already-open socket.
+//! avoids cancelling half-duplex TCP/UDP exchanges mid-flight and keeps aborts
+//! serialized on the same socket.
 
 mod celestron_aux;
 mod ioptron;
@@ -235,7 +235,8 @@ trait MountDriver: Send {
     fn is_goto_ready(&self) -> bool {
         true
     }
-    /// Returns `true` for Class B mounts whose continuous tracking rates must be halted on disconnect.
+    /// Returns `true` for Class B mounts whose tracking is host-driven (halted on disconnect;
+    /// syncs without hardware tracking active).
     fn requires_host_tracking(&self) -> bool {
         false
     }
@@ -258,7 +259,7 @@ trait MountDriver: Send {
         Ok(false)
     }
     /// Commands continuous directional manual slewing (`axis*_dir` in `-1..=1`, `speed` in `1..=9`),
-    /// or stops manual motion when `(0, 0, _)`. Works even before plate solving or calibration.
+    /// or stops when `(0, 0, _)` or `speed == 0`. Works even before plate solving or calibration.
     fn manual_slew(&mut self, _axis1_dir: i8, _axis2_dir: i8, _speed: u8) -> IoResult<()> {
         Ok(())
     }
@@ -537,12 +538,14 @@ pub struct MountHandle {
     cmd_tx: Sender<MountCmd>,
     enabled: AtomicBool,
     connected: AtomicBool,
-    /// Monotonic command sequence bumped on GoTo, Abort, disable, and shutdown.
+    /// Monotonic command sequence bumped on control commands (GoTo, Calibrate, SetTracking,
+    /// manual slew start, Abort, disable/shutdown).
     /// Kept separate from `FenceState.slew_epoch` so polls/reconnects never drop valid GoTos.
     cmd_seq: AtomicU64,
     abort_flag: AtomicBool,
     goto_active: AtomicBool,
     wants_solve: AtomicBool,
+    // Lock order: `manual_slew` -> `fence` (never acquire `manual_slew` while holding `fence`).
     fence: Mutex<FenceState>,
     manual_slew: Mutex<ManualSlewSlot>,
     manual_deadman_timeout: Duration,
@@ -672,7 +675,7 @@ impl MountHandle {
         if !self.enabled.load(Ordering::Acquire) {
             return;
         }
-        // Serialize cmd_seq/fence updates with `manual_slew()` so concurrent callers never drop both.
+        // Serialize cmd_seq/fence updates with `manual_slew()`/`abort()` so concurrent calls never desynchronize state.
         let seq = {
             let _slot = self.manual_slew.lock().unwrap();
             let seq = self.cmd_seq.fetch_add(1, Ordering::SeqCst) + 1;
@@ -799,7 +802,8 @@ impl MountHandle {
         let _ = self.cmd_tx.send(MountCmd::TargetPixelChanged);
     }
 
-    /// Updates observer latitude/longitude (degrees, East positive) used for horizon floor and GPS-unlocked seeding.
+    /// Updates observer latitude/longitude (degrees, East positive) for horizon limits,
+    /// GPS-unlocked seeding, and Class B site/GEM modeling.
     pub fn set_site_location(&self, lat: Option<f64>, lon: Option<f64>) {
         if lat.is_some() {
             self.site_lat.store(lat, Ordering::Relaxed);
@@ -1361,7 +1365,7 @@ impl MountController {
             return;
         }
 
-        // If a new GoTo/Calibrate/Abort was queued while `driver.poll()` blocked on I/O,
+        // If a new control command was queued while `driver.poll()` blocked on I/O,
         // defer state transitions so the queued command is handled cleanly next loop.
         if self.handle.cmd_seq.load(Ordering::Acquire) != cmd_seq_before_poll {
             return;
@@ -1479,6 +1483,7 @@ impl MountController {
                 } else {
                     prev.notice
                 };
+                // Keep TrackingNoSolve and its timeout notice while open-loop tracking continues.
                 if prev.state != MountUiState::TrackingNoSolve || ui_state != MountUiState::Tracking
                 {
                     self.handle.set_state_and_notice(ui_state, notice);
@@ -1709,6 +1714,7 @@ impl MountController {
         }
     }
 
+    /// Clears `MountHandle::goto()`'s optimistic fence and resyncs wait epochs so active motion/solves aren't disrupted.
     fn reject_goto_preserving_active_motion(&mut self, idle_state: MountUiState, notice: String) {
         match self.state {
             ControllerState::Calibrating { post_action, .. } => {
@@ -1901,7 +1907,7 @@ impl MountController {
     }
 
     fn handle_goto(&mut self, ra_j2000: f64, dec_j2000: f64, cmd_seq: u64) {
-        // Skip GoTos superseded by a newer GoTo, Abort, disable, or shutdown.
+        // Skip GoTos superseded by a newer command, Abort, disable, or shutdown.
         if self.is_stale_command(cmd_seq) {
             return;
         }
@@ -2182,6 +2188,7 @@ impl MountController {
                         return;
                     }
                 }
+                // Targets inside the ±85° gimbal cone (e.g. Polaris) cannot be GoTo-targeted, so track in place.
                 let next_action = match post_action {
                     CalPostAction::ReturnToInitialAndTrack
                         if dec_jnow.abs() <= CALIBRATION_RETURN_MAX_DEC_DEG =>
@@ -2281,7 +2288,7 @@ impl MountController {
     fn handle_abort(&mut self) {
         if !self.is_actively_moving() {
             self.handle.goto_active.store(false, Ordering::Release);
-            // Clear optimistic fence if a queued GoTo was superseded before running.
+            // Clear optimistic fence if a queued GoTo or manual slew was superseded before running.
             if self.handle.is_physically_slewing() {
                 self.handle.clear_slewing(false);
             }

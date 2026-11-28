@@ -551,6 +551,7 @@ impl Engine {
 
                 if mount_handle_poll.is_enabled() {
                     mount_was_enabled = true;
+                    // Poll abort here too so aborts fire within ~33ms even while t2 is blocked solving.
                     let op = shared_pos_clone.target_op.load(Ordering::Acquire);
                     if op == Some(TargetOp::Abort) {
                         mount_handle_poll.abort_if_active();
@@ -570,6 +571,7 @@ impl Engine {
                         };
                     mount_handle_poll.set_site_location(lat, lon);
 
+                    // Keep is_slewing=true across the handoff window until t2 calls mount_handle.goto().
                     if op == Some(TargetOp::Slew) || has_pending_ui_goto {
                         shared_pos_clone.is_slewing.store(true, Ordering::Release);
                     } else {
@@ -1408,7 +1410,7 @@ impl Engine {
                 return;
             }
 
-            // 1. Process Local UI Requests (JNI/Push-To GoTo & Pixel Align)
+            // 1. Process Local UI Requests (GoTo, Abort, Pixel Align & Sync)
             if let Ok(mut st) = self.engine_state.write() {
                 if st.requested_target_clear {
                     self.target_ra = None;
@@ -1534,6 +1536,7 @@ impl Engine {
                 if self.mount_handle.is_enabled() {
                     self.mount_handle.goto(t_ra, t_dec);
                 }
+                // CAS avoids clobbering a concurrent Abort or newer Slew posted by LX200/Alpaca.
                 if self
                     .shared_position
                     .target_op
@@ -1677,7 +1680,6 @@ impl Engine {
                     solve_options.fov_estimate = None;
                     solve_options.fov_max_error = None;
                 }
-                // Check for pending sync or slew already processed above
 
                 if let Some(tp) = self.target_pixel {
                     solve_options.target_pixel =

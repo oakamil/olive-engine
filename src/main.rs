@@ -221,6 +221,7 @@ async fn main() {
         .expect("Failed to listen for Ctrl-C");
     info!("Received Ctrl-C, shutting down...");
     mount_handle.shutdown();
+    // Allow the non-blocking MountController thread to send abort/halt commands before exit.
     sleep(Duration::from_millis(500)).await;
     exit(0);
 }

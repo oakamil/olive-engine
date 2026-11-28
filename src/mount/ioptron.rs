@@ -165,6 +165,7 @@ impl IoptronMount {
                 self.manual_axes.1 = 0;
             }
         }
+        // Directional arrow commands (:me/mw/mn/ms#) produce no reply on V2.5/V3.10.
         if target > 0 {
             trace!("iOptron TX: {}", from_utf8(pos_cmd).unwrap_or("?"));
             send_raw(&mut self.stream, pos_cmd)?;
