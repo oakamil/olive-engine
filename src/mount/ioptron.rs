@@ -14,8 +14,8 @@ use chrono::{DateTime, Datelike, Timelike};
 use log::{info, trace};
 
 use super::{
-    MountDriver, MountRawStatus, StartTrackingOutcome, TcpConnector, angular_separation_deg,
-    connect_tcp_stream, invalid_data,
+    MANUAL_SLEW_MAX_SPEED, MANUAL_SLEW_MIN_SPEED, MountDriver, MountRawStatus,
+    StartTrackingOutcome, TcpConnector, angular_separation_deg, connect_tcp_stream, invalid_data,
 };
 
 const J2000_NOON_UNIX_MS: i64 = 946_728_000_000;
@@ -36,6 +36,8 @@ pub(super) struct IoptronMount {
     dialect: IoptronDialect,
     model_name: String,
     is_alt_az: bool,
+    manual_axes: (i8, i8),
+    last_manual_speed: Option<u8>,
 }
 
 impl IoptronMount {
@@ -75,6 +77,8 @@ impl IoptronMount {
             dialect,
             model_name,
             is_alt_az,
+            manual_axes: (0, 0),
+            last_manual_speed: None,
         })
     }
 
@@ -128,6 +132,53 @@ impl IoptronMount {
         let dec_cmd = format_set_dec(dec_deg)?;
         self.send_action(&dec_cmd)
     }
+
+    fn stop_manual_axes(&mut self) -> IoResult<()> {
+        if self.manual_axes != (0, 0) {
+            let _ = self.send_action(":q#")?;
+            self.manual_axes = (0, 0);
+        }
+        Ok(())
+    }
+
+    fn set_manual_axis(
+        &mut self,
+        axis_idx: usize,
+        target: i8,
+        stop_cmd: &str,
+        pos_cmd: &[u8],
+        neg_cmd: &[u8],
+    ) -> IoResult<()> {
+        let cur = if axis_idx == 0 {
+            self.manual_axes.0
+        } else {
+            self.manual_axes.1
+        };
+        if cur == target {
+            return Ok(());
+        }
+        if cur != 0 {
+            let _ = self.send_action(stop_cmd)?;
+            if axis_idx == 0 {
+                self.manual_axes.0 = 0;
+            } else {
+                self.manual_axes.1 = 0;
+            }
+        }
+        if target > 0 {
+            trace!("iOptron TX: {}", from_utf8(pos_cmd).unwrap_or("?"));
+            send_raw(&mut self.stream, pos_cmd)?;
+        } else if target < 0 {
+            trace!("iOptron TX: {}", from_utf8(neg_cmd).unwrap_or("?"));
+            send_raw(&mut self.stream, neg_cmd)?;
+        }
+        if axis_idx == 0 {
+            self.manual_axes.0 = target;
+        } else {
+            self.manual_axes.1 = target;
+        }
+        Ok(())
+    }
 }
 
 impl MountDriver for IoptronMount {
@@ -164,6 +215,7 @@ impl MountDriver for IoptronMount {
     }
 
     fn goto_jnow(&mut self, ra_deg: f64, dec_deg: f64) -> IoResult<bool> {
+        self.stop_manual_axes()?;
         if !self.set_target_ra_dec_jnow(ra_deg, dec_deg)? {
             return Ok(false);
         }
@@ -205,8 +257,29 @@ impl MountDriver for IoptronMount {
     }
 
     fn abort(&mut self) -> IoResult<()> {
-        let _ = self.send_action(":Q#")?;
-        Ok(())
+        let q_res = self.send_action(":Q#");
+        let m_res = self.stop_manual_axes();
+        q_res.map(|_| ()).and(m_res)
+    }
+
+    fn manual_slew(&mut self, axis1_dir: i8, axis2_dir: i8, speed: u8) -> IoResult<()> {
+        let a1 = axis1_dir.clamp(-1, 1);
+        let a2 = axis2_dir.clamp(-1, 1);
+        if (a1 == 0 && a2 == 0) || speed == 0 {
+            return self.stop_manual_axes();
+        }
+
+        let spd = speed.clamp(MANUAL_SLEW_MIN_SPEED, MANUAL_SLEW_MAX_SPEED);
+        let speed_changed = self.last_manual_speed != Some(spd);
+        if speed_changed {
+            // Many V2.5/V3.10 firmwares ignore `:SRn#` for already-running arrow motion.
+            self.stop_manual_axes()?;
+            self.require_action(&format!(":SR{}#", spd))?;
+            self.last_manual_speed = Some(spd);
+        }
+
+        self.set_manual_axis(0, a1, ":qR#", b":me#", b":mw#")?;
+        self.set_manual_axis(1, a2, ":qD#", b":mn#", b":ms#")
     }
 
     fn unpark(&mut self) -> IoResult<bool> {
@@ -269,14 +342,39 @@ fn identify_model(code: &str) -> (String, bool) {
         "0123" => ("HAZ130".to_string(), true),
         "5035" => ("AZ Mount Pro".to_string(), true),
         "9035" => ("AZ Mount Pro SM".to_string(), true),
-        "0011" | "0013" | "0022" | "0032" | "0033" | "0034" | "0038" | "0050" | "0051" | "0055"
-        | "0056" | "0064" | "0065" | "0068" | "0069" | "5010" | "5045" | "8033" | "8034"
-        | "8050" | "8051" => (format!("iOptron AA ({})", code), true),
+        "8033" => ("HAE29 AA".to_string(), true),
+        "8034" => ("HAE29EC AA".to_string(), true),
+        "8050" => ("HAE43 AA".to_string(), true),
+        "8051" => ("HAE43EC AA".to_string(), true),
+        "8068" => ("HAE69 AA".to_string(), true),
+        "8069" => ("HAE69EC AA".to_string(), true),
+        "0046" | "5045" => ("iEQ45 Pro AA".to_string(), true),
+        "0013" | "0022" | "0032" | "0038" | "0055" | "0056" | "0064" | "0065" | "5010" => {
+            (format!("iOptron AA ({})", code), true)
+        }
+        "0011" => ("SmartEQ Pro+".to_string(), false),
+        "0015" => ("HEM15".to_string(), false),
+        "0025" => ("CEM25".to_string(), false),
         "0026" => ("CEM26".to_string(), false),
+        "0027" => ("HEM27".to_string(), false),
         "0028" => ("GEM28".to_string(), false),
+        "0029" => ("GEM28EC".to_string(), false),
+        "0030" => ("iEQ30 Pro".to_string(), false),
+        "0033" => ("HAE29".to_string(), false),
+        "0034" => ("HAE29EC".to_string(), false),
         "0040" => ("CEM40".to_string(), false),
+        "0041" => ("CEM40EC".to_string(), false),
         "0043" => ("GEM45".to_string(), false),
+        "0044" => ("GEM45EC".to_string(), false),
+        "0045" => ("iEQ45 Pro".to_string(), false),
+        "0050" => ("HAE43".to_string(), false),
+        "0051" => ("HAE43EC".to_string(), false),
+        "0060" => ("CEM60".to_string(), false),
+        "0061" => ("CEM60EC".to_string(), false),
+        "0068" => ("HAE69".to_string(), false),
+        "0069" => ("HAE69EC".to_string(), false),
         "0070" => ("CEM70".to_string(), false),
+        "0071" => ("CEM70G".to_string(), false),
         "0120" => ("CEM120".to_string(), false),
         _ => (format!("iOptron ({})", code), false),
     }
@@ -465,6 +563,10 @@ mod tests {
         assert_eq!(identify_model("0035"), ("HAZ31".to_string(), true));
         assert_eq!(identify_model("8035"), ("HAZ31SM".to_string(), true));
         assert_eq!(identify_model("5035"), ("AZ Mount Pro".to_string(), true));
+        assert_eq!(identify_model("8033"), ("HAE29 AA".to_string(), true));
+        assert_eq!(identify_model("0033"), ("HAE29".to_string(), false));
+        assert_eq!(identify_model("0011"), ("SmartEQ Pro+".to_string(), false));
+        assert_eq!(identify_model("0027"), ("HEM27".to_string(), false));
         assert_eq!(identify_model("0040"), ("CEM40".to_string(), false));
         assert_eq!(
             identify_model("9999"),
@@ -625,6 +727,9 @@ mod tests {
                         target_dec = s[3..s.len() - 1].parse::<i64>().unwrap() as f64 / 360_000.0;
                         sock.write_all(b"1").unwrap();
                     }
+                    ":mn#" | ":ms#" | ":me#" | ":mw#" => {
+                        // Directional arrow commands produce no reply on iOptron V2.5/V3.10.
+                    }
                     _ => sock.write_all(b"1").unwrap(),
                 }
             }
@@ -688,5 +793,41 @@ mod tests {
     fn test_rejects_non_numeric_mount_info() {
         let (port, _) = spawn_mock_ioptron_server(IoptronDialect::V310, b"1#\r\n", b'2', b'1');
         assert!(IoptronMount::connect("127.0.0.1", port, None).is_err());
+    }
+
+    #[test]
+    fn test_manual_slew_protocol_reversals_speed_change_and_abort() {
+        let (port, log) = spawn_mock_ioptron_server(IoptronDialect::V310, b"0035", b'1', b'7');
+        let mut m = IoptronMount::connect("127.0.0.1", port, None).unwrap();
+
+        // Start East at speed 5 -> :SR5# then :me# (no reply).
+        m.manual_slew(1, 0, 5).unwrap();
+        // Repeating the same state is a no-op on the wire.
+        m.manual_slew(1, 0, 5).unwrap();
+        // Reverse Axis 1 (East -> West) -> :qR# before :mw#.
+        m.manual_slew(-1, 0, 5).unwrap();
+        // Change speed mid-slew (5 -> 9) and add North -> :q#, :SR9#, :mw#, :mn#.
+        m.manual_slew(-1, 1, 9).unwrap();
+        // Drop Axis 2 only -> :qD#.
+        m.manual_slew(-1, 0, 9).unwrap();
+        // Abort while manual motion is active must send BOTH :Q# and :q#!
+        m.abort().unwrap();
+        // Follow-up poll confirms TCP stream stayed completely synchronized.
+        let _ = m.poll().unwrap();
+
+        let cmds = log.lock().unwrap();
+        let manual_seq: Vec<&str> = cmds
+            .iter()
+            .skip_while(|c| !c.starts_with(":SR"))
+            .take_while(|c| *c != ":GLS#")
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            manual_seq,
+            vec![
+                ":SR5#", ":me#", ":qR#", ":mw#", ":q#", ":SR9#", ":mw#", ":mn#", ":qD#", ":Q#",
+                ":q#",
+            ]
+        );
     }
 }

@@ -16,16 +16,18 @@ use std::time::Duration;
 
 use log::{info, trace};
 
-use super::invalid_data;
 use super::kinematic::{AxisUnwrapper, MIN_RATE_RAD_PER_SEC, RawAxisMount};
+use super::{MANUAL_SLEW_MAX_SPEED, MANUAL_SLEW_MIN_SPEED, invalid_data};
 
 const UDP_TIMEOUT: Duration = Duration::from_millis(250);
 const UDP_RETRIES: usize = 3;
-const STOP_POLL_MAX: usize = 20;
+const STOP_POLL_MAX: usize = 60;
 const STOP_POLL_DELAY: Duration = Duration::from_millis(50);
 const ENCODER_ORIGIN: i64 = 0x80_0000;
 const SIDEREAL_RAD_PER_SEC: f64 = 7.292_115_855_3e-5;
 const LOW_SPEED_RATE_LIMIT: f64 = 128.0 * SIDEREAL_RAD_PER_SEC;
+/// 9-step logarithmic manual slew speeds (in multiples of sidereal) matching iOptron `:SR1..9#`.
+const MANUAL_SPEED_MULTIPLIERS: [f64; 9] = [1.0, 2.0, 8.0, 16.0, 64.0, 128.0, 256.0, 512.0, 800.0];
 const HIGH_SPEED_RAMP_MAX: u32 = 3_200;
 const LOW_SPEED_RAMP_MAX: u32 = 200;
 
@@ -52,6 +54,7 @@ pub(super) struct SkyWatcherMount {
     model_name: String,
     is_alt_az: bool,
     axes: [AxisParams; 2],
+    last_high_speed_ticks: [Option<u32>; 2],
 }
 
 impl SkyWatcherMount {
@@ -109,6 +112,7 @@ impl SkyWatcherMount {
             model_name,
             is_alt_az,
             axes: [ax1, ax2],
+            last_high_speed_ticks: [None, None],
         })
     }
 
@@ -120,8 +124,7 @@ impl SkyWatcherMount {
         Ok(steps as f64 * TAU / self.axes[idx].counts_per_rev as f64)
     }
 
-    fn stop_axis_and_wait(&self, axis_num: u8) -> IoResult<()> {
-        talk_axis(&self.socket, axis_num, 'K', "")?;
+    fn wait_axis_stopped(&self, axis_num: u8) -> IoResult<()> {
         for _ in 0..STOP_POLL_MAX {
             let st = query_axis_status(&self.socket, axis_num)?;
             if !st.running {
@@ -133,6 +136,11 @@ impl SkyWatcherMount {
             ErrorKind::TimedOut,
             format!("Sky-Watcher axis {} did not stop after :K", axis_num),
         ))
+    }
+
+    fn stop_axis_and_wait(&self, axis_num: u8) -> IoResult<()> {
+        talk_axis(&self.socket, axis_num, 'K', "")?;
+        self.wait_axis_stopped(axis_num)
     }
 
     fn goto_axis_rad(&mut self, idx: usize, target_rad: f64) -> IoResult<()> {
@@ -149,6 +157,7 @@ impl SkyWatcherMount {
         if st.running {
             self.stop_axis_and_wait(axis_num)?;
         }
+        self.last_high_speed_ticks[idx] = None;
 
         let _ = self.read_axis_rad(idx)?;
         let cpr = self.axes[idx].counts_per_rev;
@@ -183,19 +192,29 @@ impl SkyWatcherMount {
         Ok(())
     }
 
-    fn set_axis_rate_rad_per_sec(&self, idx: usize, rate_rad_s: f64) -> IoResult<()> {
+    fn set_axis_rate_rad_per_sec(
+        &mut self,
+        idx: usize,
+        rate_rad_s: f64,
+        wait_on_stop: bool,
+    ) -> IoResult<()> {
         let axis_num = (idx + 1) as u8;
         if !rate_rad_s.is_finite() || rate_rad_s.abs() < MIN_RATE_RAD_PER_SEC {
             let st = query_axis_status(&self.socket, axis_num)?;
             if st.running {
-                talk_axis(&self.socket, axis_num, 'K', "")?;
+                if wait_on_stop {
+                    self.stop_axis_and_wait(axis_num)?;
+                } else {
+                    talk_axis(&self.socket, axis_num, 'K', "")?;
+                }
             }
+            self.last_high_speed_ticks[idx] = None;
             return Ok(());
         }
 
         let forward = rate_rad_s > 0.0;
         let abs_rate = rate_rad_s.abs();
-        let high_speed = abs_rate > LOW_SPEED_RATE_LIMIT;
+        let high_speed = abs_rate >= LOW_SPEED_RATE_LIMIT;
         let ax = &self.axes[idx];
         let adj_rate = if high_speed {
             abs_rate / ax.high_speed_ratio as f64
@@ -211,9 +230,17 @@ impl SkyWatcherMount {
         let mode_matches =
             st.running && st.rate_mode && st.forward == forward && st.high_speed == high_speed;
 
-        if !mode_matches {
+        if mode_matches && high_speed && self.last_high_speed_ticks[idx] == Some(t1_ticks) {
+            return Ok(());
+        }
+
+        // Many Sky-Watcher MC firmwares only allow hot `:I` updates in low-speed (`:G1`) mode;
+        // changing speed while in high-speed (`:G3`) mode must stop first.
+        let hot_update = mode_matches && !high_speed;
+        if !hot_update {
             if st.running {
                 self.stop_axis_and_wait(axis_num)?;
+                self.last_high_speed_ticks[idx] = None;
             }
             let mode = if high_speed { '3' } else { '1' };
             let dir = if forward { '0' } else { '1' };
@@ -221,9 +248,10 @@ impl SkyWatcherMount {
         }
 
         talk_axis(&self.socket, axis_num, 'I', &encode_le24(t1_ticks))?;
-        if !mode_matches {
+        if !hot_update {
             talk_axis(&self.socket, axis_num, 'J', "")?;
         }
+        self.last_high_speed_ticks[idx] = high_speed.then_some(t1_ticks);
         Ok(())
     }
 }
@@ -253,11 +281,48 @@ impl RawAxisMount for SkyWatcherMount {
     }
 
     fn set_rates_rad_per_sec(&mut self, rate1: f64, rate2: f64) -> IoResult<()> {
-        self.set_axis_rate_rad_per_sec(0, rate1)?;
-        self.set_axis_rate_rad_per_sec(1, rate2)
+        self.set_axis_rate_rad_per_sec(0, rate1, false)?;
+        self.set_axis_rate_rad_per_sec(1, rate2, false)
+    }
+
+    fn manual_slew(&mut self, axis1_dir: i8, axis2_dir: i8, speed: u8) -> IoResult<()> {
+        let a1 = axis1_dir.clamp(-1, 1);
+        let a2 = axis2_dir.clamp(-1, 1);
+        if (a1 == 0 && a2 == 0) || speed == 0 {
+            // Issue `:K` to both axes before waiting so Axis 2 never keeps coasting while Axis 1 stops.
+            let s1 = query_axis_status(&self.socket, 1)?;
+            let s2 = query_axis_status(&self.socket, 2)?;
+            let r1 = if s1.running {
+                talk_axis(&self.socket, 1, 'K', "").map(|_| ())
+            } else {
+                Ok(())
+            };
+            let r2 = if s2.running {
+                talk_axis(&self.socket, 2, 'K', "").map(|_| ())
+            } else {
+                Ok(())
+            };
+            self.last_high_speed_ticks = [None, None];
+            r1.and(r2)?;
+            if s1.running {
+                self.wait_axis_stopped(1)?;
+            }
+            if s2.running {
+                self.wait_axis_stopped(2)?;
+            }
+            return Ok(());
+        }
+
+        let idx = (speed.clamp(MANUAL_SLEW_MIN_SPEED, MANUAL_SLEW_MAX_SPEED) - 1) as usize;
+        let mag = MANUAL_SPEED_MULTIPLIERS[idx] * SIDEREAL_RAD_PER_SEC;
+        let r1 = (a1 as f64) * mag;
+        let r2 = (a2 as f64) * mag;
+        self.set_axis_rate_rad_per_sec(0, r1, true)?;
+        self.set_axis_rate_rad_per_sec(1, r2, true)
     }
 
     fn abort(&mut self) -> IoResult<()> {
+        self.last_high_speed_ticks = [None, None];
         let r1 = talk_axis(&self.socket, 1, 'K', "").map(|_| ());
         let r2 = talk_axis(&self.socket, 2, 'K', "").map(|_| ());
         r1.and(r2)
@@ -382,6 +447,13 @@ fn identify_mount(ver_hex: &str) -> IoResult<(String, bool)> {
         0x04 => ("Sky-Watcher EQ8".to_string(), false),
         0x05 => ("Sky-Watcher AZ-EQ6".to_string(), true),
         0x06 => ("Sky-Watcher AZ-EQ5".to_string(), true),
+        0x0A => ("Sky-Watcher Star Adventurer".to_string(), false),
+        0x20 => ("Sky-Watcher EQ8-R Pro".to_string(), false),
+        0x22 => ("Sky-Watcher AZ-EQ6 Pro".to_string(), true),
+        0x23 => ("Sky-Watcher EQ6-R Pro".to_string(), false),
+        0x31 => ("Sky-Watcher EQ5 Pro".to_string(), false),
+        0x44 => ("Sky-Watcher Wave 100i".to_string(), false),
+        0x45 => ("Sky-Watcher Wave 150i".to_string(), false),
         0x80 => ("Sky-Watcher GT".to_string(), true),
         0x81 => ("Sky-Watcher MF".to_string(), true),
         0x82 => ("Sky-Watcher 114GT".to_string(), true),
@@ -485,6 +557,7 @@ mod tests {
             let mut running = [false, false];
             let mut rate_mode = [false, false];
             let mut forward = [true, true];
+            let mut high_speed = [false, false];
             let mut pending_offset = [0_i64, 0_i64];
             let mut buf = [0u8; 64];
 
@@ -503,7 +576,9 @@ mod tests {
                         "=\r".to_string()
                     }
                     b'f' => {
-                        let n0 = (u8::from(rate_mode[axis])) | (u8::from(!forward[axis]) << 1);
+                        let n0 = u8::from(rate_mode[axis])
+                            | (u8::from(!forward[axis]) << 1)
+                            | (u8::from(high_speed[axis]) << 2);
                         let n1 = u8::from(running[axis]);
                         let n2 = u8::from(initialized[axis]);
                         format!("={:X}{:X}{:X}\r", n0, n1, n2)
@@ -512,8 +587,17 @@ mod tests {
                     b'G' => {
                         let mode = b[3];
                         rate_mode[axis] = mode == b'1' || mode == b'3';
+                        high_speed[axis] = mode == b'0' || mode == b'3';
                         forward[axis] = b[4] == b'0';
                         "=\r".to_string()
+                    }
+                    b'I' => {
+                        // Mirror real Sky-Watcher firmware: reject dynamic :I while running in :G3 high-speed!
+                        if running[axis] && high_speed[axis] {
+                            "!0\r".to_string()
+                        } else {
+                            "=\r".to_string()
+                        }
                     }
                     b'H' => {
                         let mag = decode_le24(&cmd[3..9]).unwrap() as i64;
@@ -565,6 +649,12 @@ mod tests {
             .unwrap();
         // Zero-offset goto on axis 2 while tracking must still stop axis 2!
         m.goto_axes_rad(target1 + 0.1, target2).unwrap();
+        // Manual slew at speed 6 (128x) must enter :G3 high-speed, speed 6->9 must stop first,
+        // and stop must halt cleanly.
+        m.manual_slew(1, 0, 6).unwrap();
+        m.manual_slew(1, 0, 6).unwrap();
+        m.manual_slew(1, -1, 9).unwrap();
+        m.manual_slew(0, 0, 0).unwrap();
         m.abort().unwrap();
 
         let cmds = log.lock().unwrap();
@@ -572,6 +662,8 @@ mod tests {
         assert!(cmds.iter().any(|c| c == ":F2"));
         assert!(cmds.iter().any(|c| c.starts_with(":H1")));
         assert!(cmds.iter().any(|c| c.starts_with(":I1")));
+        assert!(cmds.iter().any(|c| c == ":G130"));
+        assert!(cmds.iter().any(|c| c == ":G231"));
         assert!(cmds.iter().any(|c| c == ":K1"));
         assert!(cmds.iter().any(|c| c == ":K2"));
     }

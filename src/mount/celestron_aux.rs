@@ -7,17 +7,23 @@
 //! the Azimuth/RA (`0x10`) and Altitude/Dec (`0x11`) motor controllers, filtering
 //! unrelated shared-bus broadcasts and using `1/1024 arcsec/sec` 24-bit rates.
 
-use std::f64::consts::TAU;
+use std::f64::consts::{PI, TAU};
 use std::io::{Error, ErrorKind, Read, Result as IoResult, Write};
 use std::net::TcpStream;
+use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use log::{info, trace};
 
 use super::kinematic::{AxisUnwrapper, MIN_RATE_RAD_PER_SEC, RawAxisMount};
-use super::{TcpConnector, connect_tcp_stream, invalid_data};
+use super::{
+    MANUAL_SLEW_MAX_SPEED, MANUAL_SLEW_MIN_SPEED, TcpConnector, connect_tcp_stream, invalid_data,
+};
 
 const READ_REPLY_DEADLINE: Duration = Duration::from_millis(700);
+const MANUAL_DECEL_POLL_MAX: usize = 12;
+const MANUAL_DECEL_POLL_DELAY: Duration = Duration::from_millis(50);
+const MANUAL_HIGH_SPEED_SETTLE_MIN: u8 = 6;
 const MAX_SKIPPED_PACKETS: usize = 32;
 const MAX_PREAMBLE_NOISE_BYTES: usize = 128;
 
@@ -32,6 +38,7 @@ const CMD_SET_POS_GUIDERATE: u8 = 0x06;
 const CMD_SET_NEG_GUIDERATE: u8 = 0x07;
 const CMD_SLEW_DONE: u8 = 0x13;
 const CMD_MOVE_POS: u8 = 0x24;
+const CMD_MOVE_NEG: u8 = 0x25;
 const CMD_GET_VER: u8 = 0xFE;
 
 const STEPS_PER_REV: f64 = 16_777_216.0; // 2^24
@@ -45,6 +52,7 @@ pub(super) struct CelestronAuxMount {
     model_name: String,
     unwrappers: [AxisUnwrapper; 2],
     last_rates: [Option<i32>; 2],
+    manual_state: [(i8, u8); 2],
 }
 
 impl CelestronAuxMount {
@@ -76,6 +84,7 @@ impl CelestronAuxMount {
             model_name,
             unwrappers: [AxisUnwrapper::new(raw1, 0), AxisUnwrapper::new(raw2, 0)],
             last_rates: [None, None],
+            manual_state: [(0, 0); 2],
         })
     }
 
@@ -96,12 +105,33 @@ impl CelestronAuxMount {
         Ok(())
     }
 
+    fn stop_manual_axis(&mut self, idx: usize) -> IoResult<()> {
+        let cmd = if self.manual_state[idx].0 < 0 {
+            CMD_MOVE_NEG
+        } else {
+            CMD_MOVE_POS
+        };
+        exchange_aux(&mut self.stream, axis_dev(idx), cmd, &[0x00])?;
+        self.manual_state[idx] = (0, 0);
+        Ok(())
+    }
+
+    fn read_raw_positions(&mut self) -> IoResult<(u32, u32)> {
+        Ok((
+            query_raw_position(&mut self.stream, DEV_AZM)?,
+            query_raw_position(&mut self.stream, DEV_ALT)?,
+        ))
+    }
+
     fn goto_axis_rad(&mut self, idx: usize, target_rad: f64) -> IoResult<()> {
         if !target_rad.is_finite() {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 "Target axis angle must be finite",
             ));
+        }
+        if self.manual_state[idx] != (0, 0) {
+            self.stop_manual_axis(idx)?;
         }
         self.set_axis_rate_steps(idx, 0, true)?;
         let raw_target =
@@ -111,9 +141,59 @@ impl CelestronAuxMount {
         Ok(())
     }
 
+    fn manual_slew_axis(&mut self, idx: usize, dir: i8, speed: u8) -> IoResult<bool> {
+        let target = if dir == 0 || speed == 0 {
+            (0, 0)
+        } else {
+            (
+                dir.clamp(-1, 1),
+                speed.clamp(MANUAL_SLEW_MIN_SPEED, MANUAL_SLEW_MAX_SPEED),
+            )
+        };
+        let prev = self.manual_state[idx];
+        if prev == target {
+            // If transitioning from tracking into a single-axis manual slew, halt the orthogonal
+            // axis's active guiderate so it doesn't keep drifting!
+            if target.0 == 0 && self.last_rates[idx].is_some_and(|r| r != 0) {
+                self.set_axis_rate_steps(idx, 0, true)?;
+            }
+            return Ok(false);
+        }
+
+        self.last_rates[idx] = None;
+        if target.0 == 0 {
+            self.stop_manual_axis(idx)?;
+            return Ok(prev.1 >= MANUAL_HIGH_SPEED_SETTLE_MIN);
+        }
+
+        if prev.0 != 0 && prev.0 != target.0 {
+            self.stop_manual_axis(idx)?;
+        }
+        let cmd = if target.0 > 0 {
+            CMD_MOVE_POS
+        } else {
+            CMD_MOVE_NEG
+        };
+        exchange_aux(&mut self.stream, axis_dev(idx), cmd, &[target.1])?;
+        self.manual_state[idx] = target;
+        Ok(false)
+    }
+
+    fn wait_for_manual_settle(&mut self) -> IoResult<()> {
+        let mut prev = self.read_raw_positions()?;
+        for _ in 0..MANUAL_DECEL_POLL_MAX {
+            sleep(MANUAL_DECEL_POLL_DELAY);
+            let cur = self.read_raw_positions()?;
+            if cur == prev {
+                return Ok(());
+            }
+            prev = cur;
+        }
+        Ok(())
+    }
+
     fn halt_axis(&mut self, idx: usize) -> IoResult<()> {
-        let dev = axis_dev(idx);
-        let r_move = exchange_aux(&mut self.stream, dev, CMD_MOVE_POS, &[0x00]).map(|_| ());
+        let r_move = self.stop_manual_axis(idx);
         let r_rate = self.set_axis_rate_steps(idx, 0, true);
         r_move.and(r_rate)
     }
@@ -129,14 +209,19 @@ impl RawAxisMount for CelestronAuxMount {
     }
 
     fn read_axes_rad(&mut self) -> IoResult<(f64, f64)> {
-        let r1 = query_raw_position(&mut self.stream, DEV_AZM)?;
-        let r2 = query_raw_position(&mut self.stream, DEV_ALT)?;
+        let (r1, r2) = self.read_raw_positions()?;
         let s1 = self.unwrappers[0].update(r1);
         let s2 = self.unwrappers[1].update(r2);
         Ok((
             s1 as f64 * TAU / STEPS_PER_REV,
             s2 as f64 * TAU / STEPS_PER_REV,
         ))
+    }
+
+    fn max_goto_step_rad(&self) -> Option<f64> {
+        // `MC_GOTO_FAST` takes a 24-bit modulo-2π target and always slews along the shorter arc;
+        // splitting slews > 135° guarantees > 180° GEM meridian flips always go over the pole.
+        Some(0.75 * PI)
     }
 
     fn is_slewing(&mut self) -> IoResult<bool> {
@@ -165,6 +250,15 @@ impl RawAxisMount for CelestronAuxMount {
         let r2 = rad_per_sec_to_aux_rate(rate2);
         self.set_axis_rate_steps(0, r1, false)?;
         self.set_axis_rate_steps(1, r2, false)
+    }
+
+    fn manual_slew(&mut self, axis1_dir: i8, axis2_dir: i8, speed: u8) -> IoResult<()> {
+        let hi0 = self.manual_slew_axis(0, axis1_dir, speed)?;
+        let hi1 = self.manual_slew_axis(1, axis2_dir, speed)?;
+        if (hi0 || hi1) && self.manual_state == [(0, 0); 2] {
+            self.wait_for_manual_settle()?;
+        }
+        Ok(())
     }
 
     fn abort(&mut self) -> IoResult<()> {
@@ -348,7 +442,7 @@ mod tests {
     fn test_tcp_roundtrip_with_bus_noise_corrupt_packet_and_24bit_wrap() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let log = Arc::new(Mutex::new(Vec::<(u8, u8)>::new()));
+        let log = Arc::new(Mutex::new(Vec::<(u8, u8, Vec<u8>)>::new()));
         let log_c = log.clone();
 
         spawn(move || {
@@ -358,7 +452,7 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(5);
 
             while let Ok((src, dst, cmd, data)) = read_aux_packet(&mut sock, deadline) {
-                log_c.lock().unwrap().push((dst, cmd));
+                log_c.lock().unwrap().push((dst, cmd, data.clone()));
                 // Inject stray bytes, bad-checksum packet, unrelated HC broadcast, and a stray 0x3B
                 // right before the valid reply to verify resync across consecutive preambles.
                 sock.write_all(&[0xAA, 0x55, 0x3B, 0x03, 0x04, 0x10, 0x01, 0x00])
@@ -377,7 +471,7 @@ mod tests {
                         vec![]
                     }
                     CMD_SLEW_DONE => vec![if slewing[idx] { 0x00 } else { 0xFF }],
-                    CMD_SET_POS_GUIDERATE | CMD_SET_NEG_GUIDERATE | CMD_MOVE_POS => {
+                    CMD_SET_POS_GUIDERATE | CMD_SET_NEG_GUIDERATE | CMD_MOVE_POS | CMD_MOVE_NEG => {
                         slewing[idx] = false;
                         vec![]
                     }
@@ -404,13 +498,48 @@ mod tests {
 
         m.set_rates_rad_per_sec(15.0 / ARCSEC_PER_RAD, -5.0 / ARCSEC_PER_RAD)
             .unwrap();
+        // Single-axis manual slew while tracking must zero the orthogonal axis's guiderate!
+        m.manual_slew(1, 0, 5).unwrap();
+        assert!(log.lock().unwrap().iter().any(|(d, c, data)| {
+            *d == DEV_ALT && *c == CMD_SET_POS_GUIDERATE && data == &[0, 0, 0]
+        }));
+        // Dual-axis manual slew (pos/neg + reversal + high-speed stop) must invalidate last_rates!
+        m.manual_slew(1, -1, 7).unwrap();
+        m.manual_slew(-1, -1, 7).unwrap();
+        m.manual_slew(0, 0, 0).unwrap();
+        let guide_before = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, c, _)| *c == CMD_SET_POS_GUIDERATE)
+            .count();
+        m.set_rates_rad_per_sec(15.0 / ARCSEC_PER_RAD, -5.0 / ARCSEC_PER_RAD)
+            .unwrap();
+        let guide_after = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, c, _)| *c == CMD_SET_POS_GUIDERATE)
+            .count();
+        assert_eq!(guide_after, guide_before + 1);
         m.abort().unwrap();
 
         let seen = log.lock().unwrap();
-        assert!(seen.iter().any(|&(_, c)| c == CMD_GET_VER));
-        assert!(seen.iter().any(|&(_, c)| c == CMD_GOTO_FAST));
-        assert!(seen.iter().any(|&(_, c)| c == CMD_SET_POS_GUIDERATE));
-        assert!(seen.iter().any(|&(_, c)| c == CMD_SET_NEG_GUIDERATE));
-        assert!(seen.iter().any(|&(_, c)| c == CMD_MOVE_POS));
+        assert!(seen.iter().any(|(_, c, _)| *c == CMD_GET_VER));
+        assert!(seen.iter().any(|(_, c, _)| *c == CMD_GOTO_FAST));
+        assert!(seen.iter().any(|(_, c, _)| *c == CMD_SET_POS_GUIDERATE));
+        assert!(seen.iter().any(|(_, c, _)| *c == CMD_SET_NEG_GUIDERATE));
+        assert!(
+            seen.iter()
+                .any(|(d, c, data)| *d == DEV_AZM && *c == CMD_MOVE_POS && data == &[7])
+        );
+        assert!(
+            seen.iter()
+                .any(|(d, c, data)| *d == DEV_ALT && *c == CMD_MOVE_NEG && data == &[7])
+        );
+        assert!(
+            seen.iter()
+                .any(|(d, c, data)| *d == DEV_AZM && *c == CMD_MOVE_POS && data == &[0])
+        );
     }
 }

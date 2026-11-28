@@ -54,6 +54,11 @@ const FRAME_FENCE_MARGIN: Duration = Duration::from_millis(100);
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const TCP_IO_TIMEOUT: Duration = Duration::from_millis(350);
 
+/// Minimum manual directional slew speed index (1x sidereal).
+pub const MANUAL_SLEW_MIN_SPEED: u8 = 1;
+/// Maximum manual directional slew speed index (max slew speed).
+pub const MANUAL_SLEW_MAX_SPEED: u8 = 9;
+
 /// Optional platform TCP socket factory (e.g. Android `ConnectivityManager` `TRANSPORT_WIFI` socket).
 pub type TcpConnector = Arc<dyn Fn(&str, u16) -> IoResult<TcpStream> + Send + Sync>;
 
@@ -157,6 +162,22 @@ pub struct MountTelemetry {
     pub goto_ready: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SafetyEvent {
+    /// Tracking safety limit (85° cone or +10° GEM meridian); coarse closed-loop centering may still recover.
+    Tracking(&'static str),
+    /// Active slew/flip fault (e.g. stalled multi-leg flip); aborts the GoTo immediately without centering.
+    Slew(&'static str),
+}
+
+impl SafetyEvent {
+    fn message(self) -> &'static str {
+        match self {
+            SafetyEvent::Tracking(m) | SafetyEvent::Slew(m) => m,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct MountRawStatus {
     is_slewing: bool,
@@ -166,7 +187,7 @@ struct MountRawStatus {
     gps_locked: bool,
     ra_jnow_deg: f64,
     dec_jnow_deg: f64,
-    safety_notice: Option<&'static str>,
+    safety_notice: Option<SafetyEvent>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -235,6 +256,11 @@ trait MountDriver: Send {
     /// Relative axis slew in radians for Class B mini-calibration.
     fn jog_axes_rad(&mut self, _d_ax1: f64, _d_ax2: f64) -> IoResult<bool> {
         Ok(false)
+    }
+    /// Commands continuous directional manual slewing (`axis*_dir` in `-1..=1`, `speed` in `1..=9`),
+    /// or stops manual motion when `(0, 0, _)`. Works even before plate solving or calibration.
+    fn manual_slew(&mut self, _axis1_dir: i8, _axis2_dir: i8, _speed: u8) -> IoResult<()> {
+        Ok(())
     }
 }
 
@@ -382,12 +408,49 @@ impl CalPostAction {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ManualSlewGoal {
+    axis1_dir: i8,
+    axis2_dir: i8,
+    speed: u8,
+}
+
+impl ManualSlewGoal {
+    fn new(axis1_dir: i8, axis2_dir: i8, speed: u8) -> Self {
+        let a1 = axis1_dir.clamp(-1, 1);
+        let a2 = axis2_dir.clamp(-1, 1);
+        if (a1 == 0 && a2 == 0) || speed == 0 {
+            Self::default()
+        } else {
+            Self {
+                axis1_dir: a1,
+                axis2_dir: a2,
+                speed: speed.clamp(MANUAL_SLEW_MIN_SPEED, MANUAL_SLEW_MAX_SPEED),
+            }
+        }
+    }
+
+    fn is_active(self) -> bool {
+        self.axis1_dir != 0 || self.axis2_dir != 0
+    }
+}
+
+#[derive(Default)]
+struct ManualSlewSlot {
+    goal: ManualSlewGoal,
+    expires_at: Option<Instant>,
+}
+
 enum ControllerState {
     Disconnected,
     Idle,
     Calibrating {
         step: CalStep,
         post_action: CalPostAction,
+    },
+    ManualSlewing {
+        applied: ManualSlewGoal,
+        was_tracking: bool,
     },
     Slewing {
         target_j2000: (f64, f64),
@@ -411,6 +474,7 @@ struct ControllerTimings {
     reconnect_backoff: Duration,
     min_solve_timeout: Duration,
     max_solve_timeout: Duration,
+    manual_deadman_timeout: Duration,
 }
 
 impl Default for ControllerTimings {
@@ -423,6 +487,7 @@ impl Default for ControllerTimings {
             reconnect_backoff: Duration::from_secs(2),
             min_solve_timeout: Duration::from_secs(8),
             max_solve_timeout: Duration::from_secs(20),
+            manual_deadman_timeout: Duration::from_secs(1),
         }
     }
 }
@@ -471,6 +536,7 @@ struct FenceState {
 pub struct MountHandle {
     cmd_tx: Sender<MountCmd>,
     enabled: AtomicBool,
+    connected: AtomicBool,
     /// Monotonic command sequence bumped on GoTo, Abort, disable, and shutdown.
     /// Kept separate from `FenceState.slew_epoch` so polls/reconnects never drop valid GoTos.
     cmd_seq: AtomicU64,
@@ -478,6 +544,8 @@ pub struct MountHandle {
     goto_active: AtomicBool,
     wants_solve: AtomicBool,
     fence: Mutex<FenceState>,
+    manual_slew: Mutex<ManualSlewSlot>,
+    manual_deadman_timeout: Duration,
     telemetry: Mutex<(MountTelemetry, u64)>,
     site_lat: AtomicOptionF64,
     site_lon: AtomicOptionF64,
@@ -507,11 +575,14 @@ impl MountHandle {
         let handle = Arc::new(Self {
             cmd_tx,
             enabled: AtomicBool::new(false),
+            connected: AtomicBool::new(false),
             cmd_seq: AtomicU64::new(0),
             abort_flag: AtomicBool::new(false),
             goto_active: AtomicBool::new(false),
             wants_solve: AtomicBool::new(false),
             fence: Mutex::new(FenceState::default()),
+            manual_slew: Mutex::new(ManualSlewSlot::default()),
+            manual_deadman_timeout: timings.manual_deadman_timeout,
             telemetry: Mutex::new((MountTelemetry::default(), 0)),
             site_lat: AtomicOptionF64::new(None),
             site_lon: AtomicOptionF64::new(None),
@@ -543,6 +614,7 @@ impl MountHandle {
     /// Enables/updates motorized mount control, or disables and disconnects when `None`.
     pub fn configure(&self, config: Option<MountConfig>) {
         if config.is_some() {
+            self.clear_manual_slew_slot();
             self.enabled.store(true, Ordering::SeqCst);
         } else {
             self.reset_disabled_state();
@@ -600,9 +672,14 @@ impl MountHandle {
         if !self.enabled.load(Ordering::Acquire) {
             return;
         }
-        let seq = self.cmd_seq.fetch_add(1, Ordering::SeqCst) + 1;
-        self.mark_slew_started();
-        self.goto_active.store(true, Ordering::Release);
+        // Serialize cmd_seq/fence updates with `manual_slew()` so concurrent callers never drop both.
+        let seq = {
+            let _slot = self.manual_slew.lock().unwrap();
+            let seq = self.cmd_seq.fetch_add(1, Ordering::SeqCst) + 1;
+            self.mark_slew_started();
+            self.goto_active.store(true, Ordering::Release);
+            seq
+        };
         let _ = self.cmd_tx.send(MountCmd::GoTo {
             ra_j2000,
             dec_j2000,
@@ -631,14 +708,63 @@ impl MountHandle {
         let _ = self.cmd_tx.send(MountCmd::SetTracking { enabled, seq });
     }
 
-    /// Requests immediate slew abort (`:Q#`). Safe to call from any thread (UI, FFI, `polling_task`).
+    /// Commands continuous directional manual slewing (`axis*_dir` in `-1..=1`, `speed` in `1..=9`),
+    /// working even before plate solving or calibration (e.g. pointing a strain-wave mount at clear sky).
+    ///
+    /// Call periodically (~250 ms) while a button is held to renew the dead-man watchdog; repeating
+    /// the same `(axis1_dir, axis2_dir, speed)` refreshes the timer without sending wire commands.
+    /// Passing `(0, 0, _)` or `speed == 0` stops manual movement cleanly.
+    pub fn manual_slew(&self, axis1_dir: i8, axis2_dir: i8, speed: u8) {
+        if !self.enabled.load(Ordering::Acquire) || !self.connected.load(Ordering::Acquire) {
+            return;
+        }
+        let goal = ManualSlewGoal::new(axis1_dir, axis2_dir, speed);
+        if !goal.is_active() {
+            self.stop_manual_slew();
+            return;
+        }
+
+        let changed = {
+            let mut slot = self.manual_slew.lock().unwrap();
+            if !self.enabled.load(Ordering::Acquire) || !self.connected.load(Ordering::Acquire) {
+                return;
+            }
+            let was_active = slot.goal.is_active();
+            let changed = slot.goal != goal;
+            slot.goal = goal;
+            slot.expires_at = Some(Instant::now() + self.manual_deadman_timeout);
+            if !was_active {
+                self.cmd_seq.fetch_add(1, Ordering::SeqCst);
+                self.goto_active.store(false, Ordering::Release);
+                self.mark_slew_started();
+            }
+            changed
+        };
+        if changed {
+            let _ = self.cmd_tx.send(MountCmd::Wake);
+        }
+    }
+
+    /// Immediately requests stopping any active manual directional slew.
+    pub fn stop_manual_slew(&self) {
+        if self.clear_manual_slew_slot() {
+            let _ = self.cmd_tx.send(MountCmd::Wake);
+        }
+    }
+
+    /// Requests immediate slew abort (`:Q#` / `:q#` / axis halt). Safe to call from any thread.
     pub fn abort(&self) {
         if !self.enabled.load(Ordering::Acquire) {
             return;
         }
-        self.cmd_seq.fetch_add(1, Ordering::SeqCst);
-        self.goto_active.store(false, Ordering::Release);
-        self.abort_flag.store(true, Ordering::SeqCst);
+        {
+            let mut slot = self.manual_slew.lock().unwrap();
+            slot.goal = ManualSlewGoal::default();
+            slot.expires_at = None;
+            self.cmd_seq.fetch_add(1, Ordering::SeqCst);
+            self.goto_active.store(false, Ordering::Release);
+            self.abort_flag.store(true, Ordering::SeqCst);
+        }
         let _ = self.cmd_tx.send(MountCmd::Wake);
     }
 
@@ -700,8 +826,18 @@ impl MountHandle {
         let _ = self.cmd_tx.send(MountCmd::Shutdown);
     }
 
+    fn clear_manual_slew_slot(&self) -> bool {
+        let mut slot = self.manual_slew.lock().unwrap();
+        let was_active = slot.goal.is_active();
+        slot.goal = ManualSlewGoal::default();
+        slot.expires_at = None;
+        was_active
+    }
+
     fn reset_disabled_state(&self) {
         self.enabled.store(false, Ordering::SeqCst);
+        self.connected.store(false, Ordering::SeqCst);
+        self.clear_manual_slew_slot();
         self.cmd_seq.fetch_add(1, Ordering::SeqCst);
         self.goto_active.store(false, Ordering::SeqCst);
         self.wants_solve.store(false, Ordering::SeqCst);
@@ -835,6 +971,7 @@ impl MountController {
         matches!(
             self.state,
             ControllerState::Slewing { .. }
+                | ControllerState::ManualSlewing { .. }
                 | ControllerState::Calibrating {
                     step: CalStep::SlewAx1 { .. } | CalStep::SlewAx2 { .. },
                     ..
@@ -847,6 +984,7 @@ impl MountController {
         matches!(
             self.state,
             ControllerState::Slewing { .. }
+                | ControllerState::ManualSlewing { .. }
                 | ControllerState::WaitingPostStopSolve { .. }
                 | ControllerState::Calibrating { .. }
         ) || self.hc_slewing
@@ -879,6 +1017,7 @@ impl MountController {
                 self.handle_abort();
             }
 
+            self.sync_manual_slew();
             self.tick();
         }
     }
@@ -892,6 +1031,13 @@ impl MountController {
             ControllerState::Disconnected => self
                 .next_reconnect_at
                 .map_or(Duration::ZERO, |at| at.saturating_duration_since(now)),
+            ControllerState::ManualSlewing { .. } => self
+                .handle
+                .manual_slew
+                .lock()
+                .unwrap()
+                .expires_at
+                .map_or(Duration::ZERO, |exp| exp.saturating_duration_since(now)),
             ControllerState::WaitingPostStopSolve { deadline, .. }
             | ControllerState::Calibrating {
                 step:
@@ -982,6 +1128,138 @@ impl MountController {
         }
     }
 
+    fn sync_manual_slew(&mut self) {
+        let (goal, expired) = {
+            let mut slot = self.handle.manual_slew.lock().unwrap();
+            let expired =
+                slot.goal.is_active() && slot.expires_at.is_some_and(|exp| Instant::now() >= exp);
+            if expired {
+                slot.goal = ManualSlewGoal::default();
+                slot.expires_at = None;
+            }
+            (slot.goal, expired)
+        };
+        if expired {
+            warn!("Manual slew dead-man timeout reached; stopping motors");
+        }
+
+        if goal.is_active() {
+            if self.driver.is_none() {
+                self.handle.clear_manual_slew_slot();
+                self.reconcile_fence_with_state();
+                return;
+            }
+
+            if let ControllerState::ManualSlewing {
+                ref mut applied, ..
+            } = self.state
+            {
+                if *applied == goal {
+                    return;
+                }
+                let Some(driver) = self.driver.as_mut() else {
+                    return;
+                };
+                if let Err(e) = driver.manual_slew(goal.axis1_dir, goal.axis2_dir, goal.speed) {
+                    warn!("Mount manual slew update failed: {}", e);
+                    self.disconnect(true);
+                    return;
+                }
+                *applied = goal;
+                return;
+            }
+
+            let was_tracking = matches!(self.state, ControllerState::Idle)
+                && self.last_status.is_some_and(|s| s.is_tracking);
+            let mut aborted_prior_motion = false;
+            if self.is_actively_moving() {
+                let Some(was_slewing) = self.abort_driver_motion("Abort before manual slew failed")
+                else {
+                    return;
+                };
+                aborted_prior_motion = was_slewing;
+            }
+            if !self.unpark_if_needed(aborted_prior_motion) {
+                self.handle.clear_manual_slew_slot();
+                return;
+            }
+
+            if !self.handle.is_physically_slewing() {
+                self.handle.mark_slew_started();
+            }
+            self.handle.goto_active.store(false, Ordering::Release);
+
+            let Some(driver) = self.driver.as_mut() else {
+                return;
+            };
+            if let Err(e) = driver.manual_slew(goal.axis1_dir, goal.axis2_dir, goal.speed) {
+                warn!("Mount manual slew start failed: {}", e);
+                self.disconnect(true);
+                return;
+            }
+            if let Some(st) = self.last_status.as_mut() {
+                st.is_slewing = true;
+                st.is_tracking = false;
+                st.at_zero = false;
+            }
+            self.state = ControllerState::ManualSlewing {
+                applied: goal,
+                was_tracking,
+            };
+            self.update_wants_solve();
+            self.handle
+                .set_state_and_notice(MountUiState::Slewing, None);
+            return;
+        }
+
+        if let ControllerState::ManualSlewing { was_tracking, .. } = self.state {
+            let Some(driver) = self.driver.as_mut() else {
+                return;
+            };
+            if let Err(e) = driver.manual_slew(0, 0, 0) {
+                warn!("Mount manual slew stop failed: {}", e);
+                self.disconnect(true);
+                return;
+            }
+            if let Some(st) = self.last_status.as_mut() {
+                st.is_slewing = false;
+                st.is_tracking = false;
+                st.at_zero = false;
+            }
+            self.needs_bg_sync = true;
+            self.sync_rejected = false;
+            self.handle.clear_slewing(true);
+            self.next_poll_at = Instant::now();
+
+            let is_calibrated = self.driver.as_ref().is_some_and(|d| d.is_calibrated());
+            if was_tracking && is_calibrated {
+                self.tracking_paused = false;
+                self.finish_goto_tracking(MountUiState::Tracking, None);
+            } else {
+                // Ensure Class A mounts stay stopped even if manual slew interrupted an active GoTo.
+                let needs_explicit_stop = self
+                    .driver
+                    .as_ref()
+                    .is_some_and(|d| !d.requires_host_tracking());
+                if needs_explicit_stop {
+                    if let Some(driver) = self.driver.as_mut() {
+                        if let Err(e) = driver.stop_tracking() {
+                            warn!("Mount stop tracking after manual slew failed: {}", e);
+                            self.disconnect(true);
+                            return;
+                        }
+                    }
+                }
+                self.tracking_paused = true;
+                let ui_state = self.ready_idle_ui_state();
+                self.finish_goto_idle(false, false, ui_state, None);
+            }
+        } else {
+            // Clear any orphaned optimistic fence from a tap-and-release during a blocking poll.
+            self.reconcile_fence_with_state();
+        }
+    }
+
     fn tick(&mut self) {
         if self.config.is_none() {
             return;
@@ -991,6 +1269,11 @@ impl MountController {
             if self.next_reconnect_at.is_none_or(|at| Instant::now() >= at) {
                 self.try_connect();
             }
+            return;
+        }
+
+        // Skip periodic polling during manual slewing so stop commands never queue behind RTTs.
+        if matches!(self.state, ControllerState::ManualSlewing { .. }) {
             return;
         }
 
@@ -1036,6 +1319,7 @@ impl MountController {
             ControllerState::Idle | ControllerState::Disconnected => {
                 self.timings.poll_interval_idle
             }
+            ControllerState::ManualSlewing { .. } => unreachable!(),
         };
         self.next_poll_at = now + interval;
 
@@ -1060,14 +1344,14 @@ impl MountController {
         };
         self.last_status = Some(raw);
 
-        if let Some(msg) = raw.safety_notice {
+        if let Some(ev) = raw.safety_notice {
             if matches!(self.state, ControllerState::Idle) {
                 self.tracking_paused = true;
                 self.update_wants_solve();
                 let goto_ready = self.driver.as_ref().is_some_and(|d| d.is_goto_ready());
                 let ui_state = raw.effective_ui_state(goto_ready);
                 self.handle
-                    .set_state_and_notice(ui_state, Some(msg.to_string()));
+                    .set_state_and_notice(ui_state, Some(ev.message().to_string()));
             }
         }
 
@@ -1135,7 +1419,11 @@ impl MountController {
                     let post_stop_epoch = self.handle.clear_slewing(true);
                     let closed_loop = self.config.as_ref().is_some_and(|c| c.closed_loop_goto);
 
-                    if pass == SlewPass::Coarse && closed_loop {
+                    if let Some(SafetyEvent::Slew(msg)) = raw.safety_notice {
+                        self.tracking_paused = true;
+                        let fallback = self.ready_idle_ui_state();
+                        self.finish_goto_idle(false, false, fallback, Some(msg.to_string()));
+                    } else if pass == SlewPass::Coarse && closed_loop {
                         let timeout = self.compute_solve_timeout();
                         debug!(
                             "Coarse slew stopped (epoch={}); waiting up to {:?} for post-stop solve",
@@ -1149,10 +1437,15 @@ impl MountController {
                         self.update_wants_solve();
                         self.handle
                             .set_state_and_notice(MountUiState::Centering, None);
-                    } else if let Some(msg) = raw.safety_notice {
+                    } else if let Some(ev) = raw.safety_notice {
                         self.tracking_paused = true;
                         let fallback = self.ready_idle_ui_state();
-                        self.finish_goto_idle(false, false, fallback, Some(msg.to_string()));
+                        self.finish_goto_idle(
+                            false,
+                            false,
+                            fallback,
+                            Some(ev.message().to_string()),
+                        );
                     } else {
                         self.finish_goto_tracking(MountUiState::Tracking, None);
                     }
@@ -1191,7 +1484,7 @@ impl MountController {
                     self.handle.set_state_and_notice(ui_state, notice);
                 }
             }
-            ControllerState::Disconnected => {}
+            ControllerState::Disconnected | ControllerState::ManualSlewing { .. } => {}
         }
     }
 
@@ -1235,8 +1528,10 @@ impl MountController {
                         self.state = ControllerState::Idle;
                         self.next_reconnect_at = None;
                         self.next_poll_at = Instant::now() + self.timings.poll_interval_idle;
-                        // Discard any stale abort requested while disconnected/connecting.
+                        // Discard any stale abort or manual slew requested while disconnected.
                         self.handle.abort_flag.store(false, Ordering::SeqCst);
+                        self.handle.clear_manual_slew_slot();
+                        self.handle.connected.store(true, Ordering::Release);
                         self.update_wants_solve();
                         self.handle.set_connected_model(Some(model), goto_ready);
                         self.handle.set_state_and_notice(ui_state, None);
@@ -1435,6 +1730,11 @@ impl MountController {
                 self.handle
                     .set_state_and_notice(MountUiState::Centering, Some(notice));
             }
+            ControllerState::ManualSlewing { .. } => {
+                self.handle.goto_active.store(false, Ordering::Release);
+                self.handle
+                    .set_state_and_notice(MountUiState::Slewing, Some(notice));
+            }
             ControllerState::Idle if self.is_motor_slewing() => {
                 self.handle.goto_active.store(false, Ordering::Release);
                 self.handle
@@ -1533,6 +1833,7 @@ impl MountController {
     }
 
     fn start_calibration(&mut self, post_action: CalPostAction) {
+        self.handle.clear_manual_slew_slot();
         self.tracking_paused = false;
         if self.is_actively_moving() {
             let Some(motors_moving) = self.abort_driver_motion("Abort before calibration failed")
@@ -1576,13 +1877,17 @@ impl MountController {
                 ControllerState::Idle | ControllerState::Disconnected => {
                     self.handle.clear_slewing(false);
                 }
-                ControllerState::Slewing { .. } => unreachable!(),
+                ControllerState::Slewing { .. } | ControllerState::ManualSlewing { .. } => {
+                    unreachable!()
+                }
             }
         }
         let goto_active = match self.state {
             ControllerState::Slewing { .. } | ControllerState::WaitingPostStopSolve { .. } => true,
             ControllerState::Calibrating { post_action, .. } => post_action.is_goto_active(),
-            ControllerState::Idle | ControllerState::Disconnected => false,
+            ControllerState::Idle
+            | ControllerState::ManualSlewing { .. }
+            | ControllerState::Disconnected => false,
         };
         self.handle
             .goto_active
@@ -1643,6 +1948,7 @@ impl MountController {
                 ..
             } = self.state
             {
+                self.handle.clear_manual_slew_slot();
                 *post_action = CalPostAction::GoTo(ra_j2000, dec_j2000);
                 let new_deadline = Instant::now() + self.compute_solve_timeout();
                 self.refresh_cal_wait_fence(Some(new_deadline));
@@ -1653,6 +1959,7 @@ impl MountController {
             return;
         }
 
+        self.handle.clear_manual_slew_slot();
         let mut aborted_prior_motion = false;
         if self.is_actively_moving() {
             let Some(was_slewing) = self.abort_driver_motion("Abort before new GoTo failed") else {
@@ -2026,7 +2333,9 @@ impl MountController {
                 }
                 self.handle_background_sync(ra_j2000, dec_j2000);
             }
-            ControllerState::Slewing { .. } | ControllerState::Disconnected => {}
+            ControllerState::Slewing { .. }
+            | ControllerState::ManualSlewing { .. }
+            | ControllerState::Disconnected => {}
         }
     }
 
@@ -2363,6 +2672,7 @@ impl MountController {
             }
             ControllerState::Disconnected
             | ControllerState::Slewing { .. }
+            | ControllerState::ManualSlewing { .. }
             | ControllerState::Calibrating {
                 step: CalStep::SlewAx1 { .. } | CalStep::SlewAx2 { .. },
                 ..
@@ -2404,6 +2714,8 @@ impl MountController {
         self.last_passive_sample = None;
         self.state = ControllerState::Disconnected;
         self.update_wants_solve();
+        self.handle.connected.store(false, Ordering::Release);
+        self.handle.clear_manual_slew_slot();
         self.handle.goto_active.store(false, Ordering::Release);
         self.handle.clear_slewing(was_slewing);
         if schedule_reconnect && self.config.is_some() {
@@ -2447,6 +2759,7 @@ mod tests {
         start_tracking_calls: usize,
         stop_tracking_calls: usize,
         site_sync_calls: usize,
+        manual_slew_calls: Vec<(i8, i8, u8)>,
     }
 
     impl MockMountState {
@@ -2475,6 +2788,7 @@ mod tests {
                 start_tracking_calls: 0,
                 stop_tracking_calls: 0,
                 site_sync_calls: 0,
+                manual_slew_calls: Vec::new(),
             }))
         }
     }
@@ -2561,6 +2875,18 @@ mod tests {
             self.shared.lock().unwrap().site_sync_calls += 1;
             Ok(())
         }
+
+        fn manual_slew(&mut self, axis1_dir: i8, axis2_dir: i8, speed: u8) -> IoResult<()> {
+            let mut st = self.shared.lock().unwrap();
+            st.manual_slew_calls.push((axis1_dir, axis2_dir, speed));
+            let active = (axis1_dir != 0 || axis2_dir != 0) && speed > 0;
+            st.status.is_slewing = active;
+            if active {
+                st.status.at_zero = false;
+                st.status.is_tracking = false;
+            }
+            Ok(())
+        }
     }
 
     struct TestMount {
@@ -2592,6 +2918,7 @@ mod tests {
             reconnect_backoff: Duration::from_millis(20),
             min_solve_timeout: Duration::from_millis(80),
             max_solve_timeout: Duration::from_millis(120),
+            manual_deadman_timeout: Duration::from_millis(120),
         }
     }
 
@@ -3049,6 +3376,15 @@ mod tests {
             self.0.lock().unwrap().rate_updates += 1;
             Ok(())
         }
+        fn manual_slew(&mut self, axis1_dir: i8, axis2_dir: i8, speed: u8) -> IoResult<()> {
+            let mut s = self.0.lock().unwrap();
+            if (axis1_dir != 0 || axis2_dir != 0) && speed > 0 {
+                let delta = 0.05 * (speed as f64);
+                s.ax1 += (axis1_dir as f64) * delta;
+                s.ax2 += (axis2_dir as f64) * delta;
+            }
+            Ok(())
+        }
         fn abort(&mut self) -> IoResult<()> {
             self.0.lock().unwrap().slew_polls_remaining = 0;
             Ok(())
@@ -3442,6 +3778,158 @@ mod tests {
             Duration::from_secs(2),
         );
         assert_eq!(sim.lock().unwrap().goto_count, 3);
+
+        tm_b.stop();
+    }
+
+    #[test]
+    fn test_manual_slew_presolve_deadman_tracking_preservation_and_interrupts() {
+        // 1) Class A: tracking before manual nudge -> auto-resumes tracking on release;
+        //    heartbeat renewals stay idempotent on the wire; dead-man timeout auto-stops!
+        let mock = MockMountState::idle_tracking(true, 100.0, 30.0);
+        let tm = start_mock_controller(mock.clone(), fast_timings());
+        wait_until(
+            || tm.handle.telemetry().state == MountUiState::Tracking,
+            Duration::from_secs(2),
+        );
+
+        let epoch_before = tm.handle.slew_epoch();
+        tm.handle.manual_slew(1, 0, 5);
+        wait_until(
+            || {
+                tm.handle.telemetry().state == MountUiState::Slewing
+                    && mock.lock().unwrap().manual_slew_calls == vec![(1, 0, 5)]
+            },
+            Duration::from_secs(2),
+        );
+        assert!(tm.handle.is_physically_slewing());
+        assert!(tm.handle.slew_epoch() > epoch_before);
+
+        // Renewing the same hold past deadman (120ms) keeps slewing with ZERO extra wire calls!
+        for _ in 0..3 {
+            sleep(Duration::from_millis(60));
+            tm.handle.manual_slew(1, 0, 5);
+        }
+        assert_eq!(tm.handle.telemetry().state, MountUiState::Slewing);
+        assert_eq!(mock.lock().unwrap().manual_slew_calls, vec![(1, 0, 5)]);
+
+        // Stop renewing -> dead-man fires automatically, clears fence, and resumes Tracking!
+        wait_until(
+            || {
+                tm.handle.telemetry().state == MountUiState::Tracking
+                    && !tm.handle.is_physically_slewing()
+            },
+            Duration::from_secs(2),
+        );
+        assert_eq!(
+            mock.lock().unwrap().manual_slew_calls,
+            vec![(1, 0, 5), (0, 0, 0)]
+        );
+        assert!(mock.lock().unwrap().start_tracking_calls >= 1);
+
+        // 2) Class A parked + stopped -> manual slew auto-unparks, stays stopped on release,
+        //    and a subsequent plate solve must NOT silently turn tracking back ON!
+        {
+            let mut st = mock.lock().unwrap();
+            st.status.is_parked = true;
+            st.status.is_tracking = false;
+            st.status.at_zero = true;
+            st.start_tracking_calls = 0;
+        }
+        wait_until(
+            || tm.handle.telemetry().state == MountUiState::Parked,
+            Duration::from_secs(2),
+        );
+        tm.handle.manual_slew(0, 1, 9);
+        wait_until(
+            || tm.handle.telemetry().state == MountUiState::Slewing,
+            Duration::from_secs(2),
+        );
+        assert_eq!(mock.lock().unwrap().unpark_calls, 1);
+        tm.handle.stop_manual_slew();
+        wait_until(
+            || {
+                tm.handle.telemetry().state == MountUiState::Connected
+                    && !tm.handle.is_physically_slewing()
+            },
+            Duration::from_secs(2),
+        );
+        // Feed a plate solve far from mount coords — tracking_paused must keep tracking OFF!
+        tm.handle.on_solved(150.0, 45.0, tm.handle.slew_epoch());
+        sleep(Duration::from_millis(50));
+        assert_eq!(mock.lock().unwrap().start_tracking_calls, 0);
+        assert_eq!(tm.handle.telemetry().state, MountUiState::Connected);
+
+        // 3) Manual slew interrupting an active GoTo aborts the GoTo and ends stopped.
+        {
+            let mut st = mock.lock().unwrap();
+            st.slew_polls_remaining = 50;
+            st.abort_calls = 0;
+            st.start_tracking_calls = 0;
+        }
+        tm.handle.goto(120.0, 20.0);
+        wait_until(
+            || tm.handle.telemetry().state == MountUiState::Slewing && tm.handle.is_goto_active(),
+            Duration::from_secs(2),
+        );
+        tm.handle.manual_slew(-1, 0, 7);
+        wait_until(
+            || !tm.handle.is_goto_active() && mock.lock().unwrap().abort_calls >= 1,
+            Duration::from_secs(2),
+        );
+        tm.handle.stop_manual_slew();
+        wait_until(
+            || {
+                tm.handle.telemetry().state == MountUiState::Connected
+                    && !tm.handle.is_physically_slewing()
+            },
+            Duration::from_secs(2),
+        );
+        assert_eq!(mock.lock().unwrap().start_tracking_calls, 0);
+        tm.stop();
+
+        // 4) Class B with ZERO plate solves (uncalibrated strain-wave mount pointing at a tree):
+        //    manual slew works immediately pre-solve, moves axes, stops cleanly, and the very
+        //    next plate solve unlocks goto_ready without moving motors or starting tracking!
+        let rot = *Rotation3::from_euler_angles(0.4, -0.2, 0.9).matrix();
+        let (ts, sim, tm_b) = start_sim_class_b(0.2, 0.3, rot, None, 1);
+        assert!(!tm_b.handle.telemetry().goto_ready);
+        assert_eq!(
+            tm_b.handle.telemetry().state,
+            MountUiState::NeedsCalibration
+        );
+
+        tm_b.handle.manual_slew(1, 1, 8);
+        wait_until(
+            || {
+                tm_b.handle.telemetry().state == MountUiState::Slewing
+                    && sim.lock().unwrap().ax1 > 0.2
+                    && sim.lock().unwrap().ax2 > 0.3
+            },
+            Duration::from_secs(2),
+        );
+        tm_b.handle.stop_manual_slew();
+        wait_until(
+            || {
+                tm_b.handle.telemetry().state == MountUiState::NeedsCalibration
+                    && !tm_b.handle.is_physically_slewing()
+            },
+            Duration::from_secs(2),
+        );
+        assert_eq!(sim.lock().unwrap().rate_updates, 0);
+
+        // Now solve the newly pointed clear patch of sky -> unlocks GoTo immediately!
+        let (ra, dec) = solve_sim_j2000(&sim, &ts);
+        tm_b.handle.on_solved(ra, dec, tm_b.handle.slew_epoch());
+        wait_until(
+            || {
+                tm_b.handle.telemetry().goto_ready
+                    && tm_b.handle.telemetry().state == MountUiState::Connected
+            },
+            Duration::from_secs(2),
+        );
+        assert_eq!(sim.lock().unwrap().goto_count, 0);
+        assert_eq!(sim.lock().unwrap().rate_updates, 0);
 
         tm_b.stop();
     }
